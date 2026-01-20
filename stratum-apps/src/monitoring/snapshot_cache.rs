@@ -384,4 +384,40 @@ mod tests {
         let _ = cached.get_server_summary();
         let _ = cached.get_clients_summary();
     }
+
+    #[test]
+    fn test_refresh_if_stale() {
+        // Create cache with 100ms refresh interval (freshness threshold = 50ms)
+        let cache = SnapshotCache::new(
+            Duration::from_millis(100),
+            Some(Arc::new(MockServerMonitoring)),
+            Some(Arc::new(MockClientsMonitoring)),
+        );
+
+        // Initially stale, should refresh
+        cache.refresh_if_stale();
+        let snapshot1 = cache.get_snapshot();
+        assert!(snapshot1.timestamp.is_some());
+
+        // Immediately after refresh, should not be stale
+        cache.refresh_if_stale();
+        let snapshot2 = cache.get_snapshot();
+        assert_eq!(
+            snapshot1.timestamp.unwrap(),
+            snapshot2.timestamp.unwrap(),
+            "Should not refresh when cache is fresh"
+        );
+
+        // Wait for freshness threshold to pass (50ms)
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Now should be stale and refresh
+        cache.refresh_if_stale();
+        let snapshot3 = cache.get_snapshot();
+        assert_ne!(
+            snapshot1.timestamp.unwrap(),
+            snapshot3.timestamp.unwrap(),
+            "Should refresh when cache exceeds freshness threshold"
+        );
+    }
 }

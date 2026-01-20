@@ -16,9 +16,6 @@ pub mod server;
 pub mod snapshot_cache;
 pub mod sv1;
 
-#[cfg(test)]
-mod tests;
-
 pub use client::{
     ClientInfo, ClientMetadata, ClientsMonitoring, ClientsSummary, ExtendedChannelInfo,
     StandardChannelInfo,
