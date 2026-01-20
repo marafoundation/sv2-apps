@@ -88,8 +88,12 @@ pub struct SnapshotCache {
     /// The cached snapshot, protected by a RwLock for fast concurrent reads
     snapshot: RwLock<MonitoringSnapshot>,
 
-    /// How often to refresh the snapshot
+    /// How often the background task checks for refresh (e.g., 60s)
     refresh_interval: Duration,
+
+    /// Maximum acceptable staleness for API requests (e.g., 30s)
+    /// Defaults to refresh_interval / 2
+    freshness_threshold: Duration,
 
     /// Data sources (trait objects that acquire the business logic lock)
     server_source: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
@@ -104,6 +108,7 @@ impl Clone for SnapshotCache {
         Self {
             snapshot: RwLock::new(current_snapshot),
             refresh_interval: self.refresh_interval,
+            freshness_threshold: self.freshness_threshold,
             server_source: self.server_source.clone(),
             clients_source: self.clients_source.clone(),
             sv1_source: self.sv1_source.clone(),
@@ -116,9 +121,11 @@ impl SnapshotCache {
     ///
     /// # Arguments
     ///
-    /// * `refresh_interval` - How often to refresh the cache (e.g., 5 seconds)
+    /// * `refresh_interval` - How often to refresh the cache (e.g., 60 seconds)
     /// * `server_source` - Optional server monitoring trait object
     /// * `clients_source` - Optional clients monitoring trait object
+    ///
+    /// The freshness threshold defaults to `refresh_interval / 2`.
     pub fn new(
         refresh_interval: Duration,
         server_source: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
@@ -127,6 +134,7 @@ impl SnapshotCache {
         Self {
             snapshot: RwLock::new(MonitoringSnapshot::default()),
             refresh_interval,
+            freshness_threshold: refresh_interval / 2,
             server_source,
             clients_source,
             sv1_source: None,
@@ -150,12 +158,31 @@ impl SnapshotCache {
         self.snapshot.read().unwrap().clone()
     }
 
-    /// Check if the cache needs to be refreshed.
+    /// Check if the cache needs to be refreshed (used by background task).
     pub fn needs_refresh(&self) -> bool {
         self.snapshot
             .read()
             .unwrap()
             .is_stale(self.refresh_interval)
+    }
+
+    /// Check if the cache is stale beyond the freshness threshold (used by API handlers).
+    fn is_stale(&self) -> bool {
+        self.snapshot
+            .read()
+            .unwrap()
+            .is_stale(self.freshness_threshold)
+    }
+
+    /// Refresh the cache if it's stale beyond the freshness threshold.
+    ///
+    /// This is called by API handlers to ensure fresh data. It only refreshes
+    /// if the cache is older than `freshness_threshold`, preventing excessive
+    /// refreshes from concurrent requests.
+    pub fn refresh_if_stale(&self) {
+        if self.is_stale() {
+            self.refresh();
+        }
     }
 
     /// Refresh the cache by reading from the data sources.

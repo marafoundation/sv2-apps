@@ -265,7 +265,8 @@ impl MonitoringServer {
             let mut interval = tokio::time::interval(refresh_interval);
             loop {
                 interval.tick().await;
-                cache_for_refresh.refresh();
+                // Only refresh if stale (respects freshness threshold)
+                cache_for_refresh.refresh_if_stale();
             }
         });
 
@@ -478,6 +479,9 @@ async fn handle_global(State(state): State<ServerState>) -> Json<GlobalInfo> {
     )
 )]
 async fn handle_server(State(state): State<ServerState>) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.server_monitoring {
         Some(monitoring) => {
             let summary = monitoring.get_server_summary();
@@ -514,6 +518,9 @@ async fn handle_server_channels(
     Query(params): Query<Pagination>,
     State(state): State<ServerState>,
 ) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.server_monitoring {
         Some(monitoring) => {
             let server = monitoring.get_server();
@@ -556,6 +563,9 @@ async fn handle_clients(
     Query(params): Query<Pagination>,
     State(state): State<ServerState>,
 ) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.clients_monitoring {
         Some(monitoring) => {
             let clients: Vec<ClientMetadata> = monitoring
@@ -600,6 +610,9 @@ async fn handle_client_by_id(
     Path(client_id): Path<usize>,
     State(state): State<ServerState>,
 ) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.clients_monitoring {
         Some(monitoring) => match monitoring.get_client_by_id(client_id) {
             Some(client) => Json(ClientResponse {
@@ -646,6 +659,9 @@ async fn handle_client_channels(
     Query(params): Query<Pagination>,
     State(state): State<ServerState>,
 ) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.clients_monitoring {
         Some(monitoring) => match monitoring.get_client_by_id(client_id) {
             Some(client) => {
@@ -698,6 +714,9 @@ async fn handle_sv1_clients(
     Query(params): Query<Pagination>,
     State(state): State<ServerState>,
 ) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.sv1_monitoring {
         Some(monitoring) => {
             let clients = monitoring.get_sv1_clients();
@@ -738,6 +757,9 @@ async fn handle_sv1_client_by_id(
     Path(client_id): Path<usize>,
     State(state): State<ServerState>,
 ) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     match &state.sv1_monitoring {
         Some(monitoring) => match monitoring.get_sv1_client_by_id(client_id) {
             Some(client) => Json(client).into_response(),
@@ -761,6 +783,9 @@ async fn handle_sv1_client_by_id(
 
 /// Handler for Prometheus metrics endpoint
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
+    // Refresh cache if stale beyond freshness threshold
+    state.cache.refresh_if_stale();
+
     let uptime_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
