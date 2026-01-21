@@ -73,7 +73,7 @@ impl PoolSv2 {
 
         debug!("Channels initialized.");
 
-        let channel_manager = ChannelManager::new(
+        let mut channel_manager = ChannelManager::new(
             self.config.clone(),
             channel_manager_to_tp_sender.clone(),
             tp_to_channel_manager_receiver,
@@ -97,6 +97,10 @@ impl PoolSv2 {
                 std::time::Duration::from_secs(self.config.monitoring_cache_refresh_secs()),
             )
             .expect("Failed to initialize monitoring server");
+
+            // Pass event metrics to ChannelManager for real-time counter increments
+            let event_metrics = monitoring_server.event_metrics();
+            channel_manager = channel_manager.with_event_metrics(event_metrics);
 
             // Create shutdown signal that waits for ShutdownAll
             let mut notify_shutdown_monitoring = notify_shutdown.subscribe();

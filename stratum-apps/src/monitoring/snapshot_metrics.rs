@@ -1,11 +1,20 @@
-//! Prometheus metrics definitions for SV2 monitoring
+//! Snapshot-based Prometheus metrics for SV2 monitoring.
+//!
+//! These metrics are populated from the snapshot cache during periodic refreshes
+//! and Prometheus scrapes. They represent point-in-time state (gauges) rather than
+//! real-time event counts (counters/histograms in EventMetrics).
 
-use prometheus::{Gauge, GaugeVec, Opts, Registry};
+use prometheus::{CounterVec, Gauge, GaugeVec, Opts, Registry};
 
-/// Prometheus metrics for the monitoring server.
+/// Snapshot-based metrics populated from cached monitoring state.
+///
+/// These are primarily gauges that represent current state (hashrate, channel counts)
+/// sampled periodically from business logic. Counters in this struct are legacy and
+/// being migrated to EventMetrics for proper event-driven collection.
+///
 /// Metrics are optional - only registered when the corresponding monitoring type is enabled.
 #[derive(Clone)]
-pub struct PrometheusMetrics {
+pub struct SnapshotMetrics {
     pub registry: Registry,
     // System metrics
     pub sv2_uptime_seconds: Gauge,
@@ -15,7 +24,7 @@ pub struct PrometheusMetrics {
     pub sv2_server_channels_standard: Option<Gauge>,
     pub sv2_server_hashrate_total: Option<Gauge>,
     pub sv2_server_channel_hashrate: Option<GaugeVec>,
-    pub sv2_server_shares_accepted_total: Option<GaugeVec>,
+    pub sv2_server_shares_accepted_total: Option<CounterVec>,
     // Clients metrics (downstream connections)
     pub sv2_clients_total: Option<Gauge>,
     pub sv2_client_channels_total: Option<Gauge>,
@@ -23,14 +32,14 @@ pub struct PrometheusMetrics {
     pub sv2_client_channels_standard: Option<Gauge>,
     pub sv2_client_hashrate_total: Option<Gauge>,
     pub sv2_client_channel_hashrate: Option<GaugeVec>,
-    pub sv2_client_shares_accepted_total: Option<GaugeVec>,
+    pub sv2_client_shares_accepted_total: Option<CounterVec>,
     pub sv2_client_channel_shares_per_minute: Option<GaugeVec>,
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
 }
 
-impl PrometheusMetrics {
+impl SnapshotMetrics {
     pub fn new(
         enable_server_metrics: bool,
         enable_clients_metrics: bool,
@@ -84,7 +93,7 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(channel_hashrate.clone()))?;
 
-            let shares_accepted = GaugeVec::new(
+            let shares_accepted = CounterVec::new(
                 Opts::new(
                     "sv2_server_shares_accepted_total",
                     "Total shares accepted per server channel",
@@ -153,7 +162,7 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(channel_hashrate.clone()))?;
 
-            let shares_accepted = GaugeVec::new(
+            let shares_accepted = CounterVec::new(
                 Opts::new(
                     "sv2_client_shares_accepted_total",
                     "Total shares accepted per client channel",

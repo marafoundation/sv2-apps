@@ -5,10 +5,10 @@ use super::{
         ClientInfo, ClientMetadata, ClientsMonitoring, ClientsSummary, ExtendedChannelInfo,
         StandardChannelInfo,
     },
-    prometheus_metrics::PrometheusMetrics,
     server::{
         ServerExtendedChannelInfo, ServerMonitoring, ServerStandardChannelInfo, ServerSummary,
     },
+    snapshot_metrics::SnapshotMetrics,
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
     GlobalInfo,
 };
@@ -88,7 +88,7 @@ struct ServerState {
     clients_monitoring: Option<Arc<dyn ClientsMonitoring + Send + Sync + 'static>>,
     sv1_monitoring: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync + 'static>>,
     start_time: u64,
-    metrics: PrometheusMetrics,
+    metrics: SnapshotMetrics,
     cache: Arc<super::snapshot_cache::SnapshotCache>,
 }
 
@@ -131,6 +131,7 @@ pub struct MonitoringServer {
     bind_address: SocketAddr,
     state: ServerState,
     refresh_interval: Duration,
+    event_metrics: Arc<super::event_metrics::EventMetrics>,
 }
 
 impl MonitoringServer {
@@ -179,7 +180,14 @@ impl MonitoringServer {
         let has_clients = snapshot.clients_summary.is_some();
         let has_sv1 = snapshot.sv1_summary.is_some();
 
-        let metrics = PrometheusMetrics::new(has_server, has_clients, has_sv1)?;
+        let metrics = SnapshotMetrics::new(has_server, has_clients, has_sv1)?;
+
+        // Create event metrics using the same registry
+        let event_metrics = Arc::new(super::event_metrics::EventMetrics::new(
+            &metrics.registry,
+            has_server,
+            has_clients,
+        )?);
 
         Ok(Self {
             bind_address,
@@ -204,7 +212,16 @@ impl MonitoringServer {
                 metrics,
                 cache,
             },
+            event_metrics,
         })
+    }
+
+    /// Get a reference to the event metrics for passing to business logic components.
+    ///
+    /// This allows ChannelManager and other components to increment counters
+    /// at the point where events occur (e.g., share acceptance).
+    pub fn event_metrics(&self) -> Arc<super::event_metrics::EventMetrics> {
+        self.event_metrics.clone()
     }
 
     /// Add SV1 client monitoring (optional, for Translator Proxy only)
@@ -228,7 +245,7 @@ impl MonitoringServer {
         let cached = Arc::new(super::snapshot_cache::CachedMonitoring::new(cache.clone()));
 
         // Re-create metrics with SV1 enabled
-        self.state.metrics = PrometheusMetrics::new(
+        self.state.metrics = SnapshotMetrics::new(
             self.state.server_monitoring.is_some(),
             self.state.clients_monitoring.is_some(),
             true, // Enable SV1 metrics
@@ -781,7 +798,10 @@ async fn handle_sv1_client_by_id(
     }
 }
 
-/// Handler for Prometheus metrics endpoint
+/// Prometheus metrics endpoint handler.
+///
+/// Collects snapshot-based metrics (gauges) from the cache and event-based metrics
+/// (counters/histograms) from EventMetrics, returning them in Prometheus text format.
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
     // Refresh cache if stale beyond freshness threshold
     state.cache.refresh_if_stale();
@@ -793,20 +813,15 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
 
-    // Reset per-channel metrics before repopulating
+    // Reset per-channel gauge metrics before repopulating
+    // Note: Counter metrics (shares_accepted) are NOT reset - they only increment
     if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
         metric.reset();
     }
     if let Some(ref metric) = state.metrics.sv2_client_channel_shares_per_minute {
         metric.reset();
     }
     if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
         metric.reset();
     }
 
@@ -827,15 +842,13 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
 
         let server = monitoring.get_server();
+
         for channel in &server.extended_channels {
             let channel_id = channel.channel_id.to_string();
             let user = &channel.user_identity;
 
-            if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.shares_accepted as f64);
-            }
+            // Note: shares_accepted counter is incremented in real-time by event metrics
+            // in the message handlers, not here in the snapshot-based collection
             if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
                 metric
                     .with_label_values(&[&channel_id, user])
@@ -847,11 +860,8 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
             let channel_id = channel.channel_id.to_string();
             let user = &channel.user_identity;
 
-            if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.shares_accepted as f64);
-            }
+            // Note: shares_accepted counter is incremented in real-time by event metrics
+            // in the message handlers, not here in the snapshot-based collection
             if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
                 metric
                     .with_label_values(&[&channel_id, user])
@@ -880,6 +890,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
 
         let clients = monitoring.get_clients();
+
         for client in &clients {
             let client_id = client.client_id.to_string();
 
@@ -887,11 +898,8 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                 let channel_id = channel.channel_id.to_string();
                 let user = &channel.user_identity;
 
-                if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_accepted as f64);
-                }
+                // Note: shares_accepted counter is incremented in real-time by event metrics
+                // in the message handlers, not here in the snapshot-based collection
                 if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
                     metric
                         .with_label_values(&[&client_id, &channel_id, user])
@@ -908,11 +916,8 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                 let channel_id = channel.channel_id.to_string();
                 let user = &channel.user_identity;
 
-                if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_accepted as f64);
-                }
+                // Note: shares_accepted counter is incremented in real-time by event metrics
+                // in the message handlers, not here in the snapshot-based collection
                 if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
                     metric
                         .with_label_values(&[&client_id, &channel_id, user])

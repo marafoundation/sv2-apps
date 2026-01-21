@@ -10,10 +10,11 @@
 //! - **SV1 clients**: Legacy SV1 connections (Translator only)
 
 pub mod client;
+pub mod event_metrics;
 pub mod http_server;
-pub mod prometheus_metrics;
 pub mod server;
 pub mod snapshot_cache;
+pub mod snapshot_metrics;
 pub mod sv1;
 
 pub use client::{
