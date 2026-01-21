@@ -53,6 +53,14 @@ impl PoolSv2 {
         let coinbase_outputs = vec![self.config.get_txout()];
         let mut encoded_outputs = vec![];
 
+        info!(
+            "Using coinbase reward script: {}",
+            self.config
+                .coinbase_reward_script()
+                .script_pubkey()
+                .to_hex_string()
+        );
+
         coinbase_outputs
             .consensus_encode(&mut encoded_outputs)
             .expect("Invalid coinbase output in config");
