@@ -58,6 +58,7 @@ required_extensions = [
 
 # Monitoring HTTP server address for exposing channel data (optional)
 monitoring_address = "0.0.0.0:9091"
+monitoring_cache_refresh_secs = 60
 
 # List of upstreams (Pool and JDS) used as backup endpoints
 # In case of shares refused by the Pool or JDS, the fallback system will propose the same job to the next upstream in this list

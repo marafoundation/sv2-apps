@@ -41,6 +41,7 @@ required_extensions = [
 ]
 
 monitoring_address = "127.0.0.1:9090"
+monitoring_cache_refresh_secs = 60
 
 # Bitcoin Core IPC config
 # Supported networks: mainnet, testnet4, signet, regtest

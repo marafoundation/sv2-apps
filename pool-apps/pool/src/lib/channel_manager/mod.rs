@@ -98,6 +98,9 @@ pub struct ChannelManager {
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).
     required_extensions: Vec<u16>,
+    /// Event-driven metrics for real-time Prometheus counter increments.
+    /// Optional - only present when monitoring is enabled.
+    pub(crate) event_metrics: Option<Arc<stratum_apps::monitoring::event_metrics::EventMetrics>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -161,9 +164,21 @@ impl ChannelManager {
             coinbase_reward_script: config.coinbase_reward_script().clone(),
             supported_extensions: config.supported_extensions().to_vec(),
             required_extensions: config.required_extensions().to_vec(),
+            event_metrics: None, // Will be set later if monitoring is enabled
         };
 
         Ok(channel_manager)
+    }
+
+    /// Set event metrics for real-time counter increments.
+    ///
+    /// This should be called after creating the ChannelManager if monitoring is enabled.
+    pub fn with_event_metrics(
+        mut self,
+        event_metrics: Arc<stratum_apps::monitoring::event_metrics::EventMetrics>,
+    ) -> Self {
+        self.event_metrics = Some(event_metrics);
+        self
     }
 
     /// Starts the downstream server, and accepts new connection request.
