@@ -28,6 +28,91 @@ pub use sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary};
 
 use utoipa::ToSchema;
 
+/// Common interface for extracting metrics from channel types.
+///
+/// This trait provides a unified way to access common channel data across
+/// different channel types (server/client, extended/standard), enabling
+/// generic metric collection without code duplication.
+pub trait ChannelMetrics {
+    fn channel_id(&self) -> u32;
+    fn user_identity(&self) -> &str;
+    fn nominal_hashrate(&self) -> f32;
+    fn shares_accepted(&self) -> u32;
+    fn shares_per_minute(&self) -> f32;
+}
+
+impl ChannelMetrics for ServerExtendedChannelInfo {
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn user_identity(&self) -> &str {
+        &self.user_identity
+    }
+    fn nominal_hashrate(&self) -> f32 {
+        self.nominal_hashrate
+    }
+    fn shares_accepted(&self) -> u32 {
+        self.shares_accepted
+    }
+    fn shares_per_minute(&self) -> f32 {
+        0.0 // Not tracked for server
+    }
+}
+
+impl ChannelMetrics for ServerStandardChannelInfo {
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn user_identity(&self) -> &str {
+        &self.user_identity
+    }
+    fn nominal_hashrate(&self) -> f32 {
+        self.nominal_hashrate
+    }
+    fn shares_accepted(&self) -> u32 {
+        self.shares_accepted
+    }
+    fn shares_per_minute(&self) -> f32 {
+        0.0 // Not tracked for server
+    }
+}
+
+impl ChannelMetrics for ExtendedChannelInfo {
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn user_identity(&self) -> &str {
+        &self.user_identity
+    }
+    fn nominal_hashrate(&self) -> f32 {
+        self.nominal_hashrate
+    }
+    fn shares_accepted(&self) -> u32 {
+        self.shares_accepted
+    }
+    fn shares_per_minute(&self) -> f32 {
+        self.shares_per_minute
+    }
+}
+
+impl ChannelMetrics for StandardChannelInfo {
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn user_identity(&self) -> &str {
+        &self.user_identity
+    }
+    fn nominal_hashrate(&self) -> f32 {
+        self.nominal_hashrate
+    }
+    fn shares_accepted(&self) -> u32 {
+        self.shares_accepted
+    }
+    fn shares_per_minute(&self) -> f32 {
+        self.shares_per_minute
+    }
+}
+
 /// Global statistics from `/api/v1/global` endpoint
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct GlobalInfo {

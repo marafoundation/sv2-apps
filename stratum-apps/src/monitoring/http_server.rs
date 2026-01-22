@@ -10,7 +10,7 @@ use super::{
         ServerExtendedChannelInfo, ServerMonitoring, ServerStandardChannelInfo, ServerSummary,
     },
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
-    GlobalInfo,
+    ChannelMetrics, GlobalInfo,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -22,10 +22,11 @@ use axum::{
 use prometheus::{Encoder, TextEncoder};
 use serde::Deserialize;
 use std::{
+    collections::HashSet,
     future::Future,
     net::SocketAddr,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -89,6 +90,10 @@ struct ServerState {
     sv1_monitoring: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync + 'static>>,
     start_time: u64,
     metrics: PrometheusMetrics,
+    cache: Arc<super::snapshot_cache::SnapshotCache>,
+    // Track active label combinations to clean up stale metrics
+    server_channel_labels: Arc<Mutex<HashSet<(String, String)>>>,
+    client_channel_labels: Arc<Mutex<HashSet<(String, String, String)>>>,
 }
 
 const DEFAULT_LIMIT: usize = 25;
@@ -161,6 +166,9 @@ impl MonitoringServer {
                 sv1_monitoring: None,
                 start_time,
                 metrics,
+                cache,
+                server_channel_labels: Arc::new(Mutex::new(HashSet::new())),
+                client_channel_labels: Arc::new(Mutex::new(HashSet::new())),
             },
         })
     }
@@ -683,6 +691,119 @@ async fn handle_sv1_client_by_id(
     }
 }
 
+/// Generic helper to collect server channel metrics
+fn collect_server_channels<C: ChannelMetrics>(
+    channels: &[C],
+    metrics: &PrometheusMetrics,
+    labels: &mut HashSet<(String, String)>,
+) {
+    for channel in channels {
+        let channel_id = channel.channel_id().to_string();
+        let user = channel.user_identity().to_string();
+
+        labels.insert((channel_id.clone(), user.clone()));
+
+        if let Some(ref metric) = metrics.sv2_server_shares_accepted_total {
+            metric
+                .with_label_values(&[&channel_id, &user])
+                .set(channel.shares_accepted() as f64);
+        }
+        if let Some(ref metric) = metrics.sv2_server_channel_hashrate {
+            metric
+                .with_label_values(&[&channel_id, &user])
+                .set(channel.nominal_hashrate() as f64);
+        }
+    }
+}
+
+/// Helper function to collect server channel metrics and track active labels
+fn collect_server_channel_metrics(
+    server: &super::server::ServerInfo,
+    metrics: &PrometheusMetrics,
+    labels: &mut HashSet<(String, String)>,
+) {
+    collect_server_channels(&server.extended_channels, metrics, labels);
+    collect_server_channels(&server.standard_channels, metrics, labels);
+}
+
+/// Generic helper to collect client channel metrics (works for both extended and standard)
+fn collect_client_channels<C: ChannelMetrics>(
+    client_id: &str,
+    channels: &[C],
+    metrics: &PrometheusMetrics,
+    labels: &mut HashSet<(String, String, String)>,
+) {
+    for channel in channels {
+        let channel_id = channel.channel_id().to_string();
+        let user = channel.user_identity().to_string();
+
+        labels.insert((client_id.to_string(), channel_id.clone(), user.clone()));
+
+        if let Some(ref metric) = metrics.sv2_client_shares_accepted_total {
+            metric
+                .with_label_values(&[client_id, &channel_id, &user])
+                .set(channel.shares_accepted() as f64);
+        }
+        if let Some(ref metric) = metrics.sv2_client_channel_hashrate {
+            metric
+                .with_label_values(&[client_id, &channel_id, &user])
+                .set(channel.nominal_hashrate() as f64);
+        }
+        if let Some(ref metric) = metrics.sv2_client_channel_shares_per_minute {
+            metric
+                .with_label_values(&[client_id, &channel_id, &user])
+                .set(channel.shares_per_minute() as f64);
+        }
+    }
+}
+
+/// Generic helper to clean up stale metrics
+fn cleanup_stale_metrics<L, F>(old_labels: &HashSet<L>, new_labels: &HashSet<L>, cleanup_fn: F)
+where
+    L: std::hash::Hash + Eq + Clone,
+    F: Fn(&L),
+{
+    let stale_labels: Vec<_> = old_labels.difference(new_labels).cloned().collect();
+    for label in &stale_labels {
+        cleanup_fn(label);
+    }
+}
+
+/// Helper function to clean up stale server metrics
+fn cleanup_stale_server_metrics(
+    old_labels: &HashSet<(String, String)>,
+    new_labels: &HashSet<(String, String)>,
+    metrics: &PrometheusMetrics,
+) {
+    cleanup_stale_metrics(old_labels, new_labels, |(channel_id, user)| {
+        if let Some(ref metric) = metrics.sv2_server_shares_accepted_total {
+            let _ = metric.remove_label_values(&[channel_id, user]);
+        }
+        if let Some(ref metric) = metrics.sv2_server_channel_hashrate {
+            let _ = metric.remove_label_values(&[channel_id, user]);
+        }
+    });
+}
+
+/// Helper function to clean up stale client metrics
+fn cleanup_stale_client_metrics(
+    old_labels: &HashSet<(String, String, String)>,
+    new_labels: &HashSet<(String, String, String)>,
+    metrics: &PrometheusMetrics,
+) {
+    cleanup_stale_metrics(old_labels, new_labels, |(client_id, channel_id, user)| {
+        if let Some(ref metric) = metrics.sv2_client_shares_accepted_total {
+            let _ = metric.remove_label_values(&[client_id, channel_id, user]);
+        }
+        if let Some(ref metric) = metrics.sv2_client_channel_hashrate {
+            let _ = metric.remove_label_values(&[client_id, channel_id, user]);
+        }
+        if let Some(ref metric) = metrics.sv2_client_channel_shares_per_minute {
+            let _ = metric.remove_label_values(&[client_id, channel_id, user]);
+        }
+    });
+}
+
 /// Handler for Prometheus metrics endpoint
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
     let uptime_secs = SystemTime::now()
@@ -692,22 +813,10 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
 
-    // Reset per-channel metrics before repopulating
-    if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_client_channel_shares_per_minute {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-        metric.reset();
-    }
+    // Clean up stale metrics before repopulating
+    // We track which label combinations are currently active, and remove any that are no longer present
+    let mut new_server_labels: HashSet<(String, String)> = HashSet::new();
+    let mut new_client_labels: HashSet<(String, String, String)> = HashSet::new();
 
     // Collect server metrics
     if let Some(monitoring) = &state.server_monitoring {
@@ -726,37 +835,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
 
         let server = monitoring.get_server();
-        for channel in &server.extended_channels {
-            let channel_id = channel.channel_id.to_string();
-            let user = &channel.user_identity;
-
-            if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.shares_accepted as f64);
-            }
-            if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.nominal_hashrate as f64);
-            }
-        }
-
-        for channel in &server.standard_channels {
-            let channel_id = channel.channel_id.to_string();
-            let user = &channel.user_identity;
-
-            if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.shares_accepted as f64);
-            }
-            if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.nominal_hashrate as f64);
-            }
-        }
+        collect_server_channel_metrics(&server, &state.metrics, &mut new_server_labels);
     }
 
     // Collect clients metrics
@@ -781,48 +860,18 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         let clients = monitoring.get_clients();
         for client in &clients {
             let client_id = client.client_id.to_string();
-
-            for channel in &client.extended_channels {
-                let channel_id = channel.channel_id.to_string();
-                let user = &channel.user_identity;
-
-                if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_accepted as f64);
-                }
-                if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.nominal_hashrate as f64);
-                }
-                if let Some(ref metric) = state.metrics.sv2_client_channel_shares_per_minute {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_per_minute as f64);
-                }
-            }
-
-            for channel in &client.standard_channels {
-                let channel_id = channel.channel_id.to_string();
-                let user = &channel.user_identity;
-
-                if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_accepted as f64);
-                }
-                if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.nominal_hashrate as f64);
-                }
-                if let Some(ref metric) = state.metrics.sv2_client_channel_shares_per_minute {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_per_minute as f64);
-                }
-            }
+            collect_client_channels(
+                &client_id,
+                &client.extended_channels,
+                &state.metrics,
+                &mut new_client_labels,
+            );
+            collect_client_channels(
+                &client_id,
+                &client.standard_channels,
+                &state.metrics,
+                &mut new_client_labels,
+            );
         }
     }
 
@@ -835,6 +884,18 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         if let Some(ref metric) = state.metrics.sv1_hashrate_total {
             metric.set(summary.total_hashrate as f64);
         }
+    }
+
+    // Clean up stale metrics by removing label combinations that are no longer active
+    // This prevents memory leaks when miners reconnect on different channels
+    if let Ok(mut old_server_labels) = state.server_channel_labels.lock() {
+        cleanup_stale_server_metrics(&old_server_labels, &new_server_labels, &state.metrics);
+        *old_server_labels = new_server_labels;
+    }
+
+    if let Ok(mut old_client_labels) = state.client_channel_labels.lock() {
+        cleanup_stale_client_metrics(&old_client_labels, &new_client_labels, &state.metrics);
+        *old_client_labels = new_client_labels;
     }
 
     // Encode and return metrics
