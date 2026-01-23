@@ -26,7 +26,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -90,7 +90,6 @@ struct ServerState {
     sv1_monitoring: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync + 'static>>,
     start_time: u64,
     metrics: PrometheusMetrics,
-    cache: Arc<super::snapshot_cache::SnapshotCache>,
     // Track active label combinations to clean up stale metrics
     server_channel_labels: Arc<Mutex<HashSet<(String, String)>>>,
     client_channel_labels: Arc<Mutex<HashSet<(String, String, String)>>>,
@@ -166,7 +165,6 @@ impl MonitoringServer {
                 sv1_monitoring: None,
                 start_time,
                 metrics,
-                cache,
                 server_channel_labels: Arc::new(Mutex::new(HashSet::new())),
                 client_channel_labels: Arc::new(Mutex::new(HashSet::new())),
             },
