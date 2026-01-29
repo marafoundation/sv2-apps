@@ -651,21 +651,48 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                             || group_channel_id == m.channel_id
                         {
                             // update aggregated channel state
-                            aggregated_channel
-                                .on_set_new_prev_hash(m_static.clone())
-                                .map_err(|e| {
-                                    error!("Failed to set new prev hash: {:?}", e);
-                                    TproxyError::fallback(
-                                        TproxyErrorKind::FailedToProcessSetNewPrevHash,
-                                    )
-                                })?;
+                            // Only process if this channel has the job as a future job
+                            if aggregated_channel
+                                .get_future_jobs()
+                                .contains_key(&m_static.job_id)
+                            {
+                                aggregated_channel
+                                    .on_set_new_prev_hash(m_static.clone())
+                                    .map_err(|e| {
+                                        error!("Failed to set new prev hash: {:?}", e);
+                                        TproxyError::fallback(
+                                            TproxyErrorKind::FailedToProcessSetNewPrevHash,
+                                        )
+                                    })?;
+
+                                // make sure the SetNewPrevHash message is sent to the aggregated
+                                // channel
+                                m_static.channel_id = AGGREGATED_CHANNEL_ID;
+                                set_new_prev_hash_messages.push(m_static.clone());
+
+                                // for the aggregated channel, send one NewExtendedMiningJob message to
+                                // the SV1Server
+                                let mut new_extended_mining_job_message = aggregated_channel
+                                    .get_active_job()
+                                    .expect("active job must exist after on_set_new_prev_hash")
+                                    .clone();
+                                new_extended_mining_job_message.0.channel_id = AGGREGATED_CHANNEL_ID;
+                                new_extended_mining_job_messages
+                                    .push(new_extended_mining_job_message.0);
+                            }
 
                             // update each extended channel state
+                            // Only process channels that have this job in their future_jobs
+                            // to avoid JobIdNotFound errors when multiple channels exist
                             for (_, channel) in channel_manager_data.extended_channels.iter() {
                                 let mut channel = channel.write().map_err(|e| {
                                     error!("Failed to write channel: {:?}", e);
                                     TproxyError::shutdown(TproxyErrorKind::PoisonLock)
                                 })?;
+                                // Skip channels that don't have this job as a future job
+                                if !channel.get_future_jobs().contains_key(&m_static.job_id) {
+                                    continue;
+                                }
                                 channel
                                     .on_set_new_prev_hash(m_static.clone())
                                     .map_err(|e| {
@@ -675,21 +702,6 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                                         )
                                     })?;
                             }
-
-                            // make sure the SetNewPrevHash message is sent to the aggregated
-                            // channel
-                            m_static.channel_id = AGGREGATED_CHANNEL_ID;
-                            set_new_prev_hash_messages.push(m_static.clone());
-
-                            // for the aggregated channel, send one NewExtendedMiningJob message to
-                            // the SV1Server
-                            let mut new_extended_mining_job_message = aggregated_channel
-                                .get_active_job()
-                                .expect("active job must exist")
-                                .clone();
-                            new_extended_mining_job_message.0.channel_id = AGGREGATED_CHANNEL_ID;
-                            new_extended_mining_job_messages
-                                .push(new_extended_mining_job_message.0);
                         } else {
                             // we got a nonsense channel id, we should log an error and ignore the
                             // message
@@ -729,6 +741,10 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                                 error!("Failed to write channel: {:?}", e);
                                 TproxyError::shutdown(TproxyErrorKind::PoisonLock)
                             })?;
+                            // Skip channels that don't have this job as a future job
+                            if !channel.get_future_jobs().contains_key(&m_static.job_id) {
+                                continue;
+                            }
                             channel
                                 .on_set_new_prev_hash(m_static.clone())
                                 .map_err(|e| {
@@ -748,7 +764,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                             // the SV1Server
                             let new_extended_mining_job_message = channel
                                 .get_active_job()
-                                .expect("active job must exist")
+                                .expect("active job must exist after on_set_new_prev_hash")
                                 .clone();
                             new_extended_mining_job_messages
                                 .push(new_extended_mining_job_message.0);
@@ -775,24 +791,32 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                         })?;
 
                         // update channel state
-                        channel
-                            .on_set_new_prev_hash(m_static.clone())
-                            .map_err(|e| {
-                                error!("Failed to set new prev hash: {:?}", e);
-                                TproxyError::fallback(
-                                    TproxyErrorKind::FailedToProcessSetNewPrevHash,
-                                )
-                            })?;
+                        // Only process if this channel has the job as a future job
+                        if channel.get_future_jobs().contains_key(&m_static.job_id) {
+                            channel
+                                .on_set_new_prev_hash(m_static.clone())
+                                .map_err(|e| {
+                                    error!("Failed to set new prev hash: {:?}", e);
+                                    TproxyError::fallback(
+                                        TproxyErrorKind::FailedToProcessSetNewPrevHash,
+                                    )
+                                })?;
 
-                        // make sure the SetNewPrevHash message is sent to the channel
-                        set_new_prev_hash_messages.push(m_static.clone());
+                            // make sure the SetNewPrevHash message is sent to the channel
+                            set_new_prev_hash_messages.push(m_static.clone());
 
-                        // for the channel, send one NewExtendedMiningJob message to the SV1Server
-                        let new_extended_mining_job_message = channel
-                            .get_active_job()
-                            .expect("active job must exist")
-                            .clone();
-                        new_extended_mining_job_messages.push(new_extended_mining_job_message.0);
+                            // for the channel, send one NewExtendedMiningJob message to the SV1Server
+                            let new_extended_mining_job_message = channel
+                                .get_active_job()
+                                .expect("active job must exist after on_set_new_prev_hash")
+                                .clone();
+                            new_extended_mining_job_messages.push(new_extended_mining_job_message.0);
+                        } else {
+                            warn!(
+                                "Job {} not found in future_jobs for channel {}, skipping SetNewPrevHash",
+                                m_static.job_id, m_static.channel_id
+                            );
+                        }
                     }
                     Ok::<
                         (
