@@ -1613,3 +1613,492 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
 
     assert!(TcpListener::bind(tproxy_addr).await.is_err());
 }
+
+/// This test reproduces the JobIdNotFound bug that occurs when multiple SV1 miners connect
+/// simultaneously in aggregated mode (`aggregate_channels = true`).
+///
+/// ## Bug Description
+/// When `SetNewPrevHash` arrives targeting a group channel ID, the translator iterates over ALL
+/// extended channels in that group and calls `on_set_new_prev_hash()` on each. The problem is that
+/// `on_set_new_prev_hash()` removes the job from `future_jobs` and clears all remaining future jobs.
+/// This causes subsequent channels to fail when they try to find the same job_id, resulting in:
+/// ```
+/// ERROR Failed to set new prev hash: JobIdNotFound
+/// WARN  Upstream connection dropped: FailedToProcessSetNewPrevHash
+/// ```
+///
+/// ## Test Strategy
+/// 1. Use MockUpstream to have precise control over message timing and content
+/// 2. Start translator in aggregated mode
+/// 3. Open multiple extended channels (5 miners) - all assigned to the same group channel
+/// 4. For each channel, send initial job and SetNewPrevHash to establish the channel
+/// 5. **Critical step**: Send a NewExtendedMiningJob (future job) to the GROUP channel ID,
+///    followed by SetNewPrevHash to the GROUP channel ID
+/// 6. This triggers the bug - all channels try to process the same job_id from the group channel
+/// 7. Use timeout to detect if translator crashes (sniffer operations will hang)
+///
+/// ## Expected Behavior
+/// - **Without fix (origin/main)**: Test FAILS - translator crashes with JobIdNotFound, causing
+///   timeout when waiting for subsequent messages
+/// - **With fix**: Test PASSES - translator correctly handles the SetNewPrevHash by checking if
+///   each channel has the job before processing
+///
+/// ## Related Issue
+/// https://github.com/stratum-mining/sv2-apps/issues/223
+#[tokio::test]
+async fn aggregated_translator_handles_group_channel_set_new_prev_hash_without_job_id_not_found() {
+    start_tracing();
+
+    // Create MockUpstream for precise message control
+    let mock_upstream_addr = get_available_address();
+    let mock_upstream = MockUpstream::new(mock_upstream_addr);
+    let send_to_tproxy = mock_upstream.start().await;
+
+    // Create sniffer between MockUpstream and translator for message inspection
+    let (sniffer, sniffer_addr) = start_sniffer("", mock_upstream_addr, false, vec![], None);
+
+    // Start translator in AGGREGATED mode (aggregate_channels = true)
+    // This is the mode where the bug manifests
+    let (_tproxy, tproxy_addr) =
+        start_sv2_translator(&[sniffer_addr], true, vec![], vec![], None).await;
+
+    // Wait for translator to send SetupConnection
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SETUP_CONNECTION,
+        )
+        .await;
+
+    // Respond with SetupConnectionSuccess
+    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        SetupConnectionSuccess {
+            used_version: 2,
+            flags: 0,
+        },
+    ));
+    send_to_tproxy.send(setup_connection_success).await.unwrap();
+
+    // Configuration
+    const N_MINERS: u32 = 5;
+    const GROUP_CHANNEL_ID: u32 = 100;
+    const AGGREGATED_CHANNEL_ID: u32 = 0; // In aggregated mode, all miners share channel 0
+
+    // Keep references to minerd processes to prevent them from being dropped
+    let mut minerd_vec = Vec::new();
+
+    // ========================================================================
+    // PHASE 1: Open multiple extended channels (all will be aggregated)
+    // In aggregated mode, only the FIRST miner triggers an OpenExtendedMiningChannel
+    // Subsequent miners are aggregated into the same channel
+    // ========================================================================
+
+    // Start the first miner - this triggers the OpenExtendedMiningChannel
+    let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+    minerd_vec.push(minerd_process);
+
+    // Wait for OpenExtendedMiningChannel from translator
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+
+    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+        match sniffer.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
+                break msg;
+            }
+            _ => continue,
+        };
+    };
+
+    // Respond with OpenExtendedMiningChannelSuccess
+    // In aggregated mode, all miners will share this channel
+    let open_extended_mining_channel_success = AnyMessage::Mining(
+        parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+            request_id: open_extended_mining_channel.request_id,
+            channel_id: AGGREGATED_CHANNEL_ID,
+            target: hex::decode("0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            // Full extranonce has a total of 12 bytes (4 prefix + 8 miner-controlled)
+            extranonce_size: 8,
+            extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
+            group_channel_id: GROUP_CHANNEL_ID,
+        }),
+    );
+    send_to_tproxy
+        .send(open_extended_mining_channel_success)
+        .await
+        .unwrap();
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+
+    // Send initial NewExtendedMiningJob (job_id=1) to the aggregated channel
+    // This is NOT a future job (min_ntime is None), so it's immediately active
+    let new_extended_mining_job_1 = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(
+        NewExtendedMiningJob {
+            channel_id: AGGREGATED_CHANNEL_ID,
+            job_id: 1,
+            min_ntime: Sv2Option::new(None), // Not a future job
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            coinbase_tx_prefix: hex::decode(
+                "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f0c",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            coinbase_tx_suffix: hex::decode(
+                "feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        },
+    ));
+    send_to_tproxy
+        .send(new_extended_mining_job_1)
+        .await
+        .unwrap();
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+
+    // Send SetNewPrevHash for job_id=1 to the aggregated channel
+    let set_new_prev_hash_1 =
+        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+            channel_id: AGGREGATED_CHANNEL_ID,
+            job_id: 1,
+            prev_hash: hex::decode(
+                "3ab7089cd2cd30f133552cfde82c4cb239cd3c2310306f9d825e088a1772cc39",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            min_ntime: 1766782170,
+            nbits: 0x207fffff,
+        }));
+    send_to_tproxy.send(set_new_prev_hash_1).await.unwrap();
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+
+    // Now start additional miners - in aggregated mode, they don't trigger new OpenExtendedMiningChannel
+    // The translator aggregates them into the existing channel
+    for _i in 1..N_MINERS {
+        let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+        minerd_vec.push(minerd_process);
+
+        // Small delay to let the miner connect and be aggregated
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify no new OpenExtendedMiningChannel is sent (aggregated mode)
+        sniffer
+            .assert_message_not_present(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+            )
+            .await;
+    }
+
+    // ========================================================================
+    // PHASE 2: Verify miners are working - wait for at least one share submission
+    // ========================================================================
+
+    // Use a timeout to detect if translator has already crashed
+    let share_wait_result = tokio::time::timeout(Duration::from_secs(30), async {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+            )
+            .await;
+    })
+    .await;
+
+    assert!(
+        share_wait_result.is_ok(),
+        "Translator should be alive and miners should submit shares after initial setup"
+    );
+
+    // Clean the queue for the next phase
+    while sniffer.next_message_from_downstream().is_some() {}
+
+    // ========================================================================
+    // PHASE 3: Trigger the bug - send future job + SetNewPrevHash to GROUP channel
+    // This is where the bug manifests: all aggregated channels try to process
+    // the same job_id, but only the first one succeeds because it removes
+    // the job from future_jobs and clears remaining future jobs
+    // ========================================================================
+
+    // Send NewExtendedMiningJob (job_id=2) as a FUTURE JOB to the GROUP channel ID
+    // Note: min_ntime with Some value indicates this is a future job
+    let new_extended_mining_job_2 = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(
+        NewExtendedMiningJob {
+            channel_id: GROUP_CHANNEL_ID, // Directed to GROUP channel, not individual channel
+            job_id: 2,
+            min_ntime: Sv2Option::new(Some(1766782180)), // Future job (has min_ntime)
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            coinbase_tx_prefix: hex::decode(
+                "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265300162f5374726174756d2056322053524920506f6f6c2f2f0c",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            coinbase_tx_suffix: hex::decode(
+                "feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        },
+    ));
+    send_to_tproxy
+        .send(new_extended_mining_job_2)
+        .await
+        .unwrap();
+
+    // Wait for the job to be received
+    let job_received = tokio::time::timeout(Duration::from_secs(10), async {
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+    })
+    .await;
+
+    assert!(
+        job_received.is_ok(),
+        "Translator should forward NewExtendedMiningJob to downstream"
+    );
+
+    // ========================================================================
+    // CRITICAL: Send SetNewPrevHash to GROUP channel with job_id=2
+    // This is the exact scenario that triggers the bug!
+    // The translator will iterate over all channels in the group and call
+    // on_set_new_prev_hash() on each. Without the fix, the first channel
+    // removes the job from future_jobs, causing subsequent channels to fail.
+    // ========================================================================
+
+    let set_new_prev_hash_2 =
+        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+            channel_id: GROUP_CHANNEL_ID, // Directed to GROUP channel!
+            job_id: 2,
+            prev_hash: hex::decode(
+                "2089973501ad229333ae0e9c52fa160f95616890db364a71ccfb77773a8b54cb",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            min_ntime: 1766782180,
+            nbits: 0x207fffff,
+        }));
+    send_to_tproxy.send(set_new_prev_hash_2).await.unwrap();
+
+    // ========================================================================
+    // PHASE 4: Verify translator survived - check it can still process messages
+    // Without the fix, the translator crashes here and all subsequent operations
+    // will timeout
+    // ========================================================================
+
+    // Wait for SetNewPrevHash to be forwarded downstream
+    // If translator crashed, this will timeout
+    let prev_hash_result = tokio::time::timeout(Duration::from_secs(15), async {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .await;
+    })
+    .await;
+
+    assert!(
+        prev_hash_result.is_ok(),
+        "Translator should survive SetNewPrevHash to group channel and forward it downstream. \
+         If this times out, the translator likely crashed with JobIdNotFound error."
+    );
+
+    // Clean queue
+    while sniffer.next_message_from_downstream().is_some() {}
+    while sniffer.next_message_from_upstream().is_some() {}
+
+    // ========================================================================
+    // PHASE 5: Additional verification - miners should continue submitting shares
+    // This confirms the translator is still fully operational
+    // ========================================================================
+
+    // Wait for shares to be submitted for the new job (job_id=2)
+    let shares_after_bug_trigger = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            sniffer
+                .wait_for_message_type(
+                    MessageDirection::ToUpstream,
+                    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+                )
+                .await;
+            match sniffer.next_message_from_downstream() {
+                Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => {
+                    if msg.job_id == 2 {
+                        // Got a share for job_id=2, translator is working correctly
+                        return msg;
+                    }
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        shares_after_bug_trigger.is_ok(),
+        "Miners should submit shares for job_id=2 after SetNewPrevHash to group channel. \
+         If this times out, the translator likely crashed with JobIdNotFound error."
+    );
+
+    let share = shares_after_bug_trigger.unwrap();
+    assert_eq!(
+        share.channel_id, AGGREGATED_CHANNEL_ID,
+        "Share should be submitted to the aggregated channel ID, not the group channel ID"
+    );
+
+    // ========================================================================
+    // PHASE 6: Repeat the pattern to ensure consistent behavior
+    // Send another future job + SetNewPrevHash to GROUP channel
+    // ========================================================================
+
+    // Send another future job (job_id=3) to GROUP channel
+    let new_extended_mining_job_3 = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(
+        NewExtendedMiningJob {
+            channel_id: GROUP_CHANNEL_ID,
+            job_id: 3,
+            min_ntime: Sv2Option::new(Some(1766782190)), // Future job
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            coinbase_tx_prefix: hex::decode(
+                "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265400162f5374726174756d2056322053524920506f6f6c2f2f0c",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            coinbase_tx_suffix: hex::decode(
+                "feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        },
+    ));
+    send_to_tproxy
+        .send(new_extended_mining_job_3)
+        .await
+        .unwrap();
+
+    let job3_received = tokio::time::timeout(Duration::from_secs(10), async {
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+    })
+    .await;
+
+    assert!(
+        job3_received.is_ok(),
+        "Translator should forward third NewExtendedMiningJob"
+    );
+
+    // Send SetNewPrevHash for job_id=3 to GROUP channel
+    let set_new_prev_hash_3 =
+        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+            channel_id: GROUP_CHANNEL_ID,
+            job_id: 3,
+            prev_hash: hex::decode(
+                "1122334455667788990011223344556677889900112233445566778899001122",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            min_ntime: 1766782190,
+            nbits: 0x207fffff,
+        }));
+    send_to_tproxy.send(set_new_prev_hash_3).await.unwrap();
+
+    let prev_hash_3_result = tokio::time::timeout(Duration::from_secs(15), async {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .await;
+    })
+    .await;
+
+    assert!(
+        prev_hash_3_result.is_ok(),
+        "Translator should survive multiple SetNewPrevHash messages to group channel"
+    );
+
+    // Wait for shares for job_id=3
+    let shares_job3 = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            sniffer
+                .wait_for_message_type(
+                    MessageDirection::ToUpstream,
+                    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+                )
+                .await;
+            match sniffer.next_message_from_downstream() {
+                Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => {
+                    if msg.job_id == 3 {
+                        return msg;
+                    }
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        shares_job3.is_ok(),
+        "Miners should submit shares for job_id=3"
+    );
+
+    // ========================================================================
+    // PHASE 7: Final verification - translator is still listening for connections
+    // ========================================================================
+
+    // The translator should still be bound to its address (not crashed)
+    // If we can't bind to the address, it means the translator is still running
+    assert!(
+        TcpListener::bind(tproxy_addr).await.is_err(),
+        "Translator should still be running and bound to its address"
+    );
+
+    println!("Test passed: Translator correctly handles SetNewPrevHash to group channel without JobIdNotFound error");
+}
