@@ -12,6 +12,33 @@ use crate::{
     utils::{validate_sv1_share, AGGREGATED_CHANNEL_ID},
 };
 
+/// Maximum length for user identity in bytes.
+/// This is a protocol limit from the UserIdentity TLV in SV2 extensions.
+const MAX_USER_IDENTITY_BYTES: usize = 32;
+
+/// Truncates a string to a maximum byte length, respecting UTF-8 character boundaries.
+///
+/// If the input string exceeds `max_bytes`, it is truncated at the last valid
+/// UTF-8 character boundary before or at `max_bytes`.
+///
+/// # Arguments
+/// * `s` - The input string to potentially truncate
+/// * `max_bytes` - Maximum number of bytes allowed
+///
+/// # Returns
+/// A string slice that is at most `max_bytes` long
+fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Find the last valid UTF-8 char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 // Implements `IsServer` for `Sv1Server` to handle the Sv1 messages.
 #[hotpath::measure_all]
 impl IsServer<'static> for Sv1Server {
@@ -192,6 +219,9 @@ impl IsServer<'static> for Sv1Server {
     }
 
     /// Authorizes a Downstream role.
+    ///
+    /// If the username exceeds 32 bytes (the protocol limit for UserIdentity TLV),
+    /// it will be truncated and a warning will be logged.
     fn authorize(&mut self, client_id: Option<usize>, name: &str) {
         let downstream_id = client_id.expect("Downstream id should exist");
         let downstream = self
@@ -200,11 +230,29 @@ impl IsServer<'static> for Sv1Server {
             .expect("Downstream should exist");
 
         let is_authorized = self.is_authorized(client_id, name);
+
+        // Truncate user_identity if it exceeds the protocol limit (32 bytes)
+        let user_identity = if name.len() > MAX_USER_IDENTITY_BYTES {
+            let truncated = truncate_to_bytes(name, MAX_USER_IDENTITY_BYTES);
+            warn!(
+                "Downstream {}: Username '{}' exceeds {} bytes ({} bytes), truncating to '{}'. \
+                 Consider using a shorter username for full visibility on the pool dashboard.",
+                downstream_id,
+                name,
+                MAX_USER_IDENTITY_BYTES,
+                name.len(),
+                truncated
+            );
+            truncated.to_string()
+        } else {
+            name.to_string()
+        };
+
         downstream.downstream_data.super_safe_lock(|data| {
             if !is_authorized {
                 data.authorized_worker_name = name.to_string();
             }
-            data.user_identity = name.to_string();
+            data.user_identity = user_identity.clone();
             debug!(
                 "Down: Set user_identity to '{}' for downstream {}",
                 data.user_identity, downstream_id
