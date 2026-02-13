@@ -353,6 +353,16 @@ impl ChannelManager {
         Ok(channel_manager)
     }
 
+    /// Sets the negotiated extensions.
+    ///
+    /// This is used after upstream connection setup to store the extensions
+    /// that were successfully negotiated with the upstream server.
+    pub fn set_negotiated_extensions(&self, extensions: Vec<u16>) {
+        self.channel_manager_data.super_safe_lock(|data| {
+            data.negotiated_extensions = extensions;
+        });
+    }
+
     // Bootstraps a group channel with the given parameters.
     // Returns a `GroupChannel` if successful, otherwise returns `None`.
     //

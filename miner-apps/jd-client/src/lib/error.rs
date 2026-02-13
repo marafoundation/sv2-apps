@@ -226,6 +226,8 @@ pub enum JDCErrorKind {
     RequiredExtensionsNotSupported(Vec<u16>),
     /// Server requires extensions that the translator doesn't support
     ServerRequiresUnsupportedExtensions(Vec<u16>),
+    /// Extension negotiation timed out waiting for response
+    ExtensionNegotiationTimeout,
     /// BitcoinCoreSv2 cancellation token activated
     BitcoinCoreSv2CancellationTokenActivated,
     /// Failed to create BitcoinCoreSv2 tokio runtime
@@ -372,6 +374,9 @@ impl fmt::Display for JDCErrorKind {
             }
             ServerRequiresUnsupportedExtensions(extensions) => {
                 write!(f, "Server requires extensions that the translator doesn't support: {extensions:?}")
+            }
+            ExtensionNegotiationTimeout => {
+                write!(f, "Extension negotiation timed out waiting for response")
             }
             BitcoinCoreSv2CancellationTokenActivated => {
                 write!(f, "BitcoinCoreSv2 cancellation token activated")
