@@ -134,7 +134,7 @@ impl TranslatorSv2 {
 
         info!("Initializing upstream connection...");
 
-        let init_result = match self
+        let negotiated_extensions = match self
             .initialize_upstream(
                 &mut upstream_addresses,
                 channel_manager_to_upstream_receiver.clone(),
@@ -148,7 +148,7 @@ impl TranslatorSv2 {
             )
             .await
         {
-            Ok(result) => result,
+            Ok(extensions) => extensions,
             Err(e) => {
                 error!("Failed to initialize any upstream connection: {e:?}");
                 self.shutdown_notify.notify_waiters();
@@ -168,7 +168,7 @@ impl TranslatorSv2 {
             status_sender.clone(),
             self.config.supported_extensions.clone(),
             self.config.required_extensions.clone(),
-            init_result.negotiated_extensions,
+            negotiated_extensions,
         ));
 
         info!("Launching ChannelManager tasks...");
@@ -303,10 +303,10 @@ impl TranslatorSv2 {
                                     sv1_server.clone(),
                                     self.config.required_extensions.clone(),
                                 ).await {
-                                    Ok(fallback_result) => {
+                                    Ok(negotiated_extensions) => {
                                         info!(
                                             "Upstream restarted successfully with extensions: {:?}",
-                                            fallback_result.negotiated_extensions
+                                            negotiated_extensions
                                         );
 
                                         channel_manager = Arc::new(ChannelManager::new(
@@ -317,7 +317,7 @@ impl TranslatorSv2 {
                                             status_sender.clone(),
                                             self.config.supported_extensions.clone(),
                                             self.config.required_extensions.clone(),
-                                            fallback_result.negotiated_extensions,
+                                            negotiated_extensions,
                                         ));
                                     }
                                     Err(e) => {
@@ -442,7 +442,7 @@ impl TranslatorSv2 {
     /// to avoid hammering known-bad endpoints during failover.
     ///
     /// # Returns
-    /// * `Ok(UpstreamInitResult)` - Contains the negotiated extensions to be passed to ChannelManager
+    /// * `Ok(Vec<u16>)` - The negotiated extensions to be passed to ChannelManager
     /// * `Err(TproxyErrorKind)` - All upstreams failed
     #[allow(clippy::too_many_arguments)]
     pub async fn initialize_upstream(
@@ -456,7 +456,7 @@ impl TranslatorSv2 {
         task_manager: Arc<TaskManager>,
         sv1_server_instance: Arc<Sv1Server>,
         required_extensions: Vec<u16>,
-    ) -> Result<UpstreamInitResult, TproxyErrorKind> {
+    ) -> Result<Vec<u16>, TproxyErrorKind> {
         const MAX_RETRIES: usize = 3;
         let upstream_len = upstreams.len();
         for (i, upstream_entry) in upstreams.iter_mut().enumerate() {
@@ -492,10 +492,10 @@ impl TranslatorSv2 {
                 )
                 .await
                 {
-                    Ok(init_result) => {
+                    Ok(negotiated_extensions) => {
                         info!(
                             "Extension negotiation complete. Negotiated extensions: {:?}",
-                            init_result.negotiated_extensions
+                            negotiated_extensions
                         );
 
                         // Now that extensions are negotiated, start the SV1 server
@@ -514,7 +514,7 @@ impl TranslatorSv2 {
                         }
 
                         upstream_entry.tried_or_flagged = true;
-                        return Ok(init_result);
+                        return Ok(negotiated_extensions);
                     }
                     Err(e) => {
                         warn!(
@@ -538,14 +538,6 @@ impl TranslatorSv2 {
     }
 }
 
-/// Result of successful upstream initialization.
-/// Contains the negotiated extensions that should be passed to the ChannelManager.
-pub struct UpstreamInitResult {
-    /// Extensions that were successfully negotiated with the upstream server.
-    /// This should be stored in the ChannelManager before starting the SV1 server.
-    pub negotiated_extensions: Vec<u16>,
-}
-
 // Attempts to initialize a single upstream.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), hotpath::measure)]
@@ -558,7 +550,7 @@ async fn try_initialize_upstream(
     status_sender: Sender<Status>,
     task_manager: Arc<TaskManager>,
     required_extensions: Vec<u16>,
-) -> Result<UpstreamInitResult, TproxyErrorKind> {
+) -> Result<Vec<u16>, TproxyErrorKind> {
     let upstream = Upstream::new(
         upstream_addr,
         upstream_to_channel_manager_sender,
@@ -570,18 +562,15 @@ async fn try_initialize_upstream(
     )
     .await?;
 
-    let negotiated_extensions = upstream
+    upstream
         .start(
             cancellation_token,
             fallback_coordinator,
             status_sender,
             task_manager,
         )
-        .await?;
-
-    Ok(UpstreamInitResult {
-        negotiated_extensions,
-    })
+        .await
+        .map_err(|e| e.kind)
 }
 
 /// Defines the operational mode for Translator Proxy.
