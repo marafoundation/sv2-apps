@@ -22,7 +22,10 @@ use stratum_apps::{
     stratum_core::{
         binary_sv2::{self, Seq064K},
         codec_sv2::HandshakeRole,
-        extensions_sv2::{RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess},
+        extensions_sv2::{
+            RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
+        },
         framing_sv2,
         handlers_sv2::HandleCommonMessagesFromServerAsync,
         noise_sv2::Initiator,
@@ -293,13 +296,8 @@ impl Upstream {
         let msg_type = header.msg_type();
         let payload = response.payload();
 
-        // Message types for extension negotiation:
-        // 0x00 = RequestExtensions
-        // 0x01 = RequestExtensionsSuccess
-        // 0x02 = RequestExtensionsError
         match msg_type {
-            0x01 => {
-                // RequestExtensionsSuccess
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS => {
                 let msg: RequestExtensionsSuccess =
                     binary_sv2::from_bytes(payload).map_err(|e| {
                         error!("Failed to parse RequestExtensionsSuccess: {:?}", e);
@@ -330,8 +328,7 @@ impl Upstream {
                 info!("Successfully negotiated extensions: {:?}", supported);
                 Ok(supported)
             }
-            0x02 => {
-                // RequestExtensionsError
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR => {
                 let msg: RequestExtensionsError = binary_sv2::from_bytes(payload).map_err(|e| {
                     error!("Failed to parse RequestExtensionsError: {:?}", e);
                     JDCError::fallback(JDCErrorKind::BinarySv2(e))
