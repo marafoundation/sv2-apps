@@ -223,7 +223,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         for message in messages {
-            let _ = message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(self).await;
         }
 
         Ok(())
@@ -586,7 +586,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         for message in messages {
-            let _ = message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(self).await;
         }
 
         Ok(())

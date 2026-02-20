@@ -144,6 +144,7 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
                 AnyMessage::Extensions(new_require_extensions.into_static().into())
                     .try_into()
                     .map_err(JDCError::shutdown)?;
+            let sent_bytes = sv2_frame.encoded_length() as u64;
 
             self.channel_manager_channel
                 .upstream_sender
@@ -153,6 +154,7 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
                     error!("Failed to send message to upstream: {:?}", e);
                     JDCError::fallback(JDCErrorKind::ChannelErrorSender)
                 })?;
+            self.record_upstream_sent_bytes(sent_bytes);
         }
 
         Ok(())

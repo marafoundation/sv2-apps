@@ -1,4 +1,11 @@
-use std::time::Instant;
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+
 use stratum_apps::{
     stratum_core::{
         bitcoin::Target,
@@ -37,10 +44,19 @@ pub struct DownstreamData {
     pub upstream_target: Option<Target>,
     // Timestamp of when the last job was received by this downstream, used for keepalive check
     pub last_job_received_time: Option<Instant>,
+    /// Cumulative SV1 TCP bytes received from the miner
+    pub sv1_bytes_received: Arc<AtomicU64>,
+    /// Cumulative SV1 TCP bytes sent to the miner
+    pub sv1_bytes_sent: Arc<AtomicU64>,
 }
 
 impl DownstreamData {
-    pub fn new(hashrate: Option<Hashrate>, target: Target) -> Self {
+    pub fn new(
+        hashrate: Option<Hashrate>,
+        target: Target,
+        sv1_bytes_received: Arc<AtomicU64>,
+        sv1_bytes_sent: Arc<AtomicU64>,
+    ) -> Self {
         DownstreamData {
             channel_id: None,
             extranonce1: vec![0; 8]
@@ -62,7 +78,19 @@ impl DownstreamData {
             pending_share: None,
             upstream_target: None,
             last_job_received_time: None,
+            sv1_bytes_received,
+            sv1_bytes_sent,
         }
+    }
+
+    /// Returns the current SV1 TCP bytes received from the miner.
+    pub fn get_sv1_bytes_received(&self) -> u64 {
+        self.sv1_bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current SV1 TCP bytes sent to the miner.
+    pub fn get_sv1_bytes_sent(&self) -> u64 {
+        self.sv1_bytes_sent.load(Ordering::Relaxed)
     }
 
     pub fn set_pending_target(&mut self, new_target: Target, downstream_id: DownstreamId) {

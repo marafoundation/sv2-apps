@@ -222,11 +222,13 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
             .try_into()
             .map_err(JDCError::shutdown)?;
+        let sent_bytes = sv2_frame.encoded_length() as u64;
         self.channel_manager_channel
             .upstream_sender
             .send(sv2_frame)
             .await
             .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
+        self.record_upstream_sent(channel_id, sent_bytes);
 
         info!("Successfully sent SetCustomMiningJob to the upstream with channel_id: {channel_id}");
         Ok(())

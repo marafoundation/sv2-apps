@@ -75,6 +75,8 @@ tokio::spawn(async move {
 - `sv2_server_channel_hashrate{channel_id, user_identity}` - Per-channel hashrate
 - `sv2_server_shares_accepted_total{channel_id, user_identity}` - Per-channel shares
 - `sv2_server_blocks_found_total` - Total blocks found across all current server channels
+- `sv2_server_bytes_received_total` - Total bytes received from the server
+- `sv2_server_bytes_sent_total` - Total bytes sent to the server
 
 **Clients:**
 - `sv2_clients_total` - Connected client count
@@ -83,7 +85,25 @@ tokio::spawn(async move {
 - `sv2_client_channel_hashrate{client_id, channel_id, user_identity}` - Per-channel hashrate
 - `sv2_client_shares_accepted_total{client_id, channel_id, user_identity}` - Per-channel shares
 - `sv2_client_blocks_found_total` - Total blocks found across all current client channels
+- `sv2_client_bytes_received_total` - Total bytes received from all clients
+- `sv2_client_bytes_sent_total` - Total bytes sent to all clients
 
 **Sv1 (Translator Proxy only):**
 - `sv1_clients_total` - Sv1 client count
 - `sv1_hashrate_total` - Sv1 total hashrate
+- `sv1_client_bytes_received_total{client_id, user_identity}` - Bytes received per SV1 client
+- `sv1_client_bytes_sent_total{client_id, user_identity}` - Bytes sent per SV1 client
+
+## Metric Design Notes
+
+### Bytes Metrics
+
+Prometheus exposes **aggregate** byte counters (`_total` suffix, scalar Gauges) for capacity
+planning, anomaly detection, and reflection attack detection at the system level. Per-channel
+and per-client byte detail is available via the JSON REST API (`/api/v1/server/channels`,
+`/api/v1/clients/{id}/channels`, `/api/v1/sv1/clients`) for drill-down without inflating
+Prometheus time series cardinality.
+
+The SV1 per-client byte metrics (`sv1_client_bytes_received_total`, `sv1_client_bytes_sent_total`)
+are per-client GaugeVecs because each SV1 client maps 1:1 to a TCP connection, making them the
+natural unit for bandwidth asymmetry monitoring on the translator proxy.

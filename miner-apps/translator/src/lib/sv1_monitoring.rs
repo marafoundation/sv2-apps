@@ -26,6 +26,8 @@ fn downstream_to_sv1_client_info(downstream: &Downstream) -> Option<Sv1ClientInf
                 .version_rolling_min_bit
                 .as_ref()
                 .map(|bit| format!("{:08x}", bit.0)),
+            bytes_received: dd.get_sv1_bytes_received(),
+            bytes_sent: dd.get_sv1_bytes_sent(),
         })
         .ok()
 }

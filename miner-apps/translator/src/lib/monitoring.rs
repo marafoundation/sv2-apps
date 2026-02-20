@@ -38,6 +38,12 @@ impl ServerMonitoring for ChannelManager {
                         .map(|v| *v)
                         .unwrap_or(0);
 
+                    let (bytes_received, bytes_sent) = self
+                        .bytes_by_channel
+                        .get(&channel_id)
+                        .map(|v| *v)
+                        .unwrap_or((0, 0));
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -58,6 +64,8 @@ impl ServerMonitoring for ChannelManager {
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
                         blocks_found: share_accounting.get_blocks_found(),
+                        bytes_received,
+                        bytes_sent,
                     });
                 }
             }
@@ -81,6 +89,12 @@ impl ServerMonitoring for ChannelManager {
                         .map(|v| *v)
                         .unwrap_or(0);
 
+                    let (bytes_received, bytes_sent) = self
+                        .bytes_by_channel
+                        .get(&channel_id)
+                        .map(|v| *v)
+                        .unwrap_or((0, 0));
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -99,6 +113,8 @@ impl ServerMonitoring for ChannelManager {
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
                         blocks_found: share_accounting.get_blocks_found(),
+                        bytes_received,
+                        bytes_sent,
                     });
                 }
             }

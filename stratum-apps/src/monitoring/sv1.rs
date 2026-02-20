@@ -19,6 +19,8 @@ pub struct Sv1ClientInfo {
     pub extranonce2_len: usize,
     pub version_rolling_mask: Option<String>,
     pub version_rolling_min_bit: Option<String>,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
 }
 
 /// Aggregate information about SV1 client connections
@@ -26,6 +28,8 @@ pub struct Sv1ClientInfo {
 pub struct Sv1ClientsSummary {
     pub total_clients: usize,
     pub total_hashrate: f32,
+    pub total_bytes_received: u64,
+    pub total_bytes_sent: u64,
 }
 
 /// Trait for monitoring SV1 client connections
@@ -50,6 +54,8 @@ pub trait Sv1ClientsMonitoring: Send + Sync {
         Sv1ClientsSummary {
             total_clients: clients.len(),
             total_hashrate: clients.iter().filter_map(|c| c.hashrate).sum(),
+            total_bytes_received: clients.iter().map(|c| c.bytes_received).sum(),
+            total_bytes_sent: clients.iter().map(|c| c.bytes_sent).sum(),
         }
     }
 }

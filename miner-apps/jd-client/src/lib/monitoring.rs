@@ -34,6 +34,12 @@ impl ServerMonitoring for ChannelManager {
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .saturating_sub(1);
 
+                    let (bytes_received, bytes_sent) = d
+                        .bytes_by_channel
+                        .get(&channel_id)
+                        .copied()
+                        .unwrap_or((0, 0));
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -48,6 +54,8 @@ impl ServerMonitoring for ChannelManager {
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
                         blocks_found: share_accounting.get_blocks_found(),
+                        bytes_received,
+                        bytes_sent,
                     });
                 }
 
@@ -79,6 +87,12 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let user_identity = extended_channel.get_user_identity();
                 let share_accounting = extended_channel.get_share_accounting();
 
+                let (bytes_received, bytes_sent) = dd
+                    .bytes_by_channel
+                    .get(&channel_id)
+                    .copied()
+                    .unwrap_or((0, 0));
+
                 extended_channels.push(ExtendedChannelInfo {
                     channel_id,
                     user_identity: user_identity.clone(),
@@ -97,6 +111,8 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     last_batch_work_sum: share_accounting.get_last_batch_work_sum(),
                     share_batch_size: share_accounting.get_share_batch_size(),
                     blocks_found: share_accounting.get_blocks_found(),
+                    bytes_received,
+                    bytes_sent,
                 });
             }
 
@@ -106,6 +122,12 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let requested_max_target = standard_channel.get_requested_max_target();
                 let user_identity = standard_channel.get_user_identity();
                 let share_accounting = standard_channel.get_share_accounting();
+
+                let (bytes_received, bytes_sent) = dd
+                    .bytes_by_channel
+                    .get(&channel_id)
+                    .copied()
+                    .unwrap_or((0, 0));
 
                 standard_channels.push(StandardChannelInfo {
                     channel_id,
@@ -123,6 +145,8 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     last_batch_work_sum: share_accounting.get_last_batch_work_sum(),
                     share_batch_size: share_accounting.get_share_batch_size(),
                     blocks_found: share_accounting.get_blocks_found(),
+                    bytes_received,
+                    bytes_sent,
                 });
             }
 

@@ -7,7 +7,7 @@ use crate::{
 use async_channel::{Receiver, Sender};
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Instant,
@@ -70,8 +70,15 @@ impl Downstream {
         target: Target,
         hashrate: Option<Hashrate>,
         connection_token: CancellationToken,
+        sv1_bytes_received: Arc<AtomicU64>,
+        sv1_bytes_sent: Arc<AtomicU64>,
     ) -> Self {
-        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(hashrate, target)));
+        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(
+            hashrate,
+            target,
+            sv1_bytes_received,
+            sv1_bytes_sent,
+        )));
         let downstream_channel_state = DownstreamChannelState::new(
             downstream_sv1_sender,
             downstream_sv1_receiver,

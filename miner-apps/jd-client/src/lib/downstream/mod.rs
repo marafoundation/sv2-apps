@@ -20,7 +20,10 @@ use stratum_apps::{
         parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, Tlv},
     },
     task_manager::TaskManager,
-    utils::types::{DownstreamId, Message, Sv2Frame},
+    utils::{
+        protocol_message_type::mining_message_channel_id,
+        types::{ChannelId, DownstreamId, Message, Sv2Frame},
+    },
 };
 
 use bitcoin_core_sv2::CancellationToken;
@@ -33,8 +36,6 @@ use crate::{
     status::{handle_error, Status, StatusSender},
 };
 
-use stratum_apps::utils::types::ChannelId;
-
 mod common_message_handler;
 mod extensions_message_handler;
 
@@ -45,6 +46,7 @@ mod extensions_message_handler;
 /// - An optional [`GroupChannel`] if group channeling is used.
 /// - Active [`ExtendedChannel`]s keyed by channel ID.
 /// - Active [`StandardChannel`]s keyed by channel ID.
+/// - Per-channel byte counters (bytes_received, bytes_sent)
 pub struct DownstreamData {
     pub require_std_job: bool,
     pub group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
@@ -59,6 +61,8 @@ pub struct DownstreamData {
     pub supported_extensions: Vec<u16>,
     /// Extensions that the JDC requires
     pub required_extensions: Vec<u16>,
+    /// Per-channel byte counters: (bytes_received, bytes_sent)
+    pub bytes_by_channel: HashMap<ChannelId, (u64, u64)>,
 }
 
 /// Communication layer for a downstream connection.
@@ -144,6 +148,7 @@ impl Downstream {
             negotiated_extensions: vec![],
             supported_extensions,
             required_extensions,
+            bytes_by_channel: HashMap::new(),
         }));
 
         Downstream {
@@ -270,8 +275,10 @@ impl Downstream {
             return Ok(());
         }
 
+        let channel_id = mining_message_channel_id(&message);
         let message = AnyMessage::Mining(message);
         let sv2_frame: Sv2Frame = message.try_into().map_err(JDCError::shutdown)?;
+        let frame_bytes = sv2_frame.encoded_length() as u64;
 
         self.downstream_channel
             .downstream_sender
@@ -281,6 +288,13 @@ impl Downstream {
                 error!(?e, "Downstream send failed");
                 JDCError::disconnect(JDCErrorKind::ChannelErrorSender, self.downstream_id)
             })?;
+
+        if let Some(ch_id) = channel_id {
+            self.downstream_data.super_safe_lock(|data| {
+                let entry = data.bytes_by_channel.entry(ch_id).or_insert((0, 0));
+                entry.1 += frame_bytes;
+            });
+        }
 
         Ok(())
     }
@@ -293,6 +307,7 @@ impl Downstream {
             .recv()
             .await
             .map_err(|error| JDCError::disconnect(error, self.downstream_id))?;
+        let frame_bytes = sv2_frame.encoded_length() as u64;
         let header = sv2_frame
             .get_header()
             .expect("frame header must be present");
@@ -305,6 +320,12 @@ impl Downstream {
                 .map_err(|error| JDCError::disconnect(error, self.downstream_id))?;
         match any_message {
             AnyMessage::Mining(message) => {
+                if let Some(ch_id) = mining_message_channel_id(&message) {
+                    self.downstream_data.super_safe_lock(|data| {
+                        let entry = data.bytes_by_channel.entry(ch_id).or_insert((0, 0));
+                        entry.0 += frame_bytes;
+                    });
+                }
                 self.downstream_channel
                     .channel_manager_sender
                     .send((self.downstream_id, message, tlv_fields))

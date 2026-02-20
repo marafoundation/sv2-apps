@@ -25,7 +25,7 @@ use stratum_apps::{
     },
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{mining_message_channel_id, protocol_message_type, MessageType},
         types::{ChannelId, DownstreamId, Message, Sv2Frame},
     },
 };
@@ -49,6 +49,7 @@ mod extensions_message_handler;
 /// - Active [`ExtendedChannel`]s keyed by channel ID.
 /// - Active [`StandardChannel`]s keyed by channel ID.
 /// - Extensions that have been successfully negotiated with this client
+/// - Per-channel byte counters (bytes_received, bytes_sent)
 pub struct DownstreamData {
     pub group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
     pub extended_channels:
@@ -58,6 +59,8 @@ pub struct DownstreamData {
     pub channel_id_factory: AtomicU32,
     /// Extensions that have been successfully negotiated with this client
     pub negotiated_extensions: Vec<u16>,
+    /// Per-channel byte counters: (bytes_received, bytes_sent)
+    pub bytes_by_channel: HashMap<ChannelId, (u64, u64)>,
 }
 
 /// Communication layer for a downstream connection.
@@ -144,6 +147,7 @@ impl Downstream {
             group_channel,
             channel_id_factory,
             negotiated_extensions: vec![],
+            bytes_by_channel: HashMap::new(),
         }));
 
         Downstream {
@@ -275,8 +279,10 @@ impl Downstream {
             return Ok(());
         }
 
+        let channel_id = mining_message_channel_id(&msg);
         let message = AnyMessage::Mining(msg);
         let std_frame: Sv2Frame = message.try_into().map_err(PoolError::shutdown)?;
+        let frame_bytes = std_frame.encoded_length() as u64;
 
         self.downstream_channel
             .downstream_sender
@@ -286,6 +292,13 @@ impl Downstream {
                 error!(?e, "Downstream send failed");
                 PoolError::disconnect(PoolErrorKind::ChannelErrorSender, self.downstream_id)
             })?;
+
+        if let Some(ch_id) = channel_id {
+            self.downstream_data.super_safe_lock(|data| {
+                let entry = data.bytes_by_channel.entry(ch_id).or_insert((0, 0));
+                entry.1 += frame_bytes;
+            });
+        }
 
         Ok(())
     }
@@ -306,6 +319,7 @@ impl Downstream {
         match protocol_message_type(header.ext_type(), header.msg_type()) {
             MessageType::Mining => {
                 debug!("Received mining SV2 frame from downstream.");
+                let frame_bytes = sv2_frame.encoded_length() as u64;
                 let negotiated_extensions = self
                     .downstream_data
                     .super_safe_lock(|data| data.negotiated_extensions.clone());
@@ -328,6 +342,12 @@ impl Downstream {
                         ));
                     }
                 };
+                if let Some(ch_id) = mining_message_channel_id(&mining_message) {
+                    self.downstream_data.super_safe_lock(|data| {
+                        let entry = data.bytes_by_channel.entry(ch_id).or_insert((0, 0));
+                        entry.0 += frame_bytes;
+                    });
+                }
                 self.downstream_channel
                     .channel_manager_sender
                     .send((self.downstream_id, mining_message, tlv_fields))

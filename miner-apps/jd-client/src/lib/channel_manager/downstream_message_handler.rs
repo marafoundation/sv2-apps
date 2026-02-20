@@ -30,7 +30,7 @@ use stratum_apps::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    channel_manager::{ChannelManager, ChannelManagerChannel, FULL_EXTRANONCE_SIZE},
+    channel_manager::{ChannelManager, FULL_EXTRANONCE_SIZE},
     error::{self, JDCError, JDCErrorKind},
     jd_mode::{get_jd_mode, JdMode},
     utils::create_close_channel_msg,
@@ -97,10 +97,8 @@ impl RouteMessageTo<'_> {
     /// - [`RouteMessageTo::JobDeclarator`] → Sends the job declaration message to the JDS.
     /// - [`RouteMessageTo::TemplateProvider`] → Sends the template distribution message to the
     ///   template provider.
-    pub async fn forward(
-        self,
-        channel_manager_channel: &ChannelManagerChannel,
-    ) -> Result<(), JDCErrorKind> {
+    pub async fn forward(self, channel_manager: &ChannelManager) -> Result<(), JDCErrorKind> {
+        let channel_manager_channel = &channel_manager.channel_manager_channel;
         match self {
             RouteMessageTo::Downstream((downstream_id, message)) => {
                 _ = channel_manager_channel.downstream_sender.send((
@@ -113,10 +111,12 @@ impl RouteMessageTo<'_> {
                 if get_jd_mode() != JdMode::SoloMining {
                     let message_static = message.into_static();
                     let sv2_frame: Sv2Frame = AnyMessage::Mining(message_static).try_into()?;
+                    let sent_bytes = sv2_frame.encoded_length() as u64;
                     _ = channel_manager_channel
                         .upstream_sender
                         .send(sv2_frame)
                         .await;
+                    channel_manager.record_upstream_sent_bytes(sent_bytes);
                 }
             }
             RouteMessageTo::JobDeclarator(message) => {
@@ -201,6 +201,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 downstream.downstream_data.super_safe_lock(|data| {
                     data.extended_channels.remove(&msg.channel_id);
                     data.standard_channels.remove(&msg.channel_id);
+                    data.bytes_by_channel.remove(&msg.channel_id);
                 });
                 channel_manager_data
                     .vardiff
@@ -453,7 +454,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 })?;
 
         for messages in messages {
-            let _ = messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(self).await;
         }
         Ok(())
     }
@@ -716,7 +717,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             })?;
 
         for messages in messages {
-            let _ = messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(self).await;
         }
 
         Ok(())
@@ -911,7 +912,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             });
 
         for messages in messages {
-            let _ = messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(self).await;
         }
 
         Ok(())
@@ -1111,7 +1112,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         })?;
 
         for messages in messages {
-            let _ = messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(self).await;
         }
 
         Ok(())
@@ -1334,7 +1335,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         })?;
 
         for messages in messages {
-            _ = messages.forward(&self.channel_manager_channel).await;
+            _ = messages.forward(self).await;
         }
 
         Ok(())

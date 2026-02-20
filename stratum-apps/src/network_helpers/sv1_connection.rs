@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use async_channel::{unbounded, Receiver, Sender};
 use futures::StreamExt;
 use stratum_core::sv1_api::json_rpc;
@@ -21,6 +26,8 @@ use tracing::{error, trace, warn};
 pub struct ConnectionSV1 {
     receiver: Receiver<json_rpc::Message>,
     sender: Sender<json_rpc::Message>,
+    bytes_received: Arc<AtomicU64>,
+    bytes_sent: Arc<AtomicU64>,
 }
 
 struct ConnectionState {
@@ -64,6 +71,11 @@ impl ConnectionSV1 {
         let buffer_read_half = BufReader::new(read_half);
         let buffer_write_half = BufWriter::new(write_half);
 
+        let bytes_received = Arc::new(AtomicU64::new(0));
+        let bytes_sent = Arc::new(AtomicU64::new(0));
+        let reader_bytes = bytes_received.clone();
+        let writer_bytes = bytes_sent.clone();
+
         let connection_state = ConnectionState::new(
             receiver_outgoing.clone(),
             sender_outgoing.clone(),
@@ -77,11 +89,11 @@ impl ConnectionSV1 {
                     trace!("ConnectionSV1: received cancellation signal.");
                     connection_state.close();
                 }
-                _ = Self::run_reader(buffer_read_half, sender_incoming.clone()) => {
+                _ = Self::run_reader(buffer_read_half, sender_incoming.clone(), reader_bytes) => {
                     trace!("Reader task exited. Closing writer sender.");
                     connection_state.close();
                 }
-                _ = Self::run_writer(buffer_write_half, receiver_outgoing.clone()) => {
+                _ = Self::run_writer(buffer_write_half, receiver_outgoing.clone(), writer_bytes) => {
                     trace!("Writer task exited. Closing reader sender.");
                     connection_state.close();
                 }
@@ -91,27 +103,34 @@ impl ConnectionSV1 {
         Self {
             receiver: receiver_incoming,
             sender: sender_outgoing,
+            bytes_received,
+            bytes_sent,
         }
     }
 
     async fn run_reader(
         reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         sender: Sender<json_rpc::Message>,
+        bytes_received: Arc<AtomicU64>,
     ) {
         let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
         while let Some(result) = lines.next().await {
             match result {
-                Ok(line) => match serde_json::from_str::<json_rpc::Message>(&line) {
-                    Ok(msg) => {
-                        if sender.send(msg).await.is_err() {
-                            warn!("Receiver dropped, stopping reader");
-                            break;
+                Ok(line) => {
+                    // +1 accounts for the newline character stripped by LinesCodec
+                    bytes_received.fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
+                    match serde_json::from_str::<json_rpc::Message>(&line) {
+                        Ok(msg) => {
+                            if sender.send(msg).await.is_err() {
+                                warn!("Receiver dropped, stopping reader");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to deserialize message: {e:?}");
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to deserialize message: {e:?}");
-                    }
-                },
+                }
                 Err(e) => {
                     error!("Error reading from stream: {e:?}");
                     break;
@@ -123,12 +142,15 @@ impl ConnectionSV1 {
     async fn run_writer(
         mut writer: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
         receiver: Receiver<json_rpc::Message>,
+        bytes_sent: Arc<AtomicU64>,
     ) {
         while let Ok(msg) = receiver.recv().await {
             match serde_json::to_string(&msg) {
                 Ok(line) => {
                     let data = format!("{line}\n");
-                    if writer.write_all(data.as_bytes()).await.is_err() {
+                    let data_bytes = data.as_bytes();
+                    bytes_sent.fetch_add(data_bytes.len() as u64, Ordering::Relaxed);
+                    if writer.write_all(data_bytes).await.is_err() {
                         error!("Failed to write to stream");
                         break;
                     }
@@ -163,6 +185,16 @@ impl ConnectionSV1 {
     /// Get a clone of the sender channel.
     pub fn sender(&self) -> Sender<json_rpc::Message> {
         self.sender.clone()
+    }
+
+    /// Get a reference to the bytes received counter.
+    pub fn bytes_received(&self) -> Arc<AtomicU64> {
+        self.bytes_received.clone()
+    }
+
+    /// Get a reference to the bytes sent counter.
+    pub fn bytes_sent(&self) -> Arc<AtomicU64> {
+        self.bytes_sent.clone()
     }
 }
 

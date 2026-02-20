@@ -255,11 +255,13 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     let sv2_frame: Sv2Frame = AnyMessage::Mining(set_custom_job)
                         .try_into()
                         .map_err(JDCError::shutdown)?;
+                    let sent_bytes = sv2_frame.encoded_length() as u64;
                     self.channel_manager_channel
                         .upstream_sender
                         .send(sv2_frame)
                         .await
                         .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
+                    self.record_upstream_sent_bytes(sent_bytes);
                     _ = self.allocate_tokens(1).await;
                 }
             }
@@ -284,11 +286,13 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             let sv2_frame: Sv2Frame = AnyMessage::Mining(close_channel)
                 .try_into()
                 .map_err(JDCError::shutdown)?;
+            let sent_bytes = sv2_frame.encoded_length() as u64;
             self.channel_manager_channel
                 .upstream_sender
                 .send(sv2_frame)
                 .await
                 .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
+            self.record_upstream_sent_bytes(sent_bytes);
             _ = self.allocate_tokens(1).await;
         }
 
@@ -336,6 +340,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
 
         self.channel_manager_data.super_safe_lock(|data| {
+            data.bytes_by_channel.remove(&msg.channel_id);
             data.upstream_channel = None;
         });
         Err(JDCError::fallback(JDCErrorKind::CloseChannel))
@@ -476,7 +481,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 })?;
 
         for message in messages_results.into_iter().flatten() {
-            let _ = message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(self).await;
         }
         Ok(())
     }

@@ -75,6 +75,8 @@ pub struct ChannelManager {
     pub negotiated_extensions: Arc<Mutex<Vec<u16>>>,
     /// Extranonce factories containing per channel extranonces
     pub extranonce_factories: Arc<DashMap<ChannelId, ExtendedExtranonce>>,
+    /// Per-channel byte counters for server channels: (bytes_received, bytes_sent)
+    pub bytes_by_channel: Arc<DashMap<ChannelId, (u64, u64)>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -122,6 +124,7 @@ impl ChannelManager {
             share_sequence_counters: Arc::new(DashMap::new()),
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
             extranonce_factories: Arc::new(DashMap::new()),
+            bytes_by_channel: Arc::new(DashMap::new()),
         }
     }
 
@@ -225,12 +228,23 @@ impl ChannelManager {
             .recv()
             .await
             .map_err(TproxyError::fallback)?;
+        let frame_bytes = sv2_frame.encoded_length() as u64;
 
         let mut channel_manager: ChannelManager = (*self).clone();
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
             TproxyError::fallback(framing_sv2::Error::MissingHeader)
         })?;
+        // Count received bytes keyed by channel_id (from header if channel_msg, else 0)
+        if header.channel_msg() {
+            let payload = sv2_frame.payload();
+            if payload.len() >= 4 {
+                let channel_id =
+                    u32::from_le_bytes(payload[..4].try_into().expect("slice is exactly 4 bytes"));
+                let mut entry = self.bytes_by_channel.entry(channel_id).or_insert((0, 0));
+                entry.0 += frame_bytes;
+            }
+        }
         match protocol_message_type(header.ext_type(), header.msg_type()) {
             MessageType::Mining => {
                 channel_manager
@@ -616,23 +630,37 @@ impl ChannelManager {
                                     );
                                     TproxyError::shutdown(framing_sv2::Error::ExpectedSv2Frame)
                                 })?;
+                            let sent_bytes = sv2_frame.encoded_length() as u64;
+                            let upstream_ch_id = m.channel_id;
                             self.channel_state.upstream_sender.send(sv2_frame).await.map_err(|e| {
                                 error!("Failed to send submit shares extended message to upstream: {:?}", e);
                                 TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                             })?;
+                            let mut entry = self
+                                .bytes_by_channel
+                                .entry(upstream_ch_id)
+                                .or_insert((0, 0));
+                            entry.1 += sent_bytes;
                             sent = true;
                         }
                     }
 
                     if !sent {
+                        let upstream_ch_id = m.channel_id;
                         let message = Mining::SubmitSharesExtended(m);
                         let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
                             .try_into()
                             .map_err(TproxyError::shutdown)?;
+                        let sent_bytes = sv2_frame.encoded_length() as u64;
                         self.channel_state.upstream_sender.send(sv2_frame).await.map_err(|e| {
                             error!("Failed to send submit shares extended message to upstream: {:?}", e);
                             TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                         })?;
+                        let mut entry = self
+                            .bytes_by_channel
+                            .entry(upstream_ch_id)
+                            .or_insert((0, 0));
+                        entry.1 += sent_bytes;
                     }
                 }
             }
@@ -661,10 +689,12 @@ impl ChannelManager {
                     m.channel_id
                 );
                 // Forward UpdateChannel message to upstream
+                let upstream_ch_id = m.channel_id;
                 let message = Mining::UpdateChannel(m);
                 let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
                     .try_into()
                     .map_err(TproxyError::shutdown)?;
+                let sent_bytes = sv2_frame.encoded_length() as u64;
 
                 self.channel_state
                     .upstream_sender
@@ -674,6 +704,11 @@ impl ChannelManager {
                         error!("Failed to send UpdateChannel message to upstream: {:?}", e);
                         TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                     })?;
+                let mut entry = self
+                    .bytes_by_channel
+                    .entry(upstream_ch_id)
+                    .or_insert((0, 0));
+                entry.1 += sent_bytes;
             }
             Mining::CloseChannel(m) => {
                 debug!("Received CloseChannel from Sv1Server: {m}");
@@ -691,6 +726,7 @@ impl ChannelManager {
                         debug!("Removed channel {} from group channel before sending CloseChannel to upstream", m.channel_id);
                     }
                 }
+                self.bytes_by_channel.remove(&m.channel_id);
 
                 let message = Mining::CloseChannel(m);
                 let sv2_frame: Sv2Frame = AnyMessage::Mining(message)

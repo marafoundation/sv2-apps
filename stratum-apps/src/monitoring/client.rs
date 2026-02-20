@@ -26,6 +26,8 @@ pub struct ExtendedChannelInfo {
     pub last_batch_work_sum: f64,
     pub share_batch_size: usize,
     pub blocks_found: u32,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
 }
 
 /// Information about a standard channel
@@ -46,6 +48,8 @@ pub struct StandardChannelInfo {
     pub last_batch_work_sum: f64,
     pub share_batch_size: usize,
     pub blocks_found: u32,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
 }
 
 /// Full information about a single Sv2 client including all channels
@@ -103,6 +107,8 @@ pub struct Sv2ClientsSummary {
     pub extended_channels: usize,
     pub standard_channels: usize,
     pub total_hashrate: f32,
+    pub total_bytes_received: u64,
+    pub total_bytes_sent: u64,
 }
 
 /// Trait for monitoring Sv2 clients (downstream connections)
@@ -126,12 +132,33 @@ pub trait Sv2ClientsMonitoring: Send + Sync {
         let extended: usize = clients.iter().map(|c| c.extended_channels.len()).sum();
         let standard: usize = clients.iter().map(|c| c.standard_channels.len()).sum();
 
+        let total_bytes_received: u64 = clients
+            .iter()
+            .flat_map(|c| {
+                c.extended_channels
+                    .iter()
+                    .map(|ch| ch.bytes_received)
+                    .chain(c.standard_channels.iter().map(|ch| ch.bytes_received))
+            })
+            .sum();
+        let total_bytes_sent: u64 = clients
+            .iter()
+            .flat_map(|c| {
+                c.extended_channels
+                    .iter()
+                    .map(|ch| ch.bytes_sent)
+                    .chain(c.standard_channels.iter().map(|ch| ch.bytes_sent))
+            })
+            .sum();
+
         Sv2ClientsSummary {
             total_clients: clients.len(),
             total_channels: extended + standard,
             extended_channels: extended,
             standard_channels: standard,
             total_hashrate: clients.iter().map(|c| c.total_hashrate()).sum(),
+            total_bytes_received,
+            total_bytes_sent,
         }
     }
 }

@@ -317,12 +317,15 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         if let Some((_, group_channel)) = group_channel {
             for channel_id in group_channel.get_channel_ids() {
                 self.extended_channels.remove(channel_id);
+                self.bytes_by_channel.remove(channel_id);
             }
+            self.bytes_by_channel.remove(&m.channel_id);
         // if the message was not sent to a group channel, and we're not working in
         // aggregated mode,
         } else if self.extended_channels.contains_key(&m.channel_id) {
             // remove the channel from the extended channels map
             self.extended_channels.remove(&m.channel_id);
+            self.bytes_by_channel.remove(&m.channel_id);
 
             // remove the channel from any group channels that contain it
             for mut group_channel in self.group_channels.iter_mut() {

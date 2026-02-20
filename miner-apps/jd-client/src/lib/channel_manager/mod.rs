@@ -165,6 +165,8 @@ pub struct ChannelManagerData {
     supported_extensions: Vec<u16>,
     /// Extensions that the JDC requires
     required_extensions: Vec<u16>,
+    /// Per-channel byte counters for the upstream server channel: (bytes_received, bytes_sent)
+    pub bytes_by_channel: HashMap<ChannelId, (u64, u64)>,
 }
 
 impl ChannelManagerData {
@@ -180,6 +182,7 @@ impl ChannelManagerData {
         self.template_id_to_upstream_job_id.clear();
         self.downstream_channel_id_and_job_id_to_template_id.clear();
         self.pending_downstream_requests.clear();
+        self.bytes_by_channel.clear();
 
         self.downstream_id_factory = AtomicUsize::new(0);
         self.request_id_factory = AtomicU32::new(0);
@@ -321,6 +324,7 @@ impl ChannelManager {
             negotiated_extensions: vec![],
             supported_extensions,
             required_extensions,
+            bytes_by_channel: HashMap::new(),
         }));
 
         let channel_manager_channel = ChannelManagerChannel {
@@ -692,6 +696,28 @@ impl ChannelManager {
         Ok(())
     }
 
+    /// Records bytes sent upstream for the given channel_id.
+    pub fn record_upstream_sent(&self, channel_id: ChannelId, bytes: u64) {
+        self.channel_manager_data.super_safe_lock(|data| {
+            let entry = data.bytes_by_channel.entry(channel_id).or_insert((0, 0));
+            entry.1 += bytes;
+        });
+    }
+
+    /// Records bytes sent upstream, resolving the channel_id from current upstream channel.
+    /// Single lock acquisition instead of separate upstream_channel_id() + record_upstream_sent().
+    pub fn record_upstream_sent_bytes(&self, bytes: u64) {
+        self.channel_manager_data.super_safe_lock(|data| {
+            let ch_id = data
+                .upstream_channel
+                .as_ref()
+                .map(|ch| ch.get_channel_id())
+                .unwrap_or(0);
+            let entry = data.bytes_by_channel.entry(ch_id).or_insert((0, 0));
+            entry.1 += bytes;
+        });
+    }
+
     /// Handles messages received from the Upstream subsystem.  
     ///  
     /// This method listens for incoming frames on the `upstream_receiver` channel.  
@@ -700,10 +726,24 @@ impl ChannelManager {
     /// - If the frame contains any unsupported message type, an error is returned.
     async fn handle_pool_message_frame(&mut self) -> JDCResult<(), error::ChannelManager> {
         if let Ok(mut sv2_frame) = self.channel_manager_channel.upstream_receiver.recv().await {
+            let frame_bytes = sv2_frame.encoded_length() as u64;
             let header = sv2_frame.get_header().ok_or_else(|| {
                 error!("SV2 frame missing header");
                 JDCError::fallback(framing_sv2::Error::MissingHeader)
             })?;
+            // Count received bytes keyed by channel_id
+            if header.channel_msg() {
+                let payload = sv2_frame.payload();
+                if payload.len() >= 4 {
+                    let channel_id = u32::from_le_bytes(
+                        payload[..4].try_into().expect("slice is exactly 4 bytes"),
+                    );
+                    self.channel_manager_data.super_safe_lock(|data| {
+                        let entry = data.bytes_by_channel.entry(channel_id).or_insert((0, 0));
+                        entry.0 += frame_bytes;
+                    });
+                }
+            }
             let message_type = header.msg_type();
             let extension_type = header.ext_type();
             let payload = sv2_frame.payload();
@@ -812,6 +852,7 @@ impl ChannelManager {
                                 let sv2_frame: Sv2Frame = AnyMessage::Mining(upstream_message)
                                     .try_into()
                                     .map_err(JDCError::shutdown)?;
+                                let sent_bytes = sv2_frame.encoded_length() as u64;
                                 self.channel_manager_channel
                                     .upstream_sender
                                     .send(sv2_frame)
@@ -819,6 +860,7 @@ impl ChannelManager {
                                     .map_err(|_| {
                                         JDCError::fallback(JDCErrorKind::ChannelErrorSender)
                                     })?;
+                                self.record_upstream_sent_bytes(sent_bytes);
                             }
                         }
                         UpstreamState::Pending => {
@@ -873,6 +915,7 @@ impl ChannelManager {
                                 let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
                                     .try_into()
                                     .map_err(JDCError::shutdown)?;
+                                let sent_bytes = sv2_frame.encoded_length() as u64;
                                 self.channel_manager_channel
                                     .upstream_sender
                                     .send(sv2_frame)
@@ -880,6 +923,7 @@ impl ChannelManager {
                                     .map_err(|_| {
                                         JDCError::fallback(JDCErrorKind::ChannelErrorSender)
                                     })?;
+                                self.record_upstream_sent_bytes(sent_bytes);
                             }
                         }
                         UpstreamState::Pending => {
@@ -1175,7 +1219,7 @@ impl ChannelManager {
             });
 
         for message in messages {
-            let _ = message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(self).await;
         }
 
         info!("Vardiff update cycle complete");

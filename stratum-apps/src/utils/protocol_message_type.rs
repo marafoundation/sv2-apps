@@ -1,3 +1,7 @@
+use crate::stratum_core::parsers_sv2::Mining;
+
+use super::types::ChannelId;
+
 use stratum_core::extensions_sv2::{
     EXTENSION_TYPE_EXTENSIONS_NEGOTIATION, MESSAGE_TYPE_REQUEST_EXTENSIONS,
     MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
@@ -126,6 +130,37 @@ pub enum MessageType {
     TemplateDistribution,
     Extensions,
     Unknown,
+}
+
+/// Returns the channel_id from a Mining message if it is a channel-specific message.
+///
+/// Connection-level messages (OpenChannel, SetCustomMiningJob, SetGroupChannel, etc.)
+/// return `None` since they do not carry a channel_id field.
+pub fn mining_message_channel_id(msg: &Mining<'_>) -> Option<ChannelId> {
+    match msg {
+        Mining::CloseChannel(m) => Some(m.channel_id),
+        Mining::NewExtendedMiningJob(m) => Some(m.channel_id),
+        Mining::NewMiningJob(m) => Some(m.channel_id),
+        Mining::SetExtranoncePrefix(m) => Some(m.channel_id),
+        Mining::SetNewPrevHash(m) => Some(m.channel_id),
+        Mining::SetTarget(m) => Some(m.channel_id),
+        Mining::SubmitSharesError(m) => Some(m.channel_id),
+        Mining::SubmitSharesExtended(m) => Some(m.channel_id),
+        Mining::SubmitSharesStandard(m) => Some(m.channel_id),
+        Mining::SubmitSharesSuccess(m) => Some(m.channel_id),
+        Mining::UpdateChannel(m) => Some(m.channel_id),
+        Mining::UpdateChannelError(m) => Some(m.channel_id),
+        // Connection-level messages have no channel_id
+        Mining::OpenExtendedMiningChannel(_)
+        | Mining::OpenExtendedMiningChannelSuccess(_)
+        | Mining::OpenMiningChannelError(_)
+        | Mining::OpenStandardMiningChannel(_)
+        | Mining::OpenStandardMiningChannelSuccess(_)
+        | Mining::SetCustomMiningJob(_)
+        | Mining::SetCustomMiningJobError(_)
+        | Mining::SetCustomMiningJobSuccess(_)
+        | Mining::SetGroupChannel(_) => None,
+    }
 }
 
 pub fn protocol_message_type(extension_type: u16, message_type: u8) -> MessageType {

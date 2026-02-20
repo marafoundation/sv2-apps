@@ -774,6 +774,9 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
     }
 
     if let Some(ref server) = snapshot.server_info {
+        let mut server_bytes_received: u64 = 0;
+        let mut server_bytes_sent: u64 = 0;
+
         for channel in &server.extended_channels {
             let channel_id = channel.channel_id.to_string();
             let user = &channel.user_identity;
@@ -791,6 +794,8 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                     .with_label_values(&[&channel_id, user])
                     .set(hashrate as f64);
             }
+            server_bytes_received += channel.bytes_received;
+            server_bytes_sent += channel.bytes_sent;
         }
 
         for channel in &server.standard_channels {
@@ -810,6 +815,15 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                     .with_label_values(&[&channel_id, user])
                     .set(hashrate as f64);
             }
+            server_bytes_received += channel.bytes_received;
+            server_bytes_sent += channel.bytes_sent;
+        }
+
+        if let Some(ref metric) = state.metrics.sv2_server_bytes_received_total {
+            metric.set(server_bytes_received as f64);
+        }
+        if let Some(ref metric) = state.metrics.sv2_server_bytes_sent_total {
+            metric.set(server_bytes_sent as f64);
         }
 
         if let Some(ref metric) = state.metrics.sv2_server_blocks_found_total {
@@ -846,6 +860,8 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
 
         let mut client_blocks_total: u64 = 0;
+        let mut client_bytes_received_total: u64 = 0;
+        let mut client_bytes_sent_total: u64 = 0;
 
         for client in snapshot.sv2_clients.as_deref().unwrap_or(&[]) {
             let client_id = client.client_id.to_string();
@@ -865,6 +881,8 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                         .set(channel.nominal_hashrate as f64);
                 }
                 client_blocks_total += channel.blocks_found as u64;
+                client_bytes_received_total += channel.bytes_received;
+                client_bytes_sent_total += channel.bytes_sent;
             }
 
             for channel in &client.standard_channels {
@@ -882,11 +900,19 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                         .set(channel.nominal_hashrate as f64);
                 }
                 client_blocks_total += channel.blocks_found as u64;
+                client_bytes_received_total += channel.bytes_received;
+                client_bytes_sent_total += channel.bytes_sent;
             }
         }
 
         if let Some(ref metric) = state.metrics.sv2_client_blocks_found_total {
             metric.set(client_blocks_total as f64);
+        }
+        if let Some(ref metric) = state.metrics.sv2_client_bytes_received_total {
+            metric.set(client_bytes_received_total as f64);
+        }
+        if let Some(ref metric) = state.metrics.sv2_client_bytes_sent_total {
+            metric.set(client_bytes_sent_total as f64);
         }
     }
 
@@ -897,6 +923,31 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
         if let Some(ref metric) = state.metrics.sv1_hashrate_total {
             metric.set(summary.total_hashrate as f64);
+        }
+    }
+
+    // Reset per-client SV1 byte metrics before repopulating
+    if let Some(ref metric) = state.metrics.sv1_client_bytes_received_total {
+        metric.reset();
+    }
+    if let Some(ref metric) = state.metrics.sv1_client_bytes_sent_total {
+        metric.reset();
+    }
+
+    if let Some(ref sv1_clients) = snapshot.sv1_clients {
+        for client in sv1_clients {
+            let client_id = client.client_id.to_string();
+            let user = &client.user_identity;
+            if let Some(ref metric) = state.metrics.sv1_client_bytes_received_total {
+                metric
+                    .with_label_values(&[&client_id, user])
+                    .set(client.bytes_received as f64);
+            }
+            if let Some(ref metric) = state.metrics.sv1_client_bytes_sent_total {
+                metric
+                    .with_label_values(&[&client_id, user])
+                    .set(client.bytes_sent as f64);
+            }
         }
     }
 

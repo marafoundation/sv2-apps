@@ -15,6 +15,8 @@ pub struct PrometheusMetrics {
     pub sv2_server_channel_hashrate: Option<GaugeVec>,
     pub sv2_server_shares_accepted_total: Option<GaugeVec>,
     pub sv2_server_blocks_found_total: Option<Gauge>,
+    pub sv2_server_bytes_received_total: Option<Gauge>,
+    pub sv2_server_bytes_sent_total: Option<Gauge>,
     // Clients metrics (downstream connections)
     pub sv2_clients_total: Option<Gauge>,
     pub sv2_client_channels: Option<GaugeVec>,
@@ -22,9 +24,13 @@ pub struct PrometheusMetrics {
     pub sv2_client_channel_hashrate: Option<GaugeVec>,
     pub sv2_client_shares_accepted_total: Option<GaugeVec>,
     pub sv2_client_blocks_found_total: Option<Gauge>,
+    pub sv2_client_bytes_received_total: Option<Gauge>,
+    pub sv2_client_bytes_sent_total: Option<Gauge>,
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
+    pub sv1_client_bytes_received_total: Option<GaugeVec>,
+    pub sv1_client_bytes_sent_total: Option<GaugeVec>,
 }
 
 impl PrometheusMetrics {
@@ -46,6 +52,8 @@ impl PrometheusMetrics {
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
             sv2_server_blocks_found_total,
+            sv2_server_channel_bytes_received_total,
+            sv2_server_channel_bytes_sent_total,
         ) = if enable_server_metrics {
             let channels = GaugeVec::new(
                 Opts::new("sv2_server_channels", "Number of server channels by type"),
@@ -83,15 +91,29 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(blocks_found.clone()))?;
 
+            let bytes_received = Gauge::new(
+                "sv2_server_bytes_received_total",
+                "Total bytes received from the server across all channels",
+            )?;
+            registry.register(Box::new(bytes_received.clone()))?;
+
+            let bytes_sent = Gauge::new(
+                "sv2_server_bytes_sent_total",
+                "Total bytes sent to the server across all channels",
+            )?;
+            registry.register(Box::new(bytes_sent.clone()))?;
+
             (
                 Some(channels),
                 Some(hashrate),
                 Some(channel_hashrate),
                 Some(shares_accepted),
                 Some(blocks_found),
+                Some(bytes_received),
+                Some(bytes_sent),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
 
         // Clients metrics (downstream connections)
@@ -102,6 +124,8 @@ impl PrometheusMetrics {
             sv2_client_channel_hashrate,
             sv2_client_shares_accepted_total,
             sv2_client_blocks_found_total,
+            sv2_client_channel_bytes_received_total,
+            sv2_client_channel_bytes_sent_total,
         ) = if enable_clients_metrics {
             let clients_total =
                 Gauge::new("sv2_clients_total", "Total number of connected clients")?;
@@ -143,6 +167,18 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(blocks_found.clone()))?;
 
+            let bytes_received = Gauge::new(
+                "sv2_client_bytes_received_total",
+                "Total bytes received from all clients across all channels",
+            )?;
+            registry.register(Box::new(bytes_received.clone()))?;
+
+            let bytes_sent = Gauge::new(
+                "sv2_client_bytes_sent_total",
+                "Total bytes sent to all clients across all channels",
+            )?;
+            registry.register(Box::new(bytes_sent.clone()))?;
+
             (
                 Some(clients_total),
                 Some(channels),
@@ -150,22 +186,52 @@ impl PrometheusMetrics {
                 Some(channel_hashrate),
                 Some(shares_accepted),
                 Some(blocks_found),
+                Some(bytes_received),
+                Some(bytes_sent),
             )
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
 
         // SV1 metrics
-        let (sv1_clients_total, sv1_hashrate_total) = if enable_sv1_metrics {
+        let (
+            sv1_clients_total,
+            sv1_hashrate_total,
+            sv1_client_bytes_received_total,
+            sv1_client_bytes_sent_total,
+        ) = if enable_sv1_metrics {
             let clients = Gauge::new("sv1_clients_total", "Total number of SV1 clients")?;
             registry.register(Box::new(clients.clone()))?;
 
             let hashrate = Gauge::new("sv1_hashrate_total", "Total hashrate from SV1 clients")?;
             registry.register(Box::new(hashrate.clone()))?;
 
-            (Some(clients), Some(hashrate))
+            let bytes_received = GaugeVec::new(
+                Opts::new(
+                    "sv1_client_bytes_received_total",
+                    "Total bytes received per SV1 client",
+                ),
+                &["client_id", "user_identity"],
+            )?;
+            registry.register(Box::new(bytes_received.clone()))?;
+
+            let bytes_sent = GaugeVec::new(
+                Opts::new(
+                    "sv1_client_bytes_sent_total",
+                    "Total bytes sent per SV1 client",
+                ),
+                &["client_id", "user_identity"],
+            )?;
+            registry.register(Box::new(bytes_sent.clone()))?;
+
+            (
+                Some(clients),
+                Some(hashrate),
+                Some(bytes_received),
+                Some(bytes_sent),
+            )
         } else {
-            (None, None)
+            (None, None, None, None)
         };
 
         Ok(Self {
@@ -176,14 +242,20 @@ impl PrometheusMetrics {
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
             sv2_server_blocks_found_total,
+            sv2_server_bytes_received_total: sv2_server_channel_bytes_received_total,
+            sv2_server_bytes_sent_total: sv2_server_channel_bytes_sent_total,
             sv2_clients_total,
             sv2_client_channels,
             sv2_client_hashrate_total,
             sv2_client_channel_hashrate,
             sv2_client_shares_accepted_total,
             sv2_client_blocks_found_total,
+            sv2_client_bytes_received_total: sv2_client_channel_bytes_received_total,
+            sv2_client_bytes_sent_total: sv2_client_channel_bytes_sent_total,
             sv1_clients_total,
             sv1_hashrate_total,
+            sv1_client_bytes_received_total,
+            sv1_client_bytes_sent_total,
         })
     }
 }

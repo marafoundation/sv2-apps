@@ -95,6 +95,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     .super_safe_lock(|downstream_data| {
                         downstream_data.standard_channels.remove(&msg.channel_id);
                         downstream_data.extended_channels.remove(&msg.channel_id);
+                        downstream_data.bytes_by_channel.remove(&msg.channel_id);
                     });
                 channel_manager_data
                     .vardiff

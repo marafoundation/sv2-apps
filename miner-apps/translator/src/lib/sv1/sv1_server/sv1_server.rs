@@ -242,6 +242,8 @@ impl Sv1Server {
                                     first_target,
                                     Some(self.config.downstream_difficulty_config.min_individual_miner_hashrate),
                                     connection_token,
+                                    connection.bytes_received(),
+                                    connection.bytes_sent(),
                                 );
                                 // vardiff initialization (only if enabled)
                                 self.downstreams.insert(downstream_id, downstream.clone());

@@ -23,6 +23,8 @@ pub struct ServerExtendedChannelInfo {
     pub shares_submitted: u32,
     pub best_diff: f64,
     pub blocks_found: u32,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
 }
 
 /// Information about a standard channel opened with the server
@@ -39,6 +41,8 @@ pub struct ServerStandardChannelInfo {
     pub shares_submitted: u32,
     pub best_diff: f64,
     pub blocks_found: u32,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
 }
 
 /// Information about the server (upstream connection)
@@ -75,6 +79,8 @@ pub struct ServerSummary {
     pub extended_channels: usize,
     pub standard_channels: usize,
     pub total_hashrate: f32,
+    pub total_bytes_received: u64,
+    pub total_bytes_sent: u64,
 }
 
 /// Trait for monitoring the server (upstream connection)
@@ -86,11 +92,26 @@ pub trait ServerMonitoring: Send + Sync {
     fn get_server_summary(&self) -> ServerSummary {
         let server = self.get_server();
 
+        let total_bytes_received: u64 = server
+            .extended_channels
+            .iter()
+            .map(|c| c.bytes_received)
+            .chain(server.standard_channels.iter().map(|c| c.bytes_received))
+            .sum();
+        let total_bytes_sent: u64 = server
+            .extended_channels
+            .iter()
+            .map(|c| c.bytes_sent)
+            .chain(server.standard_channels.iter().map(|c| c.bytes_sent))
+            .sum();
+
         ServerSummary {
             total_channels: server.total_channels(),
             extended_channels: server.extended_channels.len(),
             standard_channels: server.standard_channels.len(),
             total_hashrate: server.total_hashrate(),
+            total_bytes_received,
+            total_bytes_sent,
         }
     }
 }
