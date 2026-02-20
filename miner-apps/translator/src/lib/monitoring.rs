@@ -38,6 +38,16 @@ impl ServerMonitoring for ChannelManager {
                         .map(|v| *v)
                         .unwrap_or(0);
 
+                    // In aggregated mode, validate_share() runs on per-downstream
+                    // channels (not the aggregated channel), so blocks_found is
+                    // tracked there.  Sum across all per-downstream channels.
+                    let blocks_found: u32 = self
+                        .extended_channels
+                        .iter()
+                        .filter(|entry| *entry.key() != AGGREGATED_CHANNEL_ID)
+                        .map(|entry| entry.value().get_share_accounting().get_blocks_found())
+                        .sum();
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -57,7 +67,7 @@ impl ServerMonitoring for ChannelManager {
                         share_work_sum: share_accounting.get_share_work_sum(),
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
-                        blocks_found: share_accounting.get_blocks_found(),
+                        blocks_found,
                     });
                 }
             }
