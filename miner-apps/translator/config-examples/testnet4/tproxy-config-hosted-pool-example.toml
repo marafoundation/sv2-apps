@@ -38,7 +38,7 @@ required_extensions = [
 ]
 
 # Monitoring HTTP server address for exposing channel data (optional)
-monitoring_address = "0.0.0.0:9092"
+monitoring_address = "0.0.0.0:9102"
 monitoring_cache_refresh_secs = 15
 
 # Difficulty params

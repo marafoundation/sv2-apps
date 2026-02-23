@@ -40,7 +40,7 @@ required_extensions = [
     # 0x0002,
 ]
 
-monitoring_address = "127.0.0.1:9090"
+monitoring_address = "127.0.0.1:9110"
 monitoring_cache_refresh_secs = 15
 
 # Local Sv2 Template Provider config
