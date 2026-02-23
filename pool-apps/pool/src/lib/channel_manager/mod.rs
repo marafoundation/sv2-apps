@@ -56,6 +56,51 @@ const POOL_ALLOCATION_BYTES: usize = 4;
 const CLIENT_SEARCH_SPACE_BYTES: usize = 16;
 pub const FULL_EXTRANONCE_SIZE: usize = POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES;
 
+/// Per-channel counters for all share submission outcomes.
+///
+/// Tracks every share response the pool sends back to a downstream channel,
+/// enabling monitoring of rejection rates and root-cause analysis of revenue loss.
+///
+/// Each field corresponds to a distinct `SubmitSharesError` error code or a
+/// successful validation result. Counters are monotonically increasing over the
+/// lifetime of the channel.
+#[derive(Debug, Clone, Default)]
+pub struct ShareResponseCounts {
+    /// Shares that passed validation (includes block-found shares).
+    pub accepted: u32,
+    /// Blocks found (subset of accepted).
+    pub blocks_found: u32,
+    /// `invalid-share` — share failed hash validation.
+    pub invalid: u32,
+    /// `stale-share` — share references an outdated prev_hash / job.
+    pub stale: u32,
+    /// `invalid-job-id` — job_id in the share does not match any known job.
+    pub invalid_job_id: u32,
+    /// `difficulty-too-low` — share hash does not meet the channel's target.
+    pub difficulty_too_low: u32,
+    /// `duplicate-share` — share was already submitted.
+    pub duplicate: u32,
+    /// `bad-extranonce-size` — extranonce size mismatch (extended channels only).
+    pub bad_extranonce_size: u32,
+    /// `invalid-channel-id` — the channel_id in the share message was not found.
+    pub invalid_channel_id: u32,
+}
+
+impl ShareResponseCounts {
+    /// Merge a single-share outcome delta into the running totals.
+    pub fn accumulate(&mut self, delta: &ShareResponseCounts) {
+        self.accepted += delta.accepted;
+        self.blocks_found += delta.blocks_found;
+        self.invalid += delta.invalid;
+        self.stale += delta.stale;
+        self.invalid_job_id += delta.invalid_job_id;
+        self.difficulty_too_low += delta.difficulty_too_low;
+        self.duplicate += delta.duplicate;
+        self.bad_extranonce_size += delta.bad_extranonce_size;
+        self.invalid_channel_id += delta.invalid_channel_id;
+    }
+}
+
 pub struct ChannelManagerData {
     // Mapping of `downstream_id` → `Downstream` object,
     // used by the channel manager to locate and interact with downstream clients.
@@ -71,6 +116,9 @@ pub struct ChannelManagerData {
     // Mapping of `(downstream_id, channel_id)` → vardiff controller.
     // Each entry manages variable difficulty for a specific downstream channel.
     vardiff: HashMap<VardiffKey, VardiffState>,
+    // Mapping of `(downstream_id, channel_id)` → share response counters.
+    // Tracks all share submission outcomes per channel for monitoring.
+    pub(crate) share_response_counts: HashMap<VardiffKey, ShareResponseCounts>,
     // Coinbase outputs
     coinbase_outputs: Vec<u8>,
     // Last new prevhash
@@ -144,6 +192,7 @@ impl ChannelManager {
             extranonce_prefix_factory_standard,
             downstream_id_factory: AtomicUsize::new(1),
             vardiff: HashMap::new(),
+            share_response_counts: HashMap::new(),
             coinbase_outputs,
             last_future_template: None,
             last_new_prev_hash: None,
@@ -427,6 +476,9 @@ impl ChannelManager {
             cm_data.downstream.remove(&downstream_id);
             cm_data
                 .vardiff
+                .retain(|key, _| key.downstream_id != downstream_id);
+            cm_data
+                .share_response_counts
                 .retain(|key, _| key.downstream_id != downstream_id);
         });
         Ok(())

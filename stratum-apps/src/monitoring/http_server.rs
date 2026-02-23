@@ -61,6 +61,7 @@ use utoipa_swagger_ui::SwaggerUi;
         Sv2ClientMetadata,
         ExtendedChannelInfo,
         StandardChannelInfo,
+        super::client::ShareResponseCounts,
         Sv1ClientInfo,
         Sv1ClientsSummary,
         HealthResponse,
@@ -733,6 +734,32 @@ async fn handle_sv1_client_by_id(
     }
 }
 
+/// Sets per-reason rejection gauge values for a single channel.
+fn set_rejection_metrics(
+    metric: &prometheus::GaugeVec,
+    client_id: &str,
+    channel_id: &str,
+    user: &str,
+    sr: &super::client::ShareResponseCounts,
+) {
+    let reasons: &[(&str, u32)] = &[
+        ("invalid-share", sr.invalid),
+        ("stale-share", sr.stale),
+        ("invalid-job-id", sr.invalid_job_id),
+        ("difficulty-too-low", sr.difficulty_too_low),
+        ("duplicate-share", sr.duplicate),
+        ("bad-extranonce-size", sr.bad_extranonce_size),
+        ("invalid-channel-id", sr.invalid_channel_id),
+    ];
+    for (reason, count) in reasons {
+        if *count > 0 {
+            metric
+                .with_label_values(&[client_id, channel_id, user, reason])
+                .set(*count as f64);
+        }
+    }
+}
+
 /// Handler for Prometheus metrics endpoint
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
     let snapshot = state.cache.get_snapshot();
@@ -749,6 +776,9 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         metric.reset();
     }
     if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
+        metric.reset();
+    }
+    if let Some(ref metric) = state.metrics.sv2_client_shares_rejected_total {
         metric.reset();
     }
     if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
@@ -864,6 +894,12 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                         .with_label_values(&[&client_id, &channel_id, user])
                         .set(channel.nominal_hashrate as f64);
                 }
+                if let (Some(ref metric), Some(ref sr)) = (
+                    &state.metrics.sv2_client_shares_rejected_total,
+                    &channel.share_responses,
+                ) {
+                    set_rejection_metrics(metric, &client_id, &channel_id, user, sr);
+                }
                 client_blocks_total += channel.blocks_found as u64;
             }
 
@@ -880,6 +916,12 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
                     metric
                         .with_label_values(&[&client_id, &channel_id, user])
                         .set(channel.nominal_hashrate as f64);
+                }
+                if let (Some(ref metric), Some(ref sr)) = (
+                    &state.metrics.sv2_client_shares_rejected_total,
+                    &channel.share_responses,
+                ) {
+                    set_rejection_metrics(metric, &client_id, &channel_id, user, sr);
                 }
                 client_blocks_total += channel.blocks_found as u64;
             }
