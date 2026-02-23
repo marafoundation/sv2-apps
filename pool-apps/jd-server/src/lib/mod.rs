@@ -103,6 +103,7 @@ impl JobDeclaratorServer {
             error!("JDS Connection with bitcoin core failed {:?}", e);
             return Err(JdsError::MempoolError(e));
         }
+        info!("JDS successfully connected to Bitcoin Core RPC");
         let (status_tx, status_rx) = unbounded();
         let sender = status::Sender::Downstream(status_tx.clone());
         let mut last_empty_mempool_warning =

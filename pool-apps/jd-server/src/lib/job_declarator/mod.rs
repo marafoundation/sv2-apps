@@ -507,6 +507,10 @@ impl JobDeclarator {
         sender_add_txs_to_mempool: Sender<AddTrasactionsToMempoolInner>,
     ) {
         let listener = TcpListener::bind(config.listen_jd_address()).await.unwrap();
+        info!(
+            "JDS listening for Job Declarator connections on {}",
+            config.listen_jd_address()
+        );
 
         while let Ok((stream, _)) = listener.accept().await {
             let responder = Responder::from_authority_kp(
