@@ -124,9 +124,19 @@ impl TranslatorConfig {
         self.monitoring_address
     }
 
+    /// Sets the monitoring server bind address.
+    pub fn set_monitoring_address(&mut self, addr: Option<SocketAddr>) {
+        self.monitoring_address = addr;
+    }
+
     /// Returns the monitoring cache refresh interval in seconds.
     pub fn monitoring_cache_refresh_secs(&self) -> u64 {
         self.monitoring_cache_refresh_secs
+    }
+
+    /// Sets the monitoring cache refresh interval in seconds.
+    pub fn set_monitoring_cache_refresh_secs(&mut self, secs: u64) {
+        self.monitoring_cache_refresh_secs = secs;
     }
 
     pub fn set_log_dir(&mut self, log_dir: Option<PathBuf>) {

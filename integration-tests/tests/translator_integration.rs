@@ -1,6 +1,7 @@
 // This file contains integration tests for the `TranslatorSv2` module.
 use integration_tests_sv2::{
     interceptor::{IgnoreMessage, MessageDirection, ReplaceMessage},
+    metrics_assert::*,
     mock_roles::{MockUpstream, WithSetup},
     sv1_sniffer::SV1MessageFilter,
     template_provider::DifficultyLevel,
@@ -34,15 +35,24 @@ use stratum_apps::stratum_core::{
 // the translator and the pool is intercepted by a sniffer. The test checks if the translator and
 // the pool exchange the correct messages upon connection. And that the miner is able to submit
 // shares.
+// Also validates tProxy and Pool metrics: channel types, client counts, SV1 clients, uptime.
 #[tokio::test]
 async fn translate_sv1_to_sv2_successfully() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (_pool, pool_addr, pool_monitoring, _pool_task) =
+        start_pool_with_monitoring(sv2_tp_config(tp_addr), vec![], vec![], true).await;
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
-    let (_, tproxy_addr) =
-        start_sv2_translator(&[pool_translator_sniffer_addr], false, vec![], vec![], None).await;
+    let (_, tproxy_addr, tproxy_monitoring, _tproxy_task) = start_sv2_translator_with_monitoring(
+        &[pool_translator_sniffer_addr],
+        false,
+        vec![],
+        vec![],
+        None,
+        true,
+    )
+    .await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
     pool_translator_sniffer
         .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
@@ -77,6 +87,30 @@ async fn translate_sv1_to_sv2_successfully() {
             MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
         )
         .await;
+
+    // -- Metrics validation --
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Pool metrics: should see 1 SV2 client (tProxy) with extended channel
+    let pool_mon = pool_monitoring.expect("pool monitoring should be enabled");
+    assert_api_health(pool_mon).await;
+    let pool_metrics = fetch_metrics(pool_mon).await;
+    assert_uptime(&pool_metrics);
+    assert_metric_gte(&pool_metrics, "sv2_clients_total", 1.0);
+    // Pool has no upstream
+    assert_metric_not_present(&pool_metrics, "sv2_server_channels");
+
+    // tProxy metrics: should see upstream server channel(s) and SV1 client(s)
+    let tproxy_mon = tproxy_monitoring.expect("tproxy monitoring should be enabled");
+    assert_api_health(tproxy_mon).await;
+    let tproxy_metrics = fetch_metrics(tproxy_mon).await;
+    assert_uptime(&tproxy_metrics);
+    assert_metric_present(&tproxy_metrics, "sv2_server_channels");
+    assert_metric_gte(&tproxy_metrics, "sv1_clients_total", 1.0);
+    // tProxy has no SV2 downstreams
+    assert_metric_not_present(&tproxy_metrics, "sv2_clients_total");
+    // tProxy should report shares accepted on its server side
+    assert_metric_present(&tproxy_metrics, "sv2_server_shares_accepted_total");
 }
 
 // Demonstrates the scenario where TProxy falls back to the secondary pool

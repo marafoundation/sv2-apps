@@ -1,17 +1,20 @@
 use integration_tests_sv2::{
     interceptor::{IgnoreMessage, MessageDirection},
+    metrics_assert::*,
     template_provider::DifficultyLevel,
     *,
 };
 use stratum_apps::stratum_core::{job_declaration_sv2::*, template_distribution_sv2::*};
 
-// Block propagated from JDC to TP
+// Block propagated from JDC to TP.
+// Also validates that blocks_found metric increments on the pool.
 #[tokio::test]
 async fn propagated_from_jdc_to_tp() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let current_block_hash = tp.get_best_block_hash().unwrap();
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (_pool, pool_addr, pool_monitoring, _pool_task) =
+        start_pool_with_monitoring(sv2_tp_config(tp_addr), vec![], vec![], true).await;
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
     let ignore_push_solution =
         IgnoreMessage::new(MessageDirection::ToUpstream, MESSAGE_TYPE_PUSH_SOLUTION);
@@ -41,4 +44,13 @@ async fn propagated_from_jdc_to_tp() {
     let new_block_hash = tp.get_best_block_hash().unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     assert_ne!(current_block_hash, new_block_hash);
+
+    // -- Metrics validation --
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let pool_mon = pool_monitoring.expect("pool monitoring should be enabled");
+    let pool_metrics = fetch_metrics(pool_mon).await;
+    assert_uptime(&pool_metrics);
+    assert_metric_gte(&pool_metrics, "sv2_clients_total", 1.0);
+    // A block was found, so blocks_found should be >= 1
+    assert_metric_gte(&pool_metrics, "sv2_client_blocks_found_total", 1.0);
 }

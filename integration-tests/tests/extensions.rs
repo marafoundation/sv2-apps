@@ -7,7 +7,9 @@
 // 3. Translator forwards SubmitSharesExtended with TLV containing user_identity
 // 4. Pool receives and processes the TLV user_identity correctly
 
-use integration_tests_sv2::{interceptor::MessageDirection, template_provider::DifficultyLevel, *};
+use integration_tests_sv2::{
+    interceptor::MessageDirection, metrics_assert::*, template_provider::DifficultyLevel, *,
+};
 use stratum_apps::stratum_core::{
     binary_sv2::Seq064K,
     common_messages_sv2::*,
@@ -28,8 +30,13 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
 
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     // Start pool with extension 0x0002 support
-    let (_pool, pool_addr) =
-        start_pool(sv2_tp_config(tp_addr), supported_extensions.clone(), vec![]).await;
+    let (_pool, pool_addr, pool_monitoring, _pool_task) = start_pool_with_monitoring(
+        sv2_tp_config(tp_addr),
+        supported_extensions.clone(),
+        vec![],
+        true,
+    )
+    .await;
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("pool-translator", pool_addr, false, vec![], None);
     // Start translator with extension 0x0002 support and user_identity configured
@@ -204,4 +211,13 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
+
+    // -- Metrics validation --
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let pool_mon = pool_monitoring.expect("pool monitoring should be enabled");
+    assert_api_health(pool_mon).await;
+    let pool_metrics = fetch_metrics(pool_mon).await;
+    assert_uptime(&pool_metrics);
+    assert_metric_gte(&pool_metrics, "sv2_clients_total", 1.0);
+    assert_metric_present(&pool_metrics, "sv2_client_shares_accepted_total");
 }

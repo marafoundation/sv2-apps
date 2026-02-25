@@ -3,6 +3,7 @@
 // `PoolSv2` is a module that implements the Pool role in the Stratum V2 protocol.
 use integration_tests_sv2::{
     interceptor::{MessageDirection, ReplaceMessage},
+    metrics_assert::*,
     mock_roles::{MockDownstream, WithSetup},
     template_provider::DifficultyLevel,
     *,
@@ -178,11 +179,14 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
 // This test starts a Pool, a Sniffer, and a Sv2 Mining Device.  It then checks if the Pool receives
 // a share from the Sv2 Mining Device.  While also checking all the messages exchanged between the
 // Pool and the Mining Device in between.
+// Also validates Pool metrics: client count, standard channel count, shares accepted, uptime, and
+// API health endpoint.
 #[tokio::test]
 async fn pool_standard_channel_receives_share() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (_pool, pool_addr, pool_monitoring, _pool_task) =
+        start_pool_with_monitoring(sv2_tp_config(tp_addr), vec![], vec![], true).await;
     let (sniffer, sniffer_addr) = start_sniffer("A", pool_addr, false, vec![], None);
     start_mining_device_sv2(sniffer_addr, None, None, None, 1, None, true);
     sniffer
@@ -228,6 +232,20 @@ async fn pool_standard_channel_receives_share() {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
+
+    // -- Metrics validation --
+    // Allow monitoring cache to refresh
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let pool_mon = pool_monitoring.expect("pool monitoring should be enabled");
+    assert_api_health(pool_mon).await;
+    let pool_metrics = fetch_metrics(pool_mon).await;
+    assert_uptime(&pool_metrics);
+    // Pool has no upstream, so server metrics should not be present
+    assert_metric_not_present(&pool_metrics, "sv2_server_channels");
+    assert_metric_not_present(&pool_metrics, "sv2_server_hashrate_total");
+    // Pool should see 1 SV2 client (the mining device) with 1 standard channel
+    assert_metric_gte(&pool_metrics, "sv2_clients_total", 1.0);
+    assert_metric_present(&pool_metrics, "sv2_client_shares_accepted_total");
 }
 
 // This test verifies that the Pool does not send SetNewPrevHash and NewExtendedMiningJob (future

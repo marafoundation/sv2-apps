@@ -30,6 +30,7 @@ use utils::get_available_address;
 
 pub mod interceptor;
 pub mod message_aggregator;
+pub mod metrics_assert;
 pub mod mock_roles;
 pub mod sniffer;
 pub mod sniffer_error;
@@ -111,6 +112,27 @@ pub async fn start_pool(
     supported_extensions: Vec<u16>,
     required_extensions: Vec<u16>,
 ) -> (PoolSv2, SocketAddr) {
+    let (pool, addr, _, _handle) = start_pool_with_monitoring(
+        template_provider_config,
+        supported_extensions,
+        required_extensions,
+        false,
+    )
+    .await;
+    (pool, addr)
+}
+
+pub async fn start_pool_with_monitoring(
+    template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+) -> (
+    PoolSv2,
+    SocketAddr,
+    Option<SocketAddr>,
+    tokio::task::JoinHandle<()>,
+) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -133,7 +155,7 @@ pub async fn start_pool(
     let authority_config =
         pool_sv2::config::AuthorityConfig::new(authority_public_key, authority_secret_key);
     let share_batch_size = 1;
-    let config = PoolConfig::new(
+    let mut config = PoolConfig::new(
         connection_config,
         template_provider_config,
         authority_config,
@@ -144,13 +166,21 @@ pub async fn start_pool(
         supported_extensions,
         required_extensions,
     );
+    let monitoring_address = if enable_monitoring {
+        let addr = get_available_address();
+        config.set_monitoring_address(Some(addr));
+        config.set_monitoring_cache_refresh_secs(1);
+        Some(addr)
+    } else {
+        None
+    };
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         _ = pool_clone.start().await;
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
-    (pool, listening_address)
+    (pool, listening_address, monitoring_address, handle)
 }
 
 pub fn start_template_provider(
@@ -177,6 +207,28 @@ pub fn start_jdc(
     supported_extensions: Vec<u16>,
     required_extensions: Vec<u16>,
 ) -> (JobDeclaratorClient, SocketAddr) {
+    let (jdc, addr, _, _handle) = start_jdc_with_monitoring(
+        pool,
+        template_provider_config,
+        supported_extensions,
+        required_extensions,
+        false,
+    );
+    (jdc, addr)
+}
+
+pub fn start_jdc_with_monitoring(
+    pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
+    template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+) -> (
+    JobDeclaratorClient,
+    SocketAddr,
+    Option<SocketAddr>,
+    tokio::task::JoinHandle<()>,
+) {
     use jd_client_sv2::config::{JobDeclaratorClientConfig, PoolConfig, ProtocolConfig, Upstream};
     let jdc_address = get_available_address();
     let max_supported_version = 2;
@@ -217,7 +269,7 @@ pub fn start_jdc(
     let shares_batch_size = 1;
     let user_identity = "IT-test".to_string();
     let jdc_signature = "JDC".to_string();
-    let jd_client_proxy = JobDeclaratorClientConfig::new(
+    let mut jd_client_proxy = JobDeclaratorClientConfig::new(
         jdc_address,
         protocol_config,
         user_identity,
@@ -232,10 +284,18 @@ pub fn start_jdc(
         supported_extensions,
         required_extensions,
     );
+    let monitoring_address = if enable_monitoring {
+        let addr = get_available_address();
+        jd_client_proxy.set_monitoring_address(Some(addr));
+        jd_client_proxy.set_monitoring_cache_refresh_secs(1);
+        Some(addr)
+    } else {
+        None
+    };
     let ret = jd_client_sv2::JobDeclaratorClient::new(jd_client_proxy);
     let ret_clone = ret.clone();
-    tokio::spawn(async move { ret_clone.start().await });
-    (ret, jdc_address)
+    let handle = tokio::spawn(async move { ret_clone.start().await });
+    (ret, jdc_address, monitoring_address, handle)
 }
 
 pub fn start_jds(tp_rpc_connection: &ConnectParams) -> (JobDeclaratorServer, SocketAddr) {
@@ -293,6 +353,31 @@ pub async fn start_sv2_translator(
     required_extensions: Vec<u16>,
     job_keepalive_interval_secs: Option<u16>,
 ) -> (TranslatorSv2, SocketAddr) {
+    let (t, addr, _, _handle) = start_sv2_translator_with_monitoring(
+        upstreams,
+        aggregate_channels,
+        supported_extensions,
+        required_extensions,
+        job_keepalive_interval_secs,
+        false,
+    )
+    .await;
+    (t, addr)
+}
+
+pub async fn start_sv2_translator_with_monitoring(
+    upstreams: &[SocketAddr],
+    aggregate_channels: bool,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    job_keepalive_interval_secs: Option<u16>,
+    enable_monitoring: bool,
+) -> (
+    TranslatorSv2,
+    SocketAddr,
+    Option<SocketAddr>,
+    tokio::task::JoinHandle<()>,
+) {
     let job_keepalive_interval_secs = job_keepalive_interval_secs.unwrap_or(60);
     let upstreams = upstreams
         .iter()
@@ -329,7 +414,7 @@ pub async fn start_sv2_translator(
 
     let downstream_extranonce2_size = 4;
 
-    let config = translator_sv2::config::TranslatorConfig::new(
+    let mut config = translator_sv2::config::TranslatorConfig::new(
         upstreams,
         listening_address.ip().to_string(),
         listening_port,
@@ -342,12 +427,20 @@ pub async fn start_sv2_translator(
         supported_extensions,
         required_extensions,
     );
+    let monitoring_address = if enable_monitoring {
+        let addr = get_available_address();
+        config.set_monitoring_address(Some(addr));
+        config.set_monitoring_cache_refresh_secs(1);
+        Some(addr)
+    } else {
+        None
+    };
     let translator_v2 = translator_sv2::TranslatorSv2::new(config);
     let clone_translator_v2 = translator_v2.clone();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         clone_translator_v2.start().await;
     });
-    (translator_v2, listening_address)
+    (translator_v2, listening_address, monitoring_address, handle)
 }
 
 pub async fn start_minerd(
