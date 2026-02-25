@@ -760,6 +760,35 @@ fn set_rejection_metrics(
     }
 }
 
+/// Sets per-reason rejection gauge values for a single SV1 client.
+///
+/// Uses the same `ShareResponseCounts` struct as SV2, but the label set is
+/// `[client_id, user_identity, reason]` (no channel_id — SV1 clients don't have
+/// SV2 channels visible to the operator).
+fn set_sv1_rejection_metrics(
+    metric: &prometheus::GaugeVec,
+    client_id: &str,
+    user: &str,
+    sr: &super::client::ShareResponseCounts,
+) {
+    let reasons: &[(&str, u32)] = &[
+        ("invalid-share", sr.invalid),
+        ("stale-share", sr.stale),
+        ("invalid-job-id", sr.invalid_job_id),
+        ("difficulty-too-low", sr.difficulty_too_low),
+        ("duplicate-share", sr.duplicate),
+        ("bad-extranonce-size", sr.bad_extranonce_size),
+        ("invalid-channel-id", sr.invalid_channel_id),
+    ];
+    for (reason, count) in reasons {
+        if *count > 0 {
+            metric
+                .with_label_values(&[client_id, user, reason])
+                .set(*count as f64);
+        }
+    }
+}
+
 /// Handler for Prometheus metrics endpoint
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
     let snapshot = state.cache.get_snapshot();
@@ -932,6 +961,14 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
     }
 
+    // Reset per-client SV1 metrics before repopulating
+    if let Some(ref metric) = state.metrics.sv1_client_shares_accepted_total {
+        metric.reset();
+    }
+    if let Some(ref metric) = state.metrics.sv1_client_shares_rejected_total {
+        metric.reset();
+    }
+
     // Collect SV1 client metrics
     if let Some(ref summary) = snapshot.sv1_clients_summary {
         if let Some(ref metric) = state.metrics.sv1_clients_total {
@@ -939,6 +976,23 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         }
         if let Some(ref metric) = state.metrics.sv1_hashrate_total {
             metric.set(summary.total_hashrate as f64);
+        }
+    }
+
+    // Collect per-SV1-client share response metrics
+    for client in snapshot.sv1_clients.as_deref().unwrap_or(&[]) {
+        if let Some(ref sr) = client.share_responses {
+            let client_id = client.client_id.to_string();
+            let user = &client.user_identity;
+
+            if let Some(ref metric) = state.metrics.sv1_client_shares_accepted_total {
+                metric
+                    .with_label_values(&[&client_id, user])
+                    .set(sr.accepted as f64);
+            }
+            if let Some(ref metric) = state.metrics.sv1_client_shares_rejected_total {
+                set_sv1_rejection_metrics(metric, &client_id, user, sr);
+            }
         }
     }
 

@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::client::ShareResponseCounts;
+
 /// Information about a single SV1 client connection
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Sv1ClientInfo {
@@ -19,6 +21,15 @@ pub struct Sv1ClientInfo {
     pub extranonce2_len: usize,
     pub version_rolling_mask: Option<String>,
     pub version_rolling_min_bit: Option<String>,
+    /// Per-outcome share response counters for this SV1 client's local validation.
+    ///
+    /// Tracks shares accepted/rejected at the tProxy's local validation layer,
+    /// which is what the SV1 miner actually sees (`result: true/false`).
+    /// Only a subset of rejection reasons apply to SV1:
+    /// `accepted`, `invalid` (failed PoW), `invalid_job_id` (job not found),
+    /// `invalid_channel_id` (channel not open).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_responses: Option<ShareResponseCounts>,
 }
 
 /// Aggregate information about SV1 client connections

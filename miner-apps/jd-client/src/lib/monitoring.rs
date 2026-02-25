@@ -5,10 +5,18 @@
 //! - Server channels (upstream to pool)
 //! - Client channels (downstream miners connecting to JDC)
 
+use std::collections::HashMap;
+
 use hex;
-use stratum_apps::monitoring::{
-    client::{ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientsMonitoring},
-    server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+use stratum_apps::{
+    monitoring::{
+        client::{
+            ExtendedChannelInfo, ShareResponseCounts, StandardChannelInfo, Sv2ClientInfo,
+            Sv2ClientsMonitoring,
+        },
+        server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+    },
+    utils::types::VardiffKey,
 };
 
 use crate::{channel_manager::ChannelManager, downstream::Downstream};
@@ -65,7 +73,11 @@ impl ServerMonitoring for ChannelManager {
 
 /// Helper to convert a Downstream to Sv2ClientInfo.
 /// Returns None if the lock cannot be acquired (graceful degradation for monitoring).
-fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
+fn downstream_to_sv2_client_info(
+    client: &Downstream,
+    share_response_counts: &HashMap<VardiffKey, ShareResponseCounts>,
+) -> Option<Sv2ClientInfo> {
+    let downstream_id = client.downstream_id;
     client
         .downstream_data
         .safe_lock(|dd| {
@@ -78,6 +90,9 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let requested_max_target = extended_channel.get_requested_max_target();
                 let user_identity = extended_channel.get_user_identity();
                 let share_accounting = extended_channel.get_share_accounting();
+
+                let key: VardiffKey = (downstream_id, channel_id).into();
+                let share_responses = share_response_counts.get(&key).cloned();
 
                 extended_channels.push(ExtendedChannelInfo {
                     channel_id,
@@ -97,7 +112,7 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     last_batch_work_sum: share_accounting.get_last_batch_work_sum(),
                     share_batch_size: share_accounting.get_share_batch_size(),
                     blocks_found: share_accounting.get_blocks_found(),
-                    share_responses: None,
+                    share_responses,
                 });
             }
 
@@ -107,6 +122,9 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let requested_max_target = standard_channel.get_requested_max_target();
                 let user_identity = standard_channel.get_user_identity();
                 let share_accounting = standard_channel.get_share_accounting();
+
+                let key: VardiffKey = (downstream_id, channel_id).into();
+                let share_responses = share_response_counts.get(&key).cloned();
 
                 standard_channels.push(StandardChannelInfo {
                     channel_id,
@@ -124,12 +142,12 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     last_batch_work_sum: share_accounting.get_last_batch_work_sum(),
                     share_batch_size: share_accounting.get_share_batch_size(),
                     blocks_found: share_accounting.get_blocks_found(),
-                    share_responses: None,
+                    share_responses,
                 });
             }
 
             Sv2ClientInfo {
-                client_id: client.downstream_id,
+                client_id: downstream_id,
                 extended_channels,
                 standard_channels,
             }
@@ -139,25 +157,34 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
 
 impl Sv2ClientsMonitoring for ChannelManager {
     fn get_sv2_clients(&self) -> Vec<Sv2ClientInfo> {
-        // Clone Downstream references and release lock immediately to avoid contention
-        // with template distribution and message handling
-        let downstream_refs: Vec<Downstream> = self
+        // Clone Downstream references and share_response_counts, then release lock
+        // immediately to avoid contention with template distribution and message handling
+        let (downstream_refs, share_response_counts): (
+            Vec<Downstream>,
+            HashMap<VardiffKey, ShareResponseCounts>,
+        ) = self
             .channel_manager_data
-            .safe_lock(|data| data.downstream.values().cloned().collect())
+            .safe_lock(|data| {
+                (
+                    data.downstream.values().cloned().collect(),
+                    data.share_response_counts.clone(),
+                )
+            })
             .unwrap_or_default();
 
         downstream_refs
             .iter()
-            .filter_map(downstream_to_sv2_client_info)
+            .filter_map(|d| downstream_to_sv2_client_info(d, &share_response_counts))
             .collect()
     }
 
     fn get_sv2_client_by_id(&self, client_id: usize) -> Option<Sv2ClientInfo> {
         self.channel_manager_data
             .safe_lock(|d| {
+                let share_response_counts = &d.share_response_counts;
                 d.downstream
                     .get(&client_id)
-                    .and_then(downstream_to_sv2_client_info)
+                    .and_then(|ds| downstream_to_sv2_client_info(ds, share_response_counts))
             })
             .unwrap_or(None)
     }

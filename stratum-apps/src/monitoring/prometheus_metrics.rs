@@ -26,6 +26,8 @@ pub struct PrometheusMetrics {
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
+    pub sv1_client_shares_accepted_total: Option<GaugeVec>,
+    pub sv1_client_shares_rejected_total: Option<GaugeVec>,
 }
 
 impl PrometheusMetrics {
@@ -168,16 +170,44 @@ impl PrometheusMetrics {
         };
 
         // SV1 metrics
-        let (sv1_clients_total, sv1_hashrate_total) = if enable_sv1_metrics {
+        let (
+            sv1_clients_total,
+            sv1_hashrate_total,
+            sv1_client_shares_accepted_total,
+            sv1_client_shares_rejected_total,
+        ) = if enable_sv1_metrics {
             let clients = Gauge::new("sv1_clients_total", "Total number of SV1 clients")?;
             registry.register(Box::new(clients.clone()))?;
 
             let hashrate = Gauge::new("sv1_hashrate_total", "Total hashrate from SV1 clients")?;
             registry.register(Box::new(hashrate.clone()))?;
 
-            (Some(clients), Some(hashrate))
+            let shares_accepted = GaugeVec::new(
+                Opts::new(
+                    "sv1_client_shares_accepted_total",
+                    "Total shares accepted per SV1 client",
+                ),
+                &["client_id", "user_identity"],
+            )?;
+            registry.register(Box::new(shares_accepted.clone()))?;
+
+            let shares_rejected = GaugeVec::new(
+                Opts::new(
+                    "sv1_client_shares_rejected_total",
+                    "Total shares rejected per SV1 client, broken down by rejection reason",
+                ),
+                &["client_id", "user_identity", "reason"],
+            )?;
+            registry.register(Box::new(shares_rejected.clone()))?;
+
+            (
+                Some(clients),
+                Some(hashrate),
+                Some(shares_accepted),
+                Some(shares_rejected),
+            )
         } else {
-            (None, None)
+            (None, None, None, None)
         };
 
         Ok(Self {
@@ -197,6 +227,8 @@ impl PrometheusMetrics {
             sv2_client_blocks_found_total,
             sv1_clients_total,
             sv1_hashrate_total,
+            sv1_client_shares_accepted_total,
+            sv1_client_shares_rejected_total,
         })
     }
 }
