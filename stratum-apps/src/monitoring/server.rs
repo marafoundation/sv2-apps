@@ -94,3 +94,124 @@ pub trait ServerMonitoring: Send + Sync {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    fn make_server_extended(channel_id: u32, hashrate: Option<f32>) -> ServerExtendedChannelInfo {
+        ServerExtendedChannelInfo {
+            channel_id,
+            user_identity: format!("pool-ext-{}", channel_id),
+            nominal_hashrate: hashrate,
+            target_hex: "00ff".into(),
+            extranonce_prefix_hex: "aa".into(),
+            full_extranonce_size: 16,
+            rollable_extranonce_size: 4,
+            version_rolling: true,
+            shares_accepted: 10,
+            share_work_sum: 100.0,
+            shares_submitted: 12,
+            best_diff: 50.0,
+            blocks_found: 0,
+        }
+    }
+
+    fn make_server_standard(channel_id: u32, hashrate: Option<f32>) -> ServerStandardChannelInfo {
+        ServerStandardChannelInfo {
+            channel_id,
+            user_identity: format!("pool-std-{}", channel_id),
+            nominal_hashrate: hashrate,
+            target_hex: "00ff".into(),
+            extranonce_prefix_hex: "bb".into(),
+            shares_accepted: 20,
+            share_work_sum: 200.0,
+            shares_submitted: 22,
+            best_diff: 80.0,
+            blocks_found: 0,
+        }
+    }
+
+    // ── ServerInfo unit tests ───────────────────────────────────────
+
+    #[test]
+    fn server_info_empty() {
+        let server = ServerInfo {
+            extended_channels: vec![],
+            standard_channels: vec![],
+        };
+        assert_eq!(server.total_channels(), 0);
+        assert_eq!(server.total_hashrate(), 0.0);
+    }
+
+    #[test]
+    fn server_info_aggregates_both_channel_types() {
+        let server = ServerInfo {
+            extended_channels: vec![make_server_extended(1, Some(100.0))],
+            standard_channels: vec![
+                make_server_standard(2, Some(50.0)),
+                make_server_standard(3, Some(75.0)),
+            ],
+        };
+        assert_eq!(server.total_channels(), 3);
+        assert!((server.total_hashrate() - 225.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn server_info_hashrate_skips_none_values() {
+        let server = ServerInfo {
+            extended_channels: vec![
+                make_server_extended(1, Some(100.0)),
+                make_server_extended(2, None),
+            ],
+            standard_channels: vec![
+                make_server_standard(3, Some(50.0)),
+                make_server_standard(4, None),
+            ],
+        };
+        assert_eq!(server.total_channels(), 4);
+        assert!((server.total_hashrate() - 150.0).abs() < f32::EPSILON);
+    }
+
+    // ── ServerMonitoring trait default implementations ───────────────
+
+    struct MockServer(ServerInfo);
+    impl ServerMonitoring for MockServer {
+        fn get_server(&self) -> ServerInfo {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn server_monitoring_summary_empty() {
+        let monitor = MockServer(ServerInfo {
+            extended_channels: vec![],
+            standard_channels: vec![],
+        });
+        let summary = monitor.get_server_summary();
+
+        assert_eq!(summary.total_channels, 0);
+        assert_eq!(summary.extended_channels, 0);
+        assert_eq!(summary.standard_channels, 0);
+        assert_eq!(summary.total_hashrate, 0.0);
+    }
+
+    #[test]
+    fn server_monitoring_summary_aggregates_correctly() {
+        let monitor = MockServer(ServerInfo {
+            extended_channels: vec![
+                make_server_extended(1, Some(100.0)),
+                make_server_extended(2, Some(200.0)),
+            ],
+            standard_channels: vec![make_server_standard(3, Some(50.0))],
+        });
+        let summary = monitor.get_server_summary();
+
+        assert_eq!(summary.total_channels, 3);
+        assert_eq!(summary.extended_channels, 2);
+        assert_eq!(summary.standard_channels, 1);
+        assert!((summary.total_hashrate - 350.0).abs() < f32::EPSILON);
+    }
+}
