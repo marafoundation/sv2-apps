@@ -510,6 +510,27 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {} ❌", msg);
+
+        let error_code = msg.error_code.as_utf8_or_hex();
+        self.channel_manager_data.super_safe_lock(|data| {
+            let counts = data
+                .server_share_response_counts
+                .entry(msg.channel_id)
+                .or_default();
+            match error_code.as_str() {
+                "invalid-share" => counts.invalid += 1,
+                "stale-share" => counts.stale += 1,
+                "invalid-job-id" => counts.invalid_job_id += 1,
+                "difficulty-too-low" => counts.difficulty_too_low += 1,
+                "duplicate-share" => counts.duplicate += 1,
+                "bad-extranonce-size" => counts.bad_extranonce_size += 1,
+                "invalid-channel-id" => counts.invalid_channel_id += 1,
+                _ => {
+                    warn!("Unknown SubmitSharesError error_code: {}", error_code);
+                }
+            }
+        });
+
         Ok(())
     }
 

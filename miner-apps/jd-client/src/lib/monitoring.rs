@@ -42,6 +42,8 @@ impl ServerMonitoring for ChannelManager {
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .saturating_sub(1);
 
+                    let share_responses = d.server_share_response_counts.get(&channel_id).cloned();
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -56,6 +58,7 @@ impl ServerMonitoring for ChannelManager {
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
                         blocks_found: share_accounting.get_blocks_found(),
+                        share_responses,
                     });
                 }
 

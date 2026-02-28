@@ -4,7 +4,10 @@
 //! tProxy has server channels (upstream to pool) but no SV2 clients
 //! (SV1 clients are handled separately in sv1_monitoring.rs).
 
-use stratum_apps::monitoring::server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring};
+use stratum_apps::monitoring::{
+    client::ShareResponseCounts,
+    server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+};
 
 use crate::{
     sv2::channel_manager::ChannelManager, tproxy_mode, utils::AGGREGATED_CHANNEL_ID,
@@ -38,6 +41,12 @@ impl ServerMonitoring for ChannelManager {
                         .map(|v| *v)
                         .unwrap_or(0);
 
+                    // In aggregated mode, rejections are keyed by AGGREGATED_CHANNEL_ID
+                    let share_responses: Option<ShareResponseCounts> = self
+                        .server_share_response_counts
+                        .get(&AGGREGATED_CHANNEL_ID)
+                        .map(|r| r.clone());
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -58,6 +67,7 @@ impl ServerMonitoring for ChannelManager {
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
                         blocks_found: share_accounting.get_blocks_found(),
+                        share_responses,
                     });
                 }
             }
@@ -81,6 +91,11 @@ impl ServerMonitoring for ChannelManager {
                         .map(|v| *v)
                         .unwrap_or(0);
 
+                    let share_responses: Option<ShareResponseCounts> = self
+                        .server_share_response_counts
+                        .get(&channel_id)
+                        .map(|r| r.clone());
+
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
                         user_identity: user_identity.clone(),
@@ -99,6 +114,7 @@ impl ServerMonitoring for ChannelManager {
                         shares_submitted,
                         best_diff: share_accounting.get_best_diff(),
                         blocks_found: share_accounting.get_blocks_found(),
+                        share_responses,
                     });
                 }
             }

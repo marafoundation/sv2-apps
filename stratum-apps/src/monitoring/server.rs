@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::client::ShareResponseCounts;
+
 /// Information about an extended channel opened with the server
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServerExtendedChannelInfo {
@@ -23,6 +25,9 @@ pub struct ServerExtendedChannelInfo {
     pub shares_submitted: u32,
     pub best_diff: f64,
     pub blocks_found: u32,
+    /// Per-outcome share response counters from the upstream server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_responses: Option<ShareResponseCounts>,
 }
 
 /// Information about a standard channel opened with the server
@@ -39,6 +44,9 @@ pub struct ServerStandardChannelInfo {
     pub shares_submitted: u32,
     pub best_diff: f64,
     pub blocks_found: u32,
+    /// Per-outcome share response counters from the upstream server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_responses: Option<ShareResponseCounts>,
 }
 
 /// Information about the server (upstream connection)

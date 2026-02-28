@@ -383,6 +383,30 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {} ❌", m);
+
+        // In aggregated mode the pool responds with the upstream channel ID;
+        // map it back to AGGREGATED_CHANNEL_ID so the counter key is consistent.
+        let key = if is_aggregated() {
+            AGGREGATED_CHANNEL_ID
+        } else {
+            m.channel_id
+        };
+
+        let error_code = m.error_code.as_utf8_or_hex();
+        let mut counts = self.server_share_response_counts.entry(key).or_default();
+        match error_code.as_str() {
+            "invalid-share" => counts.invalid += 1,
+            "stale-share" => counts.stale += 1,
+            "invalid-job-id" => counts.invalid_job_id += 1,
+            "difficulty-too-low" => counts.difficulty_too_low += 1,
+            "duplicate-share" => counts.duplicate += 1,
+            "bad-extranonce-size" => counts.bad_extranonce_size += 1,
+            "invalid-channel-id" => counts.invalid_channel_id += 1,
+            _ => {
+                warn!("Unknown SubmitSharesError error_code: {}", error_code);
+            }
+        }
+
         Ok(())
     }
 

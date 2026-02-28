@@ -14,6 +14,7 @@ pub struct PrometheusMetrics {
     pub sv2_server_hashrate_total: Option<Gauge>,
     pub sv2_server_channel_hashrate: Option<GaugeVec>,
     pub sv2_server_shares_accepted_total: Option<GaugeVec>,
+    pub sv2_server_shares_rejected_total: Option<GaugeVec>,
     pub sv2_server_blocks_found_total: Option<Gauge>,
     // Clients metrics (downstream connections)
     pub sv2_clients_total: Option<Gauge>,
@@ -48,6 +49,7 @@ impl PrometheusMetrics {
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
+            sv2_server_shares_rejected_total,
             sv2_server_blocks_found_total,
         ) = if enable_server_metrics {
             let channels = GaugeVec::new(
@@ -80,6 +82,15 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(shares_accepted.clone()))?;
 
+            let shares_rejected = GaugeVec::new(
+                Opts::new(
+                    "sv2_server_shares_rejected_total",
+                    "Total shares rejected per server channel, broken down by rejection reason",
+                ),
+                &["channel_id", "user_identity", "reason"],
+            )?;
+            registry.register(Box::new(shares_rejected.clone()))?;
+
             let blocks_found = Gauge::new(
                 "sv2_server_blocks_found_total",
                 "Total blocks found across all current server channels",
@@ -91,10 +102,11 @@ impl PrometheusMetrics {
                 Some(hashrate),
                 Some(channel_hashrate),
                 Some(shares_accepted),
+                Some(shares_rejected),
                 Some(blocks_found),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         // Clients metrics (downstream connections)
@@ -217,6 +229,7 @@ impl PrometheusMetrics {
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
+            sv2_server_shares_rejected_total,
             sv2_server_blocks_found_total,
             sv2_clients_total,
             sv2_client_channels,

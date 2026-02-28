@@ -171,6 +171,9 @@ pub struct ChannelManagerData {
     /// Tracks every share response the JDC sends back to a downstream channel,
     /// enabling monitoring of rejection rates and root-cause analysis.
     pub share_response_counts: HashMap<VardiffKey, ShareResponseCounts>,
+    /// Counters for share rejections received from the upstream server.
+    /// Keyed by channel_id. Populated from SubmitSharesError messages.
+    pub server_share_response_counts: HashMap<ChannelId, ShareResponseCounts>,
 }
 
 impl ChannelManagerData {
@@ -208,6 +211,7 @@ impl ChannelManagerData {
         self.upstream_channel = None;
         self.pool_tag_string = None;
         self.share_response_counts.clear();
+        self.server_share_response_counts.clear();
 
         self.coinbase_outputs = coinbase_outputs;
     }
@@ -329,6 +333,7 @@ impl ChannelManager {
             supported_extensions,
             required_extensions,
             share_response_counts: HashMap::new(),
+            server_share_response_counts: HashMap::new(),
         }));
 
         let channel_manager_channel = ChannelManagerChannel {
