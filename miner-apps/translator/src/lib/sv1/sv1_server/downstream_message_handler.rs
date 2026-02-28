@@ -6,6 +6,8 @@ use stratum_apps::stratum_core::sv1_api::{
 };
 use tracing::{debug, info, warn};
 
+use stratum_apps::stratum_core::channels_sv2::target::bytes_to_hex;
+
 use crate::{
     error, is_aggregated,
     sv1::{downstream::SubmitShareWithChannelId, Sv1Server},
@@ -155,20 +157,35 @@ impl IsServer<'static> for Sv1Server {
                 channel_id
             );
 
-            let is_valid = validate_sv1_share(
+            let share_hash = match validate_sv1_share(
                 request,
                 data.target,
                 data.extranonce1.clone().into(),
                 data.version_rolling_mask.clone(),
                 job,
-            )
-            .unwrap_or(false);
+            ) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    error!("Invalid share for channel id: {}", channel_id);
+                    data.share_counts.failed_validation += 1;
+                    return false;
+                }
+                Err(_) => {
+                    error!("Share validation error for channel id: {}", channel_id);
+                    data.share_counts.failed_validation += 1;
+                    return false;
+                }
+            };
 
-            if !is_valid {
-                error!("Invalid share for channel id: {}", channel_id);
-                data.share_counts.failed_validation += 1;
-                return false;
-            }
+            let target_bytes = data.target.to_be_bytes();
+            warn!(
+                "SHARE_FORWARDED: downstream_id={}, channel_id={}, job_id={}, tproxy_target={}, share_hash={}",
+                downstream_id,
+                channel_id,
+                request.job_id,
+                bytes_to_hex(&target_bytes),
+                bytes_to_hex(&share_hash),
+            );
 
             data.share_counts.accepted += 1;
 

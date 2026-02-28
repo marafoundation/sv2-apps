@@ -44,8 +44,8 @@ pub const AGGREGATED_CHANNEL_ID: ChannelId = u32::MAX;
 /// * `channel_id` - Channel ID for job lookup
 ///
 /// # Returns
-/// * `Ok(true)` if the share is valid and meets the target
-/// * `Ok(false)` if the share is valid but doesn't meet the target
+/// * `Ok(Some(share_hash_bytes))` if the share is valid and meets the target
+/// * `Ok(None)` if the share is valid but doesn't meet the target
 /// * `Err(TproxyError)` if validation fails due to missing job or invalid data
 pub fn validate_sv1_share(
     share: &client_to_server::Submit<'static>,
@@ -53,7 +53,7 @@ pub fn validate_sv1_share(
     extranonce1: Vec<u8>,
     version_rolling_mask: Option<HexU32Be>,
     job: Notify<'static>,
-) -> Result<bool, TproxyErrorKind> {
+) -> Result<Option<[u8; 32]>, TproxyErrorKind> {
     let mut full_extranonce = vec![];
     full_extranonce.extend_from_slice(extranonce1.as_slice());
     full_extranonce.extend_from_slice(share.extra_nonce2.0.as_ref());
@@ -110,14 +110,10 @@ pub fn validate_sv1_share(
     );
     // check if the share hash meets the downstream target
     if hash_as_target < target {
-        /*if self.share_accounting.is_share_seen(hash.to_raw_hash()) {
-            return Err(ShareValidationError::DuplicateShare);
-        }*/
-
-        return Ok(true);
+        return Ok(Some(hash_bytes));
     }
 
-    Ok(false)
+    Ok(None)
 }
 
 /// Calculates the required length of the proxy's extranonce prefix.
