@@ -18,7 +18,7 @@ use stratum_apps::{
     utils::types::ChannelId,
 };
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::TproxyErrorKind;
 
@@ -74,15 +74,36 @@ pub fn validate_sv1_share(
     // - full extranonce
     // - job coinbase_tx_suffix
     // - job merkle_path
+    let cb1_bytes = job.coin_base1.as_ref();
+    let cb2_bytes = job.coin_base2.as_ref();
+    warn!(
+        "COINBASE_DEBUG_TPROXY: job_id={}, extranonce1={}, extra_nonce2={}, full_extranonce={}, cb1_len={}, cb1={}, cb2_len={}, cb2={}, merkle_branch_len={}",
+        share.job_id,
+        bytes_to_hex(&extranonce1),
+        bytes_to_hex(share.extra_nonce2.0.as_ref()),
+        bytes_to_hex(&full_extranonce),
+        cb1_bytes.len(),
+        bytes_to_hex(cb1_bytes),
+        cb2_bytes.len(),
+        bytes_to_hex(cb2_bytes),
+        job.merkle_branch.len(),
+    );
+
     let merkle_root: [u8; 32] = merkle_root_from_path(
-        job.coin_base1.as_ref(),
-        job.coin_base2.as_ref(),
+        cb1_bytes,
+        cb2_bytes,
         full_extranonce.as_ref(),
         job.merkle_branch.as_ref(),
     )
     .ok_or(TproxyErrorKind::InvalidMerkleRoot)?
     .try_into()
     .map_err(|_| TproxyErrorKind::InvalidMerkleRoot)?;
+
+    warn!(
+        "COINBASE_DEBUG_TPROXY: job_id={}, merkle_root={}",
+        share.job_id,
+        bytes_to_hex(&merkle_root),
+    );
 
     // create the header for validation
     let header = Header {

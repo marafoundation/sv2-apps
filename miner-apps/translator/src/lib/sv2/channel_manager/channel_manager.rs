@@ -532,6 +532,18 @@ impl ChannelManager {
                             // extranonce
                             let mut new_extranonce = translator_prefix.to_vec();
                             new_extranonce.extend_from_slice(m.extranonce.as_ref());
+
+                            warn!(
+                                "EXTRANONCE_TRANSFORM: downstream_channel_id={}, upstream_channel_id={}, downstream_extranonce_prefix={}, range0_len={}, translator_prefix={}, original_share_extranonce={}, new_extranonce={}",
+                                m.channel_id,
+                                upstream_extended_channel_id,
+                                hex::encode(&downstream_extranonce_prefix),
+                                range0_len,
+                                hex::encode(translator_prefix),
+                                hex::encode(m.extranonce.as_ref()),
+                                hex::encode(&new_extranonce),
+                            );
+
                             // Replace the original extranonce with the modified one for
                             // upstream submission
                             m.extranonce =
