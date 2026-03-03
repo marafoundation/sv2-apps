@@ -12,7 +12,6 @@ use stratum_apps::{
     network_helpers::{self, connect_with_noise},
     stratum_core::{
         binary_sv2::{self, Seq064K},
-        codec_sv2::HandshakeRole,
         common_messages_sv2::{Protocol, SetupConnection},
         extensions_sv2::{
             RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,

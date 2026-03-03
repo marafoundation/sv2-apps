@@ -18,17 +18,15 @@ use stratum_apps::{
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     key_utils::Secp256k1PublicKey,
-    network_helpers::noise_stream::NoiseTcpStream,
+    network_helpers::connect_with_noise,
     stratum_core::{
         binary_sv2::{self, Seq064K},
-        codec_sv2::HandshakeRole,
         extensions_sv2::{
             RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
             MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
         },
         framing_sv2,
         handlers_sv2::HandleCommonMessagesFromServerAsync,
-        noise_sv2::Initiator,
         parsers_sv2::AnyMessage,
     },
     task_manager::TaskManager,
