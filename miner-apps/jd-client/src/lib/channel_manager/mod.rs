@@ -58,6 +58,8 @@ use stratum_apps::{
 use tokio::{net::TcpListener, select, sync::broadcast};
 use tracing::{debug, error, info, warn};
 
+use stratum_apps::monitoring::client::ShareResponseCounts;
+
 use crate::{
     channel_manager::downstream_message_handler::RouteMessageTo,
     config::JobDeclaratorClientConfig,
@@ -169,6 +171,13 @@ pub struct ChannelManagerData {
     required_extensions: Vec<u16>,
     /// Cached shares waiting for `SetCustomMiningJob.Success` to be propagated upstream
     cached_shares: HashMap<TemplateId, BinaryHeap<SharesOrderedByDiff>>,
+    /// Per-channel counters for all share submission outcomes.
+    /// Tracks every share response the JDC sends back to a downstream channel,
+    /// enabling monitoring of rejection rates and root-cause analysis.
+    pub share_response_counts: HashMap<VardiffKey, ShareResponseCounts>,
+    /// Counters for share rejections received from the upstream server.
+    /// Keyed by channel_id. Populated from SubmitSharesError messages.
+    pub server_share_response_counts: HashMap<ChannelId, ShareResponseCounts>,
 }
 
 impl ChannelManagerData {
@@ -206,6 +215,8 @@ impl ChannelManagerData {
         self.allocate_tokens = None;
         self.upstream_channel = None;
         self.pool_tag_string = None;
+        self.share_response_counts.clear();
+        self.server_share_response_counts.clear();
 
         self.coinbase_outputs = coinbase_outputs;
     }
@@ -327,6 +338,8 @@ impl ChannelManager {
             supported_extensions,
             required_extensions,
             cached_shares: HashMap::new(),
+            share_response_counts: HashMap::new(),
+            server_share_response_counts: HashMap::new(),
         }));
 
         let channel_manager_channel = ChannelManagerChannel {
@@ -684,6 +697,9 @@ impl ChannelManager {
                 .retain(|key, _| key.downstream_id != downstream_id);
             cm_data
                 .vardiff
+                .retain(|key, _| key.downstream_id != downstream_id);
+            cm_data
+                .share_response_counts
                 .retain(|key, _| key.downstream_id != downstream_id);
         });
         Ok(())

@@ -13,6 +13,23 @@ use tracing::debug;
 
 use super::SubmitShareWithChannelId;
 
+/// Per-downstream counters for SV1 share submission outcomes.
+///
+/// Tracks every share response the tProxy sends back to an SV1 miner,
+/// enabling monitoring of rejection rates and root-cause analysis.
+/// Counters are monotonically increasing over the lifetime of the connection.
+#[derive(Debug, Clone, Default)]
+pub struct Sv1ShareCounts {
+    /// Shares that passed local validation and were forwarded upstream.
+    pub accepted: u32,
+    /// Share referenced an unknown job_id.
+    pub job_not_found: u32,
+    /// Share submitted before channel was open.
+    pub channel_not_open: u32,
+    /// Share failed PoW validation against the downstream target.
+    pub failed_validation: u32,
+}
+
 #[derive(Debug)]
 pub struct DownstreamData {
     pub channel_id: Option<ChannelId>,
@@ -37,6 +54,8 @@ pub struct DownstreamData {
     pub upstream_target: Option<Target>,
     // Timestamp of when the last job was received by this downstream, used for keepalive check
     pub last_job_received_time: Option<Instant>,
+    /// Per-outcome share response counters for local SV1 validation.
+    pub share_counts: Sv1ShareCounts,
 }
 
 impl DownstreamData {
@@ -62,6 +81,7 @@ impl DownstreamData {
             pending_share: None,
             upstream_target: None,
             last_job_received_time: None,
+            share_counts: Sv1ShareCounts::default(),
         }
     }
 

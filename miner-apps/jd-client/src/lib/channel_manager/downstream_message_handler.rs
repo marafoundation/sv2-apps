@@ -29,6 +29,8 @@ use stratum_apps::{
 };
 use tracing::{debug, error, info, warn};
 
+use stratum_apps::monitoring::client::ShareResponseCounts;
+
 use crate::{
     channel_manager::{
         ChannelManager, ChannelManagerChannel, SharesOrderedByDiff, FULL_EXTRANONCE_SIZE,
@@ -435,9 +437,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         let vardiff =
                             VardiffState::new().expect("Vardiff state should instantiate.");
 
+                        let key = (downstream_id, standard_channel_id).into();
+                        channel_manager_data.vardiff.insert(key, vardiff);
                         channel_manager_data
-                            .vardiff
-                            .insert((downstream_id, standard_channel_id).into(), vardiff);
+                            .share_response_counts
+                            .entry((downstream_id, standard_channel_id).into())
+                            .or_default();
                         data.standard_channels
                             .insert(standard_channel_id, standard_channel);
 
@@ -711,6 +716,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         channel_manager_data
                             .vardiff
                             .insert((downstream_id, extended_channel_id).into(), vardiff);
+                        channel_manager_data
+                            .share_response_counts
+                            .entry((downstream_id, extended_channel_id).into())
+                            .or_default();
 
                         data.group_channel
                             .add_channel_id(extended_channel_id, full_extranonce_size)
@@ -969,20 +978,27 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             downstream.downstream_data.super_safe_lock(|data| {
                 let mut messages: Vec<RouteMessageTo> = vec![];
 
+                let vardiff_key = (downstream_id, channel_id).into();
+
                 let Some(standard_channel) = data.standard_channels.get_mut(&channel_id) else {
                     error!("SubmitSharesError: channel_id: {channel_id}, sequence_number: {}, error_code: invalid-channel-id", msg.sequence_number);
+                    if let Some(counts) = channel_manager_data.share_response_counts.get_mut(&vardiff_key) {
+                        counts.invalid_channel_id += 1;
+                    }
                     return Ok(vec![(downstream_id, build_error("invalid-channel-id")).into()]);
                 };
 
-                let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
+                let Some(vardiff) = channel_manager_data.vardiff.get_mut(&vardiff_key) else {
                     return Ok(vec![(downstream_id, Mining::CloseChannel(create_close_channel_msg(channel_id, "invalid-channel-id"))).into()]);
                 };
                 vardiff.increment_shares_since_last_update();
                 let res = standard_channel.validate_share(msg.clone());
                 let mut is_downstream_share_valid = false;
                 let mut downstream_share_hash: Option<sha256d::Hash> = None;
+                let mut outcome = ShareResponseCounts::default();
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash)) => {
+                        outcome.accepted = 1;
                         let share_accounting = standard_channel.get_share_accounting();
                         if share_accounting.should_acknowledge() {
                             let success = SubmitSharesSuccess {
@@ -1003,6 +1019,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         is_downstream_share_valid = true;
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                        outcome.accepted = 1;
+                        outcome.blocks_found = 1;
                         info!("SubmitSharesStandard on downstream channel: 💰 Block Found!!! 💰{share_hash}");
                         downstream_share_hash = Some(share_hash);
                         is_downstream_share_valid = true;
@@ -1032,16 +1050,21 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     }
                     Err(err) => {
                         let code = match err {
-                            ShareValidationError::Invalid => "invalid-share",
-                            ShareValidationError::Stale => "stale-share",
-                            ShareValidationError::InvalidJobId => "invalid-job-id",
-                            ShareValidationError::DoesNotMeetTarget => "difficulty-too-low",
-                            ShareValidationError::DuplicateShare => "duplicate-share",
+                            ShareValidationError::Invalid => { outcome.invalid = 1; "invalid-share" }
+                            ShareValidationError::Stale => { outcome.stale = 1; "stale-share" }
+                            ShareValidationError::InvalidJobId => { outcome.invalid_job_id = 1; "invalid-job-id" }
+                            ShareValidationError::DoesNotMeetTarget => { outcome.difficulty_too_low = 1; "difficulty-too-low" }
+                            ShareValidationError::DuplicateShare => { outcome.duplicate = 1; "duplicate-share" }
                             _ => unreachable!(),
                         };
                         error!("❌ SubmitSharesError: ch={}, seq={}, error={code}", channel_id, msg.sequence_number);
                         messages.push((downstream_id, build_error(code)).into());
                     }
+                }
+
+                // Accumulate share outcome into per-channel counters
+                if let Some(counts) = channel_manager_data.share_response_counts.get_mut(&vardiff_key) {
+                    counts.accumulate(&outcome);
                 }
 
                 if !is_downstream_share_valid {
@@ -1204,8 +1227,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             downstream.downstream_data.super_safe_lock(|data| {
                 let mut messages: Vec<RouteMessageTo> = vec![];
 
+                let vardiff_key = (downstream_id, channel_id).into();
+
                 let Some(extended_channel) = data.extended_channels.get_mut(&channel_id) else {
                     error!("SubmitSharesError: channel_id: {channel_id}, sequence_number: {}, error_code: invalid-channel-id", msg.sequence_number);
+                    if let Some(counts) = channel_manager_data.share_response_counts.get_mut(&vardiff_key) {
+                        counts.invalid_channel_id += 1;
+                    }
                     return Ok(vec![(downstream_id, build_error("invalid-channel-id")).into()]);
                 };
                 // here we extract and set the user_identity from the TLV fields if the extension is negotiated
@@ -1225,15 +1253,17 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     // here we have the UserIdentity TLV, so we can use it to enhance monitoring of individual miners in the future
                 }
 
-                let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
+                let Some(vardiff) = channel_manager_data.vardiff.get_mut(&vardiff_key) else {
                     return Ok(vec![(downstream_id, Mining::CloseChannel(create_close_channel_msg(channel_id, "invalid-channel-id"))).into()]);
                 };
                 vardiff.increment_shares_since_last_update();
                 let res = extended_channel.validate_share(msg.clone());
                 let mut is_downstream_share_valid = false;
                 let mut downstream_share_hash: Option<sha256d::Hash> = None;
+                let mut outcome = ShareResponseCounts::default();
                 match res {
                     Ok(ShareValidationResult::Valid(share_hash)) => {
+                        outcome.accepted = 1;
                         let share_accounting = extended_channel.get_share_accounting();
                         if share_accounting.should_acknowledge() {
                             let success = SubmitSharesSuccess {
@@ -1254,6 +1284,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         is_downstream_share_valid = true;
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
+                        outcome.accepted = 1;
+                        outcome.blocks_found = 1;
                         info!("SubmitSharesExtended on downstream channel: 💰 Block Found!!! 💰{share_hash}");
                         downstream_share_hash = Some(share_hash);
                         if let Some(template_id) = template_id {
@@ -1282,17 +1314,22 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     }
                     Err(err) => {
                         let code = match err {
-                            ShareValidationError::Invalid => "invalid-share",
-                            ShareValidationError::Stale => "stale-share",
-                            ShareValidationError::InvalidJobId => "invalid-job-id",
-                            ShareValidationError::DoesNotMeetTarget => "difficulty-too-low",
-                            ShareValidationError::DuplicateShare => "duplicate-share",
-                            ShareValidationError::BadExtranonceSize => "bad-extranonce-size",
+                            ShareValidationError::Invalid => { outcome.invalid = 1; "invalid-share" }
+                            ShareValidationError::Stale => { outcome.stale = 1; "stale-share" }
+                            ShareValidationError::InvalidJobId => { outcome.invalid_job_id = 1; "invalid-job-id" }
+                            ShareValidationError::DoesNotMeetTarget => { outcome.difficulty_too_low = 1; "difficulty-too-low" }
+                            ShareValidationError::DuplicateShare => { outcome.duplicate = 1; "duplicate-share" }
+                            ShareValidationError::BadExtranonceSize => { outcome.bad_extranonce_size = 1; "bad-extranonce-size" }
                             _ => unreachable!(),
                         };
                         error!("❌ SubmitSharesError on downstream channel: ch={}, seq={}, error={code}", channel_id, msg.sequence_number);
                         messages.push((downstream_id, build_error(code)).into());
                     }
+                }
+
+                // Accumulate share outcome into per-channel counters
+                if let Some(counts) = channel_manager_data.share_response_counts.get_mut(&vardiff_key) {
+                    counts.accumulate(&outcome);
                 }
 
                 if !is_downstream_share_valid{

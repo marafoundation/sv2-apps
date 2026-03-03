@@ -15,6 +15,7 @@ use stratum_apps::{
     config_helpers::CoinbaseRewardScript,
     custom_mutex::Mutex,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
+    monitoring::client::ShareResponseCounts,
     network_helpers::accept_noise_connection,
     stratum_core::{
         bitcoin::{Amount, TxOut},
@@ -69,6 +70,9 @@ pub struct ChannelManagerData {
     // Mapping of `(downstream_id, channel_id)` → vardiff controller.
     // Each entry manages variable difficulty for a specific downstream channel.
     vardiff: HashMap<VardiffKey, VardiffState>,
+    // Mapping of `(downstream_id, channel_id)` → share response counters.
+    // Tracks all share submission outcomes per channel for monitoring.
+    pub(crate) share_response_counts: HashMap<VardiffKey, ShareResponseCounts>,
     // Coinbase outputs
     coinbase_outputs: Vec<u8>,
     // Last new prevhash
@@ -142,6 +146,7 @@ impl ChannelManager {
             extranonce_prefix_factory_standard,
             downstream_id_factory: AtomicUsize::new(1),
             vardiff: HashMap::new(),
+            share_response_counts: HashMap::new(),
             coinbase_outputs,
             last_future_template: None,
             last_new_prev_hash: None,
@@ -429,6 +434,9 @@ impl ChannelManager {
             cm_data.downstream.remove(&downstream_id);
             cm_data
                 .vardiff
+                .retain(|key, _| key.downstream_id != downstream_id);
+            cm_data
+                .share_response_counts
                 .retain(|key, _| key.downstream_id != downstream_id);
         });
         Ok(())

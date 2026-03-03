@@ -81,9 +81,17 @@ tokio::spawn(async move {
 - `sv2_client_channels{channel_type}` - Client channels by type (extended/standard)
 - `sv2_client_hashrate_total` - Total client hashrate
 - `sv2_client_channel_hashrate{client_id, channel_id, user_identity}` - Per-channel hashrate
-- `sv2_client_shares_accepted_total{client_id, channel_id, user_identity}` - Per-channel shares
+- `sv2_client_shares_accepted_total{client_id, channel_id, user_identity}` - Per-channel shares accepted
+- `sv2_client_shares_rejected_total{client_id, channel_id, user_identity, reason}` - Per-channel shares rejected, by reason (`invalid-share`, `stale-share`, `invalid-job-id`, `difficulty-too-low`, `duplicate-share`, `bad-extranonce-size`, `invalid-channel-id`). Only populated by the pool.
 - `sv2_client_blocks_found_total` - Total blocks found across all current client channels
 
 **Sv1 (Translator Proxy only):**
 - `sv1_clients_total` - Sv1 client count
 - `sv1_hashrate_total` - Sv1 total hashrate
+- `sv1_client_shares_accepted_total{client_id, user_identity}` - Per-client shares accepted (local tProxy validation)
+- `sv1_client_shares_rejected_total{client_id, user_identity, reason}` - Per-client shares rejected, by reason (`invalid-share`, `invalid-job-id`, `invalid-channel-id`). Tracks local tProxy validation outcomes that determine the SV1 `result: true/false` response.
+
+**Note on share response tracking:**
+- **Pool**: `sv2_client_shares_accepted/rejected_total` tracks per-channel share validation outcomes.
+- **JDC**: Same `sv2_client_shares_accepted/rejected_total` metrics are now populated by JDC's local share validation (both pool-connected and solo mining modes).
+- **tProxy**: `sv1_client_shares_accepted/rejected_total` tracks per-SV1-miner share validation outcomes at the tProxy's local validation layer.

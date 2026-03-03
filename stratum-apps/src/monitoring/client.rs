@@ -6,6 +6,50 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// Per-channel breakdown of all share submission outcomes.
+///
+/// Enables monitoring of rejection rates and root-cause analysis:
+/// a high `stale` count may indicate slow job distribution, a high
+/// `invalid_job_id` count may signal template propagation issues, etc.
+///
+/// All counters are monotonically increasing over the lifetime of the channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ShareResponseCounts {
+    /// Shares that passed validation (includes block-found shares).
+    pub accepted: u32,
+    /// Blocks found (subset of accepted).
+    pub blocks_found: u32,
+    /// `invalid-share` — share failed hash validation.
+    pub invalid: u32,
+    /// `stale-share` — share references an outdated prev_hash / job.
+    pub stale: u32,
+    /// `invalid-job-id` — job_id in the share does not match any known job.
+    pub invalid_job_id: u32,
+    /// `difficulty-too-low` — share hash does not meet the channel's target.
+    pub difficulty_too_low: u32,
+    /// `duplicate-share` — share was already submitted.
+    pub duplicate: u32,
+    /// `bad-extranonce-size` — extranonce size mismatch (extended channels only).
+    pub bad_extranonce_size: u32,
+    /// `invalid-channel-id` — the channel_id in the share message was not found.
+    pub invalid_channel_id: u32,
+}
+
+impl ShareResponseCounts {
+    /// Merge a single-share outcome delta into the running totals.
+    pub fn accumulate(&mut self, delta: &ShareResponseCounts) {
+        self.accepted += delta.accepted;
+        self.blocks_found += delta.blocks_found;
+        self.invalid += delta.invalid;
+        self.stale += delta.stale;
+        self.invalid_job_id += delta.invalid_job_id;
+        self.difficulty_too_low += delta.difficulty_too_low;
+        self.duplicate += delta.duplicate;
+        self.bad_extranonce_size += delta.bad_extranonce_size;
+        self.invalid_channel_id += delta.invalid_channel_id;
+    }
+}
+
 /// Information about an extended channel
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExtendedChannelInfo {
@@ -26,6 +70,9 @@ pub struct ExtendedChannelInfo {
     pub last_batch_work_sum: f64,
     pub share_batch_size: usize,
     pub blocks_found: u32,
+    /// Per-outcome share response counters (only populated by the pool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_responses: Option<ShareResponseCounts>,
 }
 
 /// Information about a standard channel
@@ -46,6 +93,9 @@ pub struct StandardChannelInfo {
     pub last_batch_work_sum: f64,
     pub share_batch_size: usize,
     pub blocks_found: u32,
+    /// Per-outcome share response counters (only populated by the pool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_responses: Option<ShareResponseCounts>,
 }
 
 /// Full information about a single Sv2 client including all channels

@@ -110,6 +110,9 @@ impl IsServer<'static> for Sv1Server {
             .downstream_data
             .super_safe_lock(|data| data.channel_id)
         else {
+            downstream
+                .downstream_data
+                .super_safe_lock(|data| data.share_counts.channel_not_open += 1);
             return false;
         };
 
@@ -128,6 +131,9 @@ impl IsServer<'static> for Sv1Server {
             .and_then(|jobs| find_job(jobs.as_ref()));
 
         let Some(job) = job else {
+            downstream
+                .downstream_data
+                .super_safe_lock(|data| data.share_counts.job_not_found += 1);
             return false;
         };
 
@@ -139,6 +145,7 @@ impl IsServer<'static> for Sv1Server {
                         "Cannot submit share: channel_id is None \
                          (waiting for OpenExtendedMiningChannelSuccess)"
                     );
+                    data.share_counts.channel_not_open += 1;
                     return false;
                 }
             };
@@ -159,8 +166,11 @@ impl IsServer<'static> for Sv1Server {
 
             if !is_valid {
                 error!("Invalid share for channel id: {}", channel_id);
+                data.share_counts.failed_validation += 1;
                 return false;
             }
+
+            data.share_counts.accepted += 1;
 
             data.pending_share = Some(SubmitShareWithChannelId {
                 channel_id,

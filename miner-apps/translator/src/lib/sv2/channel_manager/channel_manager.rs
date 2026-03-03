@@ -11,6 +11,7 @@ use std::sync::Arc;
 use stratum_apps::{
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
+    monitoring::client::ShareResponseCounts,
     stratum_core::{
         channels_sv2::client::{extended::ExtendedChannel, group::GroupChannel},
         codec_sv2::StandardSv2Frame,
@@ -75,6 +76,9 @@ pub struct ChannelManager {
     pub negotiated_extensions: Arc<Mutex<Vec<u16>>>,
     /// Extranonce factories containing per channel extranonces
     pub extranonce_factories: Arc<DashMap<ChannelId, ExtendedExtranonce>>,
+    /// Per-channel share response counts received from the upstream server.
+    /// Keyed by channel_id. Tracks rejections reported via SubmitSharesError.
+    pub server_share_response_counts: Arc<DashMap<ChannelId, ShareResponseCounts>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -122,6 +126,7 @@ impl ChannelManager {
             share_sequence_counters: Arc::new(DashMap::new()),
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
             extranonce_factories: Arc::new(DashMap::new()),
+            server_share_response_counts: Arc::new(DashMap::new()),
         }
     }
 
