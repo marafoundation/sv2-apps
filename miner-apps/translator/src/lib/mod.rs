@@ -121,7 +121,7 @@ impl TranslatorSv2 {
 
         info!("Initializing upstream connection...");
 
-        if let Err(e) = self
+        let negotiated_extensions = match self
             .initialize_upstream(
                 &mut upstream_addresses,
                 channel_manager_to_upstream_receiver.clone(),
@@ -135,10 +135,16 @@ impl TranslatorSv2 {
             )
             .await
         {
-            error!("Failed to initialize any upstream connection: {e:?}");
-            return;
-        }
+            Ok(extensions) => extensions,
+            Err(e) => {
+                error!("Failed to initialize any upstream connection: {e:?}");
+                return;
+            }
+        };
 
+        // Create ChannelManager with the negotiated extensions from upstream
+        // This ensures the ChannelManager knows which extensions are active
+        // BEFORE the SV1 server starts accepting connections
         let mut channel_manager: Arc<ChannelManager> = Arc::new(ChannelManager::new(
             channel_manager_to_upstream_sender,
             upstream_to_channel_manager_receiver,
@@ -147,6 +153,7 @@ impl TranslatorSv2 {
             status_sender.clone(),
             self.config.supported_extensions.clone(),
             self.config.required_extensions.clone(),
+            negotiated_extensions,
         ));
 
         info!("Launching ChannelManager tasks...");
@@ -265,7 +272,7 @@ impl TranslatorSv2 {
                                     self.config.clone(),
                                 ));
 
-                                if let Err(e) = self.initialize_upstream(
+                                match self.initialize_upstream(
                                     &mut upstream_addresses,
                                     channel_manager_to_upstream_receiver,
                                     upstream_to_channel_manager_sender,
@@ -276,20 +283,29 @@ impl TranslatorSv2 {
                                     sv1_server.clone(),
                                     self.config.required_extensions.clone(),
                                 ).await {
-                                    error!("Couldn't perform fallback, shutting system down: {e:?}");
-                                    cancellation_token.cancel();
-                                    break;
-                                }
+                                    Ok(negotiated_extensions) => {
+                                        info!(
+                                            "Upstream restarted successfully with extensions: {:?}",
+                                            negotiated_extensions
+                                        );
 
-                                channel_manager = Arc::new(ChannelManager::new(
-                                    channel_manager_to_upstream_sender,
-                                    upstream_to_channel_manager_receiver,
-                                    channel_manager_to_sv1_server_sender,
-                                    sv1_server_to_channel_manager_receiver,
-                                    status_sender.clone(),
-                                    self.config.supported_extensions.clone(),
-                                    self.config.required_extensions.clone(),
-                                ));
+                                        channel_manager = Arc::new(ChannelManager::new(
+                                            channel_manager_to_upstream_sender,
+                                            upstream_to_channel_manager_receiver,
+                                            channel_manager_to_sv1_server_sender,
+                                            sv1_server_to_channel_manager_receiver,
+                                            status_sender.clone(),
+                                            self.config.supported_extensions.clone(),
+                                            self.config.required_extensions.clone(),
+                                            negotiated_extensions,
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        error!("Couldn't perform fallback, shutting system down: {e:?}");
+                                        cancellation_token.cancel();
+                                        break;
+                                    }
+                                }
 
                                 info!("Launching ChannelManager tasks...");
                                 ChannelManager::run_channel_manager_tasks(
@@ -391,6 +407,10 @@ impl TranslatorSv2 {
     ///  `false` means "never tried", while `true` means "already connected or marked as
     /// malicious". Once an upstream is flagged we skip it on future loops
     /// to avoid hammering known-bad endpoints during failover.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u16>)` - The negotiated extensions to be passed to ChannelManager
+    /// * `Err(TproxyErrorKind)` - All upstreams failed
     #[allow(clippy::too_many_arguments)]
     pub async fn initialize_upstream(
         &self,
@@ -403,11 +423,11 @@ impl TranslatorSv2 {
         task_manager: Arc<TaskManager>,
         sv1_server_instance: Arc<Sv1Server>,
         required_extensions: Vec<u16>,
-    ) -> Result<(), TproxyErrorKind> {
+    ) -> Result<Vec<u16>, TproxyErrorKind> {
         const MAX_RETRIES: usize = 3;
         let upstream_len = upstreams.len();
         for (i, upstream_entry) in upstreams.iter_mut().enumerate() {
-            // Skip upstreams already marked as malicious. We’ve previously failed or
+            // Skip upstreams already marked as malicious. We've previously failed or
             // blacklisted them, so no need to warn or attempt reconnecting again.
             if upstream_entry.tried_or_flagged {
                 debug!(
@@ -438,8 +458,13 @@ impl TranslatorSv2 {
                 )
                 .await
                 {
-                    Ok(()) => {
-                        // starting sv1 server instance
+                    Ok(negotiated_extensions) => {
+                        info!(
+                            "Extension negotiation complete. Negotiated extensions: {:?}",
+                            negotiated_extensions
+                        );
+
+                        // Now that extensions are negotiated, start the SV1 server
                         if let Err(e) = sv1_server_instance
                             .clone()
                             .start(
@@ -455,7 +480,7 @@ impl TranslatorSv2 {
                         }
 
                         upstream_entry.tried_or_flagged = true;
-                        return Ok(());
+                        return Ok(negotiated_extensions);
                     }
                     Err(e) => {
                         warn!(
@@ -491,7 +516,7 @@ async fn try_initialize_upstream(
     status_sender: Sender<Status>,
     task_manager: Arc<TaskManager>,
     required_extensions: Vec<u16>,
-) -> Result<(), TproxyErrorKind> {
+) -> Result<Vec<u16>, TproxyErrorKind> {
     let upstream = Upstream::new(
         upstream_addr,
         upstream_to_channel_manager_sender,
@@ -510,8 +535,8 @@ async fn try_initialize_upstream(
             status_sender,
             task_manager,
         )
-        .await?;
-    Ok(())
+        .await
+        .map_err(|e| e.kind)
 }
 
 /// Defines the operational mode for Translator Proxy.

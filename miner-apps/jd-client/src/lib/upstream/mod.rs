@@ -6,10 +6,11 @@
 //! Responsibilities:
 //! - Establish a TCP + Noise encrypted connection to upstream
 //! - Perform `SetupConnection` handshake
+//! - Negotiate extensions synchronously before returning
 //! - Forward SV2 mining messages between upstream and channel manager
 //! - Handle common messages from upstream
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::CancellationToken;
@@ -19,8 +20,14 @@ use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     network_helpers::connect_with_noise,
     stratum_core::{
-        binary_sv2::Seq064K, extensions_sv2::RequestExtensions, framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync, parsers_sv2::AnyMessage,
+        binary_sv2::{self, Seq064K},
+        extensions_sv2::{
+            RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
+        },
+        framing_sv2,
+        handlers_sv2::HandleCommonMessagesFromServerAsync,
+        parsers_sv2::AnyMessage,
     },
     task_manager::TaskManager,
     utils::{
@@ -37,6 +44,9 @@ use crate::{
     status::{handle_error, Status, StatusSender},
     utils::get_setup_connection_message,
 };
+
+/// Timeout for extension negotiation response (30 seconds)
+const EXTENSION_NEGOTIATION_TIMEOUT_SECS: u64 = 30;
 
 mod message_handler;
 
@@ -142,11 +152,17 @@ impl Upstream {
     /// Perform `SetupConnection` handshake with upstream.
     ///
     /// Sends [`SetupConnection`] and awaits response.
+    /// If required extensions are configured, negotiates them synchronously
+    /// before returning.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u16>)` - The list of negotiated extensions (empty if none were requested)
+    /// * `Err(JDCError)` - Error during handshake or extension negotiation
     pub async fn setup_connection(
         &mut self,
         min_version: u16,
         max_version: u16,
-    ) -> JDCResult<(), error::Upstream> {
+    ) -> JDCResult<Vec<u16>, error::Upstream> {
         info!("Upstream: initiating SV2 handshake...");
         let setup_connection =
             get_setup_connection_message(min_version, max_version, &self.address)
@@ -188,25 +204,26 @@ impl Upstream {
             .await?;
 
         // Send RequestExtensions after successful SetupConnection if there are required extensions
+        // and wait for the response before returning
         if !self.required_extensions.is_empty() {
-            self.send_request_extensions().await?;
+            let negotiated = self.negotiate_extensions().await?;
+            return Ok(negotiated);
         }
 
-        Ok(())
+        Ok(vec![])
     }
 
-    /// Send `RequestExtensions` message to upstream.
-    /// The supported extensions are stored for potential retry if the server requires additional
-    /// extensions.
-    async fn send_request_extensions(&mut self) -> JDCResult<(), error::Upstream> {
-        info!(
-            "Sending RequestExtensions to upstream with required extensions: {:?}",
-            self.required_extensions
-        );
-        if self.required_extensions.is_empty() {
-            return Ok(());
-        }
-
+    /// Sends RequestExtensions and waits for the response.
+    ///
+    /// This method handles the extension negotiation flow:
+    /// 1. Sends RequestExtensions with required extensions
+    /// 2. Waits for RequestExtensionsSuccess or RequestExtensionsError
+    /// 3. Validates that all required extensions are supported
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u16>)` - The list of successfully negotiated extensions
+    /// * `Err(JDCError)` - Extension negotiation failed
+    async fn negotiate_extensions(&mut self) -> JDCResult<Vec<u16>, error::Upstream> {
         let requested_extensions =
             Seq064K::new(self.required_extensions.clone()).map_err(JDCError::shutdown)?;
 
@@ -233,18 +250,143 @@ impl Upstream {
                 JDCError::fallback(JDCErrorKind::ChannelErrorSender)
             })?;
 
-        info!("Sent RequestExtensions to upstream");
-        Ok(())
+        // Wait for extension negotiation response with timeout
+        let response = tokio::time::timeout(
+            Duration::from_secs(EXTENSION_NEGOTIATION_TIMEOUT_SECS),
+            self.upstream_channel.upstream_receiver.recv(),
+        )
+        .await
+        .map_err(|_| {
+            error!(
+                "Extension negotiation timed out after {} seconds",
+                EXTENSION_NEGOTIATION_TIMEOUT_SECS
+            );
+            JDCError::fallback(JDCErrorKind::ExtensionNegotiationTimeout)
+        })?
+        .map_err(|e| {
+            error!("Failed to receive extension negotiation response: {}", e);
+            JDCError::fallback(e)
+        })?;
+
+        self.handle_extension_response(response).await
+    }
+
+    /// Handles the extension negotiation response (Success or Error).
+    async fn handle_extension_response(
+        &mut self,
+        mut response: Sv2Frame,
+    ) -> JDCResult<Vec<u16>, error::Upstream> {
+        let header = response.get_header().ok_or_else(|| {
+            error!("Extension response frame missing header");
+            JDCError::fallback(JDCErrorKind::UnexpectedMessage(0, 0))
+        })?;
+
+        let msg_type = header.msg_type();
+        let payload = response.payload();
+
+        match msg_type {
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS => {
+                let msg: RequestExtensionsSuccess =
+                    binary_sv2::from_bytes(payload).map_err(|e| {
+                        error!("Failed to parse RequestExtensionsSuccess: {:?}", e);
+                        JDCError::fallback(JDCErrorKind::BinarySv2(e))
+                    })?;
+
+                let supported: Vec<u16> = msg.supported_extensions.into_inner();
+                info!("Extension negotiation success: supported={:?}", supported);
+
+                // Check if all required extensions are supported
+                let missing_required: Vec<u16> = self
+                    .required_extensions
+                    .iter()
+                    .filter(|ext| !supported.contains(ext))
+                    .copied()
+                    .collect();
+
+                if !missing_required.is_empty() {
+                    error!(
+                        "Server does not support required extensions: {:?}",
+                        missing_required
+                    );
+                    return Err(JDCError::fallback(
+                        JDCErrorKind::RequiredExtensionsNotSupported(missing_required),
+                    ));
+                }
+
+                info!("Successfully negotiated extensions: {:?}", supported);
+                Ok(supported)
+            }
+            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR => {
+                let msg: RequestExtensionsError = binary_sv2::from_bytes(payload).map_err(|e| {
+                    error!("Failed to parse RequestExtensionsError: {:?}", e);
+                    JDCError::fallback(JDCErrorKind::BinarySv2(e))
+                })?;
+
+                let unsupported: Vec<u16> = msg.unsupported_extensions.into_inner();
+                let required_by_server: Vec<u16> = msg.required_extensions.into_inner();
+
+                error!(
+                    "Extension negotiation error: unsupported={:?}, required_by_server={:?}",
+                    unsupported, required_by_server
+                );
+
+                // Check if any of our required extensions were not supported
+                let missing_required: Vec<u16> = self
+                    .required_extensions
+                    .iter()
+                    .filter(|ext| unsupported.contains(ext))
+                    .copied()
+                    .collect();
+
+                if !missing_required.is_empty() {
+                    error!(
+                        "Server does not support required extensions: {:?}",
+                        missing_required
+                    );
+                    return Err(JDCError::fallback(
+                        JDCErrorKind::RequiredExtensionsNotSupported(missing_required),
+                    ));
+                }
+
+                // If server requires extensions we don't support, fail
+                if !required_by_server.is_empty() {
+                    error!(
+                        "Server requires extensions that we don't support: {:?}",
+                        required_by_server
+                    );
+                    return Err(JDCError::fallback(
+                        JDCErrorKind::ServerRequiresUnsupportedExtensions(required_by_server),
+                    ));
+                }
+
+                // No required extensions failed, return empty
+                Ok(vec![])
+            }
+            _ => {
+                error!(
+                    "Unexpected message type during extension negotiation: {}",
+                    msg_type
+                );
+                Err(JDCError::fallback(JDCErrorKind::UnexpectedMessage(
+                    header.ext_type(),
+                    msg_type,
+                )))
+            }
+        }
     }
 
     /// Start unified upstream loop.
     ///
     /// Responsibilities:
-    /// - Run `setup_connection`
+    /// - Run `setup_connection` (including extension negotiation)
     /// - Handle messages from upstream (pool) and channel manager
     /// - React to shutdown signals
     ///
-    /// This function spawns an async task and returns immediately.
+    /// This function spawns an async task and returns the negotiated extensions.
+    ///
+    /// # Returns
+    /// * `Vec<u16>` - The list of negotiated extensions (empty if none were requested or setup
+    ///   failed)
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         mut self,
@@ -254,13 +396,22 @@ impl Upstream {
         fallback_coordinator: FallbackCoordinator,
         status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
-    ) {
+    ) -> Vec<u16> {
         let status_sender = StatusSender::Upstream(status_sender);
 
-        if let Err(e) = self.setup_connection(min_version, max_version).await {
-            error!(error = ?e, "Upstream: connection setup failed.");
-            return;
-        }
+        let negotiated_extensions = match self.setup_connection(min_version, max_version).await {
+            Ok(extensions) => {
+                info!(
+                    "Upstream: extension negotiation complete. Extensions: {:?}",
+                    extensions
+                );
+                extensions
+            }
+            Err(e) => {
+                error!(error = ?e, "Upstream: connection setup failed.");
+                return vec![];
+            }
+        };
 
         task_manager.spawn(async move {
             // we just spawned a new task that's relevant to fallback coordination
@@ -306,6 +457,8 @@ impl Upstream {
             // signal fallback coordinator that this task has completed its cleanup
             fallback_handler.done();
         });
+
+        negotiated_extensions
     }
 
     // Handle incoming frames from upstream (pool).

@@ -95,6 +95,8 @@ impl ChannelManager {
     ///   by server)
     /// * `required_extensions` - Extensions that the translator requires (must be supported by
     ///   server)
+    /// * `negotiated_extensions` - Extensions that were successfully negotiated with the upstream
+    ///   server during setup_connection
     ///
     /// # Returns
     /// A new ChannelManager instance ready to handle message routing
@@ -107,6 +109,7 @@ impl ChannelManager {
         status_sender: Sender<Status>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        negotiated_extensions: Vec<u16>,
     ) -> Self {
         let channel_state = ChannelState::new(
             upstream_sender,
@@ -124,10 +127,20 @@ impl ChannelManager {
             extended_channels: Arc::new(DashMap::new()),
             group_channels: Arc::new(DashMap::new()),
             share_sequence_counters: Arc::new(DashMap::new()),
-            negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
+            negotiated_extensions: Arc::new(Mutex::new(negotiated_extensions)),
             extranonce_factories: Arc::new(DashMap::new()),
             server_share_response_counts: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Sets the negotiated extensions.
+    ///
+    /// This is used after upstream fallback to update the negotiated extensions
+    /// with the new upstream server.
+    pub fn set_negotiated_extensions(&self, extensions: Vec<u16>) {
+        self.negotiated_extensions.super_safe_lock(|data| {
+            *data = extensions;
+        });
     }
 
     /// Spawns and runs the main channel manager task loop.
@@ -756,6 +769,7 @@ mod tests {
             status_sender,
             vec![],
             vec![],
+            vec![], // negotiated_extensions
         )
     }
 

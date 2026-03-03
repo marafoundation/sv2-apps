@@ -176,6 +176,8 @@ pub enum TproxyErrorKind {
     RequiredExtensionsNotSupported(Vec<u16>),
     /// Server requires extensions that the translator doesn't support
     ServerRequiresUnsupportedExtensions(Vec<u16>),
+    /// Extension negotiation timed out waiting for response
+    ExtensionNegotiationTimeout,
     /// Represents a generic channel send failure, described by a string.
     General(String),
     /// Error bubbling up from translator-core library
@@ -255,6 +257,9 @@ impl fmt::Display for TproxyErrorKind {
                     "Server requires extensions that we don't support: {:?}",
                     extensions
                 )
+            }
+            ExtensionNegotiationTimeout => {
+                write!(f, "Extension negotiation timed out waiting for response")
             }
             SV1Error => write!(f, "Sv1 error"),
             TranslatorCore(ref e) => write!(f, "Translator core error: {e:?}"),
