@@ -59,6 +59,7 @@ pub fn resolve_ipc_socket_path(
 /// Which type of Template Provider will be used,
 /// along with the relevant config parameters for each.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(tag = "type")]
 pub enum TemplateProviderType {
     Sv2Tp {
         address: String,
@@ -73,6 +74,28 @@ pub enum TemplateProviderType {
         fee_threshold: u64,
         min_interval: u8,
     },
+}
+
+/// Runtime entry for a template provider in the fallback list.
+///
+/// Wraps a [`TemplateProviderType`] with runtime state used during fallback iteration.
+/// Follows the same pattern as Translator's `UpstreamEntry`.
+pub struct TemplateProviderEntry {
+    pub tp_type: TemplateProviderType,
+    pub tried_or_flagged: bool,
+}
+
+impl TemplateProviderEntry {
+    /// Creates a list of entries from a config Vec, all initially untried.
+    pub fn from_config(types: &[TemplateProviderType]) -> Vec<Self> {
+        types
+            .iter()
+            .map(|tp| TemplateProviderEntry {
+                tp_type: tp.clone(),
+                tried_or_flagged: false,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -71,6 +71,8 @@ pub enum State {
     },
     /// Template receiver has shut down with a reason.
     TemplateReceiverShutdown(JDCErrorKind),
+    /// Template receiver requests fallback to next template provider.
+    TemplateReceiverShutdownFallback(JDCErrorKind),
     /// Job declarator has shut down during fallback with a reason.
     JobDeclaratorShutdownFallback(JDCErrorKind),
     /// Channel manager has shut down with a reason.
@@ -114,13 +116,25 @@ async fn send_status<O>(sender: &StatusSender, error: JDCError<O>) -> bool {
         }
 
         Fallback => {
-            let state = State::UpstreamShutdownFallback(error.kind);
+            let state = match sender {
+                StatusSender::TemplateReceiver(_) => {
+                    warn!(
+                        "Template Receiver fallback requested due to error: {:?}",
+                        error.kind
+                    );
+                    State::TemplateReceiverShutdownFallback(error.kind)
+                }
+                _ => State::UpstreamShutdownFallback(error.kind),
+            };
 
             if let Err(e) = sender.send(Status { state }).await {
                 tracing::error!("Failed to send fallback status from {:?}: {:?}", sender, e);
                 std::process::abort();
             }
-            matches!(sender, StatusSender::Upstream { .. })
+            matches!(
+                sender,
+                StatusSender::Upstream { .. } | StatusSender::TemplateReceiver(_)
+            )
         }
 
         Shutdown => {

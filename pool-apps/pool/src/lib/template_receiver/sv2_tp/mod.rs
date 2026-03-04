@@ -3,6 +3,7 @@ mod common_message_handler;
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::CancellationToken;
 use stratum_apps::{
+    fallback_coordinator::FallbackCoordinator,
     key_utils::Secp256k1PublicKey,
     network_helpers::{self, connect_with_noise, resolve_host_port},
     stratum_core::{
@@ -54,6 +55,7 @@ impl Sv2Tp {
         channel_manager_receiver: Receiver<TemplateDistribution<'static>>,
         channel_manager_sender: Sender<TemplateDistribution<'static>>,
         cancellation_token: CancellationToken,
+        fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
     ) -> PoolResult<Sv2Tp, error::TemplateProvider> {
         const MAX_RETRIES: usize = 3;
@@ -89,6 +91,7 @@ impl Sv2Tp {
                                         outbound_rx,
                                         inbound_tx,
                                         cancellation_token.clone(),
+                                        fallback_coordinator.clone(),
                                     );
 
                                     let template_receiver_channel = Sv2TpChannel {
@@ -144,6 +147,7 @@ impl Sv2Tp {
         mut self,
         socket_address: String,
         cancellation_token: CancellationToken,
+        fallback_coordinator: FallbackCoordinator,
         status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
     ) -> PoolResult<(), error::TemplateProvider> {
@@ -154,12 +158,19 @@ impl Sv2Tp {
 
         info!("Setup Connection done. connection with template receiver is now done");
         task_manager.spawn(async move {
+            let fallback_handler = fallback_coordinator.register();
+            let fallback_token = fallback_coordinator.token();
+
             loop {
                 let mut self_clone_1 = self.clone();
                 let self_clone_2 = self.clone();
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         info!("Template Receiver: received shutdown signal");
+                        break;
+                    }
+                    _ = fallback_token.cancelled() => {
+                        info!("Template Receiver: received fallback signal");
                         break;
                     }
                     res = self_clone_1.handle_template_provider_message() => {
@@ -180,6 +191,7 @@ impl Sv2Tp {
                     },
                 }
             }
+            fallback_handler.done();
             warn!("TemplateReceiver: unified message loop exited.");
         });
         Ok(())
@@ -199,7 +211,7 @@ impl Sv2Tp {
             .tp_receiver
             .recv()
             .await
-            .map_err(PoolError::shutdown)?;
+            .map_err(PoolError::fallback)?;
         debug!("Received SV2 frame from Template provider.");
         let header = sv2_frame.get_header().ok_or_else(|| {
             error!("SV2 frame missing header");
@@ -252,7 +264,7 @@ impl Sv2Tp {
             .channel_manager_receiver
             .recv()
             .await
-            .map_err(PoolError::shutdown)?;
+            .map_err(PoolError::fallback)?;
         let message = AnyMessage::TemplateDistribution(msg).into_static();
         let frame: Sv2Frame = message.try_into().map_err(PoolError::shutdown)?;
 

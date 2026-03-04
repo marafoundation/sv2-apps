@@ -78,6 +78,7 @@ impl CanDisconnect for ChannelManager {}
 impl CanFallback for Upstream {}
 impl CanFallback for JobDeclarator {}
 impl CanFallback for ChannelManager {}
+impl CanFallback for TemplateProvider {}
 
 impl CanShutdown for ChannelManager {}
 impl CanShutdown for TemplateProvider {}
@@ -252,6 +253,8 @@ pub enum JDCErrorKind {
     InvalidKey,
     /// Upstream not found
     UpstreamNotFound,
+    /// Configuration error
+    Configuration(String),
 }
 
 impl std::error::Error for JDCErrorKind {}
@@ -394,6 +397,7 @@ impl fmt::Display for JDCErrorKind {
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             InvalidKey => write!(f, "Invalid key used during noise handshake"),
             UpstreamNotFound => write!(f, "Upstream not found"),
+            Configuration(e) => write!(f, "Configuration error: {e}"),
         }
     }
 }

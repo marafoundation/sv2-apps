@@ -25,7 +25,7 @@ use stratum_apps::{
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct PoolConfig {
     listen_address: SocketAddr,
-    template_provider_type: TemplateProviderType,
+    template_provider_types: Vec<TemplateProviderType>,
     authority_public_key: Secp256k1PublicKey,
     authority_secret_key: Secp256k1SecretKey,
     cert_validity_sec: u64,
@@ -60,7 +60,7 @@ impl PoolConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_connection: ConnectionConfig,
-        template_provider_type: TemplateProviderType,
+        template_provider_types: Vec<TemplateProviderType>,
         authority_config: AuthorityConfig,
         coinbase_reward_script: CoinbaseRewardScript,
         shares_per_minute: SharesPerMinute,
@@ -69,9 +69,13 @@ impl PoolConfig {
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
     ) -> Self {
+        assert!(
+            !template_provider_types.is_empty(),
+            "At least one template provider must be configured"
+        );
         Self {
             listen_address: pool_connection.listen_address,
-            template_provider_type,
+            template_provider_types,
             authority_public_key: authority_config.public_key,
             authority_secret_key: authority_config.secret_key,
             cert_validity_sec: pool_connection.cert_validity_sec,
@@ -118,9 +122,9 @@ impl PoolConfig {
         &self.pool_signature
     }
 
-    /// Returns the Template Provider type.
-    pub fn template_provider_type(&self) -> &TemplateProviderType {
-        &self.template_provider_type
+    /// Returns the list of template provider types, ordered by priority.
+    pub fn template_provider_types(&self) -> &[TemplateProviderType] {
+        &self.template_provider_types
     }
 
     /// Returns the share batch size.

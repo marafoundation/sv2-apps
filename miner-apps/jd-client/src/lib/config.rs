@@ -27,8 +27,8 @@ pub struct JobDeclaratorClientConfig {
     authority_secret_key: Secp256k1SecretKey,
     /// The validity period (in seconds) for the certificate used in noise.
     cert_validity_sec: u64,
-    /// The template provider type that this JDC will use.
-    template_provider_type: TemplateProviderType,
+    /// Template providers in priority order (first = primary, rest = fallbacks).
+    template_provider_types: Vec<TemplateProviderType>,
     /// A list of upstream Job Declarator Servers (JDS) that this JDC can connect to.
     /// JDC can fallover between these upstreams.
     upstreams: Vec<Upstream>,
@@ -75,13 +75,17 @@ impl JobDeclaratorClientConfig {
         share_batch_size: SharesBatchSize,
         pool_config: PoolConfig,
         cert_validity_sec: u64,
-        template_provider_type: TemplateProviderType,
+        template_provider_types: Vec<TemplateProviderType>,
         upstreams: Vec<Upstream>,
         jdc_signature: String,
         jdc_mode: Option<String>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
     ) -> Self {
+        assert!(
+            !template_provider_types.is_empty(),
+            "At least one template provider must be configured"
+        );
         Self {
             listening_address,
             max_supported_version: protocol_config.max_supported_version,
@@ -89,7 +93,7 @@ impl JobDeclaratorClientConfig {
             authority_public_key: pool_config.authority_public_key,
             authority_secret_key: pool_config.authority_secret_key,
             cert_validity_sec,
-            template_provider_type,
+            template_provider_types,
             upstreams,
             coinbase_reward_script: protocol_config.coinbase_reward_script,
             jdc_signature,
@@ -144,9 +148,9 @@ impl JobDeclaratorClientConfig {
         self.cert_validity_sec
     }
 
-    /// Returns the template provider type.
-    pub fn template_provider_type(&self) -> &TemplateProviderType {
-        &self.template_provider_type
+    /// Returns the list of template provider types, ordered by priority.
+    pub fn template_provider_types(&self) -> &[TemplateProviderType] {
+        &self.template_provider_types
     }
 
     /// Returns the minimum supported version.

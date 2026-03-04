@@ -122,6 +122,19 @@ pub async fn start_pool(
     supported_extensions: Vec<u16>,
     required_extensions: Vec<u16>,
 ) -> (PoolSv2, SocketAddr) {
+    start_pool_with_tp_configs(
+        vec![template_provider_config],
+        supported_extensions,
+        required_extensions,
+    )
+    .await
+}
+
+pub async fn start_pool_with_tp_configs(
+    template_provider_configs: Vec<TemplateProviderType>,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+) -> (PoolSv2, SocketAddr) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -146,7 +159,7 @@ pub async fn start_pool(
     let share_batch_size = 1;
     let config = PoolConfig::new(
         connection_config,
-        template_provider_config,
+        template_provider_configs,
         authority_config,
         coinbase_reward_script,
         SHARES_PER_MINUTE,
@@ -185,6 +198,20 @@ pub fn start_bitcoin_core(difficulty_level: DifficultyLevel) -> BitcoinCore {
 pub fn start_jdc(
     pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
     template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+) -> (JobDeclaratorClient, SocketAddr) {
+    start_jdc_with_tp_configs(
+        pool,
+        vec![template_provider_config],
+        supported_extensions,
+        required_extensions,
+    )
+}
+
+pub fn start_jdc_with_tp_configs(
+    pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
+    template_provider_configs: Vec<TemplateProviderType>,
     supported_extensions: Vec<u16>,
     required_extensions: Vec<u16>,
 ) -> (JobDeclaratorClient, SocketAddr) {
@@ -236,7 +263,7 @@ pub fn start_jdc(
         shares_batch_size,
         pool_config,
         3600,
-        template_provider_config,
+        template_provider_configs,
         upstreams,
         jdc_signature,
         None,

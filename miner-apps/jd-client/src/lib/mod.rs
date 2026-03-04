@@ -11,9 +11,12 @@ use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::CancellationToken;
 use stratum_apps::{
     fallback_coordinator::FallbackCoordinator,
-    stratum_core::{bitcoin::consensus::Encodable, parsers_sv2::JobDeclaration},
+    stratum_core::{
+        bitcoin::consensus::Encodable,
+        parsers_sv2::{JobDeclaration, TemplateDistribution},
+    },
     task_manager::TaskManager,
-    tp_type::TemplateProviderType,
+    tp_type::{TemplateProviderEntry, TemplateProviderType},
     utils::types::{Sv2Frame, GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS},
 };
 use tokio::sync::{broadcast, Notify};
@@ -170,82 +173,22 @@ impl JobDeclaratorClient {
         }
 
         let channel_manager_clone = channel_manager.clone();
-        let mut bitcoin_core_sv2_join_handle: Option<JoinHandle<()>> = None;
 
-        match self.config.template_provider_type().clone() {
-            TemplateProviderType::Sv2Tp {
-                address,
-                public_key,
-            } => {
-                let template_receiver = Sv2Tp::new(
-                    address.clone(),
-                    public_key,
-                    channel_manager_to_tp_receiver,
-                    tp_to_channel_manager_sender,
-                    self.cancellation_token.clone(),
-                    fallback_coordinator.clone(),
-                    task_manager.clone(),
-                )
-                .await
-                .unwrap();
+        let mut tp_entries =
+            TemplateProviderEntry::from_config(self.config.template_provider_types());
 
-                let cancellation_token_tp = self.cancellation_token.clone();
-                let status_sender_cl = status_sender.clone();
-                let task_manager_cl = task_manager.clone();
-
-                template_receiver
-                    .start(
-                        address,
-                        cancellation_token_tp,
-                        status_sender_cl,
-                        task_manager_cl,
-                    )
-                    .await;
-
-                info!("Sv2 Template Provider setup done");
-            }
-            TemplateProviderType::BitcoinCoreIpc {
-                network,
-                data_dir,
-                fee_threshold,
-                min_interval,
-            } => {
-                let unix_socket_path = stratum_apps::tp_type::resolve_ipc_socket_path(
-                    &network, data_dir,
-                )
-                .expect(
-                    "Could not determine Bitcoin data directory. Please set data_dir in config.",
-                );
-
-                info!(
-                    "Using Bitcoin Core IPC socket at: {}",
-                    unix_socket_path.display()
-                );
-
-                // incoming and outgoing TDP channels from the perspective of BitcoinCoreSv2
-                let incoming_tdp_receiver = channel_manager_to_tp_receiver.clone();
-                let outgoing_tdp_sender = tp_to_channel_manager_sender.clone();
-
-                let bitcoin_core_config = BitcoinCoreSv2Config {
-                    unix_socket_path,
-                    fee_threshold,
-                    min_interval,
-                    incoming_tdp_receiver,
-                    outgoing_tdp_sender,
-                    cancellation_token: CancellationToken::new(),
-                };
-
-                bitcoin_core_sv2_join_handle = Some(
-                    connect_to_bitcoin_core(
-                        bitcoin_core_config,
-                        self.cancellation_token.clone(),
-                        task_manager.clone(),
-                        status_sender.clone(),
-                    )
-                    .await,
-                );
-            }
-        }
+        let mut bitcoin_core_sv2_join_handle: Option<JoinHandle<()>> = self
+            .initialize_tp(
+                &mut tp_entries,
+                channel_manager_to_tp_receiver.clone(),
+                tp_to_channel_manager_sender.clone(),
+                self.cancellation_token.clone(),
+                fallback_coordinator.clone(),
+                task_manager.clone(),
+                status_sender.clone(),
+            )
+            .await
+            .unwrap();
 
         let mut upstream_addresses: Vec<_> = self
             .config
@@ -366,6 +309,143 @@ impl JobDeclaratorClient {
                                 warn!("Template Receiver shutdown requested — initiating full shutdown.");
                                 self.cancellation_token.cancel();
                                 break;
+                            }
+                            State::TemplateReceiverShutdownFallback(_) => {
+                                warn!("Template Provider connection dropped — attempting TP fallback...");
+
+                                fallback_coordinator.trigger_fallback_and_wait().await;
+                                info!("All components finished TP fallback cleanup");
+
+                                while let Ok(old_status) = status_receiver.try_recv() {
+                                    debug!("Draining buffered status message: {:?}", old_status.state);
+                                }
+
+                                fallback_coordinator = FallbackCoordinator::new();
+
+                                // Recreate TP channels
+                                let (channel_manager_to_tp_sender_new, channel_manager_to_tp_receiver_new) = unbounded();
+                                let (tp_to_channel_manager_sender_new, tp_to_channel_manager_receiver_new) = unbounded();
+
+                                let (channel_manager_to_downstream_sender_new, _) = broadcast::channel(10);
+                                let (downstream_to_channel_manager_sender_new, downstream_to_channel_manager_receiver_new) = unbounded();
+
+                                // Recreate channels for upstream/JD (they stay connected but need fresh TP channels)
+                                let (channel_manager_to_upstream_sender_new, channel_manager_to_upstream_receiver_new) = unbounded();
+                                let (upstream_to_channel_manager_sender_new, upstream_to_channel_manager_receiver_new) = unbounded();
+                                let (channel_manager_to_jd_sender_new, channel_manager_to_jd_receiver_new) = unbounded();
+                                let (jd_to_channel_manager_sender_new, jd_to_channel_manager_receiver_new) = unbounded();
+
+                                channel_manager = ChannelManager::new(
+                                    self.config.clone(),
+                                    channel_manager_to_upstream_sender_new.clone(),
+                                    upstream_to_channel_manager_receiver_new.clone(),
+                                    channel_manager_to_jd_sender_new.clone(),
+                                    jd_to_channel_manager_receiver_new.clone(),
+                                    channel_manager_to_tp_sender_new.clone(),
+                                    tp_to_channel_manager_receiver_new.clone(),
+                                    channel_manager_to_downstream_sender_new.clone(),
+                                    downstream_to_channel_manager_receiver_new.clone(),
+                                    encoded_outputs.clone(),
+                                    self.config.supported_extensions().to_vec(),
+                                    self.config.required_extensions().to_vec(),
+                                )
+                                .await
+                                .unwrap();
+
+                                match self.initialize_tp(
+                                    &mut tp_entries,
+                                    channel_manager_to_tp_receiver_new,
+                                    tp_to_channel_manager_sender_new,
+                                    self.cancellation_token.clone(),
+                                    fallback_coordinator.clone(),
+                                    task_manager.clone(),
+                                    status_sender.clone(),
+                                ).await {
+                                    Ok(join_handle) => {
+                                        bitcoin_core_sv2_join_handle = join_handle;
+
+                                        channel_manager
+                                            .clone()
+                                            .start(
+                                                self.cancellation_token.clone(),
+                                                fallback_coordinator.clone(),
+                                                status_sender.clone(),
+                                                task_manager.clone(),
+                                                miner_coinbase_outputs.clone(),
+                                            )
+                                            .await;
+
+                                        // Re-initialize upstream connections
+                                        match self
+                                            .initialize_jd(
+                                                &mut upstream_addresses,
+                                                channel_manager_to_upstream_receiver_new.clone(),
+                                                upstream_to_channel_manager_sender_new.clone(),
+                                                channel_manager_to_jd_receiver_new.clone(),
+                                                jd_to_channel_manager_sender_new.clone(),
+                                                self.cancellation_token.clone(),
+                                                fallback_coordinator.clone(),
+                                                self.config.mode.clone(),
+                                                task_manager.clone(),
+                                            )
+                                            .await
+                                        {
+                                            Ok((upstream, job_declarator)) => {
+                                                upstream
+                                                    .start(
+                                                        self.config.min_supported_version(),
+                                                        self.config.max_supported_version(),
+                                                        self.cancellation_token.clone(),
+                                                        fallback_coordinator.clone(),
+                                                        status_sender.clone(),
+                                                        task_manager.clone(),
+                                                    )
+                                                    .await;
+
+                                                job_declarator
+                                                    .start(
+                                                        self.cancellation_token.clone(),
+                                                        fallback_coordinator.clone(),
+                                                        status_sender.clone(),
+                                                        task_manager.clone(),
+                                                    )
+                                                    .await;
+
+                                                channel_manager_clone.upstream_state.set(UpstreamState::NoChannel);
+                                                _ = channel_manager_clone.allocate_tokens(1).await;
+                                            }
+                                            Err(e) => {
+                                                tracing::error!("Failed to initialize upstream after TP fallback: {:?}", e);
+                                                channel_manager_clone.upstream_state.set(UpstreamState::SoloMining);
+                                                set_jd_mode(jd_mode::JdMode::SoloMining);
+                                            }
+                                        };
+
+                                        _ = channel_manager_clone.clone()
+                                            .start_downstream_server(
+                                                *self.config.authority_public_key(),
+                                                *self.config.authority_secret_key(),
+                                                self.config.cert_validity_sec(),
+                                                *self.config.listening_address(),
+                                                task_manager.clone(),
+                                                self.cancellation_token.clone(),
+                                                fallback_coordinator.clone(),
+                                                status_sender.clone(),
+                                                downstream_to_channel_manager_sender_new.clone(),
+                                                channel_manager_to_downstream_sender_new.clone(),
+                                                self.config.supported_extensions().to_vec(),
+                                                self.config.required_extensions().to_vec(),
+                                            )
+                                            .await;
+
+                                        info!("Successfully reconnected to backup template provider");
+                                    }
+                                    Err(e) => {
+                                        error!("All template providers exhausted: {e:?}");
+                                        self.cancellation_token.cancel();
+                                        break;
+                                    }
+                                }
                             }
                             State::ChannelManagerShutdown(_) => {
                                 warn!("Channel Manager shutdown requested — initiating full shutdown.");
@@ -596,6 +676,169 @@ impl JobDeclaratorClient {
         let notified = self.shutdown_notify.notified();
         self.cancellation_token.cancel();
         notified.await;
+    }
+
+    /// Iterates through template providers in priority order, trying each with retries.
+    ///
+    /// Returns `Ok(Some(JoinHandle))` for BitcoinCoreIpc connections (dedicated thread),
+    /// or `Ok(None)` for Sv2Tp connections (async task).
+    #[allow(clippy::too_many_arguments)]
+    async fn initialize_tp(
+        &self,
+        tp_entries: &mut [TemplateProviderEntry],
+        channel_manager_to_tp_receiver: Receiver<TemplateDistribution<'static>>,
+        tp_to_channel_manager_sender: Sender<TemplateDistribution<'static>>,
+        cancellation_token: CancellationToken,
+        fallback_coordinator: FallbackCoordinator,
+        task_manager: Arc<TaskManager>,
+        status_sender: Sender<Status>,
+    ) -> Result<Option<JoinHandle<()>>, JDCErrorKind> {
+        const MAX_RETRIES: usize = 3;
+        let tp_count = tp_entries.len();
+
+        for (i, entry) in tp_entries.iter_mut().enumerate() {
+            if entry.tried_or_flagged {
+                info!(
+                    "Template provider {} of {} previously tried, skipping",
+                    i + 1,
+                    tp_count
+                );
+                continue;
+            }
+
+            info!(
+                "Trying template provider {} of {}: {:?}",
+                i + 1,
+                tp_count,
+                entry.tp_type
+            );
+
+            for attempt in 1..=MAX_RETRIES {
+                info!("Connection attempt {}/{}...", attempt, MAX_RETRIES);
+
+                match self
+                    .try_connect_tp(
+                        &entry.tp_type,
+                        channel_manager_to_tp_receiver.clone(),
+                        tp_to_channel_manager_sender.clone(),
+                        cancellation_token.clone(),
+                        fallback_coordinator.clone(),
+                        task_manager.clone(),
+                        status_sender.clone(),
+                    )
+                    .await
+                {
+                    Ok(join_handle) => {
+                        entry.tried_or_flagged = true;
+                        return Ok(join_handle);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Attempt {}/{} failed for TP {} of {}: {:?}",
+                            attempt,
+                            MAX_RETRIES,
+                            i + 1,
+                            tp_count,
+                            e
+                        );
+                        if attempt < MAX_RETRIES {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+
+            warn!(
+                "Max retries reached for template provider {} of {}, moving to next",
+                i + 1,
+                tp_count
+            );
+            entry.tried_or_flagged = true;
+        }
+
+        error!(
+            "All template providers failed after {} retries each",
+            MAX_RETRIES
+        );
+        Err(JDCErrorKind::CouldNotInitiateSystem)
+    }
+
+    /// Attempt to connect to a single template provider.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_connect_tp(
+        &self,
+        tp_type: &TemplateProviderType,
+        channel_manager_to_tp_receiver: Receiver<TemplateDistribution<'static>>,
+        tp_to_channel_manager_sender: Sender<TemplateDistribution<'static>>,
+        cancellation_token: CancellationToken,
+        fallback_coordinator: FallbackCoordinator,
+        task_manager: Arc<TaskManager>,
+        status_sender: Sender<Status>,
+    ) -> Result<Option<JoinHandle<()>>, JDCErrorKind> {
+        match tp_type.clone() {
+            TemplateProviderType::Sv2Tp {
+                address,
+                public_key,
+            } => {
+                let sv2_tp = Sv2Tp::new(
+                    address.clone(),
+                    public_key,
+                    channel_manager_to_tp_receiver,
+                    tp_to_channel_manager_sender,
+                    cancellation_token.clone(),
+                    fallback_coordinator,
+                    task_manager.clone(),
+                )
+                .await
+                .map_err(|e| e.kind)?;
+
+                sv2_tp
+                    .start(address, cancellation_token, status_sender, task_manager)
+                    .await;
+
+                info!("Sv2 Template Provider setup done");
+                Ok(None)
+            }
+            TemplateProviderType::BitcoinCoreIpc {
+                network,
+                data_dir,
+                fee_threshold,
+                min_interval,
+            } => {
+                let unix_socket_path = stratum_apps::tp_type::resolve_ipc_socket_path(
+                    &network, data_dir,
+                )
+                .ok_or(JDCErrorKind::Configuration(
+                    "Could not determine Bitcoin data directory. Please set data_dir in config."
+                        .to_string(),
+                ))?;
+
+                info!(
+                    "Using Bitcoin Core IPC socket at: {}",
+                    unix_socket_path.display()
+                );
+
+                let bitcoin_core_config = BitcoinCoreSv2Config {
+                    unix_socket_path,
+                    fee_threshold,
+                    min_interval,
+                    incoming_tdp_receiver: channel_manager_to_tp_receiver,
+                    outgoing_tdp_sender: tp_to_channel_manager_sender,
+                    cancellation_token: CancellationToken::new(),
+                };
+
+                let join_handle = connect_to_bitcoin_core(
+                    bitcoin_core_config,
+                    cancellation_token,
+                    task_manager,
+                    status_sender,
+                )
+                .await;
+
+                info!("Bitcoin Core IPC Template Provider setup done");
+                Ok(Some(join_handle))
+            }
+        }
     }
 
     /// Initializes an upstream pool + JD connection pair.

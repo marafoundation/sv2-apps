@@ -39,7 +39,7 @@ pub async fn connect_to_bitcoin_core(
                 let status_sender = StatusSender::TemplateReceiver(status_sender_clone);
                 handle_error(
                     &status_sender,
-                    JDCError::<error::TemplateProvider>::shutdown(JDCErrorKind::BitcoinCoreSv2CancellationTokenActivated),
+                    JDCError::<error::TemplateProvider>::fallback(JDCErrorKind::BitcoinCoreSv2CancellationTokenActivated),
                 )
                 .await;
             }
