@@ -190,6 +190,10 @@ impl Sv1Server {
 
         info!("Translator Proxy: listening on {}", self.listener_addr);
 
+        // TEMPORARY: Sleep to test race condition hypothesis - gives upstream time to open aggregated channel
+        info!("Sleeping 5 seconds to allow upstream aggregated channel to initialize...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
         let sv1_status_sender = StatusSender::Sv1Server(status_sender.clone());
         let task_manager_clone = task_manager.clone();
         let vardiff_enabled = self.config.downstream_difficulty_config.enable_vardiff;
