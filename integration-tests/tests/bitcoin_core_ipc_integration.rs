@@ -11,13 +11,13 @@ async fn pool_propagates_block_with_bitcoin_core_ipc() {
     start_tracing();
     let bitcoin_core = start_bitcoin_core(DifficultyLevel::Low);
     let current_block_hash = bitcoin_core.get_best_block_hash().unwrap();
-    let (_pool, pool_addr) = start_pool(
+    let (pool, pool_addr) = start_pool(
         ipc_config(bitcoin_core.data_dir().clone(), bitcoin_core.is_signet()),
         vec![],
         vec![],
     )
     .await;
-    let (_translator, tproxy_addr) =
+    let (translator, tproxy_addr) =
         start_sv2_translator(&[pool_addr], false, vec![], vec![], None).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
     let timeout = tokio::time::Duration::from_secs(60);
@@ -27,6 +27,7 @@ async fn pool_propagates_block_with_bitcoin_core_ipc() {
         tokio::time::sleep(poll_interval).await;
         let new_block_hash = bitcoin_core.get_best_block_hash().unwrap();
         if new_block_hash != current_block_hash {
+            shutdown_all!(pool, translator);
             return;
         }
         if start_time.elapsed() > timeout {
@@ -44,7 +45,7 @@ async fn jdc_propagates_block_with_bitcoin_core_ipc() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let current_block_hash = tp.get_best_block_hash().unwrap();
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
     let ignore_push_solution =
         IgnoreMessage::new(MessageDirection::ToUpstream, MESSAGE_TYPE_PUSH_SOLUTION);
@@ -55,13 +56,13 @@ async fn jdc_propagates_block_with_bitcoin_core_ipc() {
         vec![ignore_push_solution.into()],
         None,
     );
-    let (_jdc, jdc_addr) = start_jdc(
+    let (jdc, jdc_addr) = start_jdc(
         &[(pool_addr, sniffer_addr)],
         ipc_config(tp.data_dir().clone(), tp.is_signet()),
         vec![],
         vec![],
     );
-    let (_translator, tproxy_addr) =
+    let (translator, tproxy_addr) =
         start_sv2_translator(&[jdc_addr], false, vec![], vec![], None).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
     sniffer
@@ -98,6 +99,7 @@ async fn jdc_propagates_block_with_bitcoin_core_ipc() {
                     MESSAGE_TYPE_PUSH_SOLUTION,
                 )
                 .await;
+            shutdown_all!(pool, jdc, translator);
             return;
         }
         if start_time.elapsed() > timeout {

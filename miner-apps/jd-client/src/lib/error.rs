@@ -78,6 +78,7 @@ impl CanDisconnect for ChannelManager {}
 impl CanFallback for Upstream {}
 impl CanFallback for JobDeclarator {}
 impl CanFallback for ChannelManager {}
+impl CanFallback for TemplateProvider {}
 
 impl CanShutdown for ChannelManager {}
 impl CanShutdown for TemplateProvider {}
@@ -182,8 +183,6 @@ pub enum JDCErrorKind {
     LastDeclareJobNotFound(RequestId),
     /// No active job with job id
     ActiveJobNotFound(JobId),
-    /// No active token
-    TokenNotFound,
     /// Template not found with template ID
     TemplateNotFound(TemplateId),
     /// Downstream not found with downstream ID
@@ -254,6 +253,8 @@ pub enum JDCErrorKind {
     InvalidKey,
     /// Upstream not found
     UpstreamNotFound,
+    /// Configuration error
+    Configuration(String),
 }
 
 impl std::error::Error for JDCErrorKind {}
@@ -288,9 +289,6 @@ impl fmt::Display for JDCErrorKind {
             }
             ActiveJobNotFound(request_id) => {
                 write!(f, "Active Job not found for request_id: {request_id}")
-            }
-            TokenNotFound => {
-                write!(f, "Token Not found")
             }
             TemplateNotFound(template_id) => {
                 write!(f, "Template not found, template_id: {template_id}")
@@ -399,6 +397,7 @@ impl fmt::Display for JDCErrorKind {
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             InvalidKey => write!(f, "Invalid key used during noise handshake"),
             UpstreamNotFound => write!(f, "Upstream not found"),
+            Configuration(e) => write!(f, "Configuration error: {e}"),
         }
     }
 }

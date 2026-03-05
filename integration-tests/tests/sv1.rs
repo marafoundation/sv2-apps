@@ -7,8 +7,9 @@ use sv1_sniffer::SV1MessageFilter;
 async fn test_basic_sv1() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
-    let (_, tproxy_addr) = start_sv2_translator(&[pool_addr], false, vec![], vec![], None).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (translator, tproxy_addr) =
+        start_sv2_translator(&[pool_addr], false, vec![], vec![], None).await;
     let (sniffer_sv1, sniffer_sv1_addr) = start_sv1_sniffer(tproxy_addr);
     let (_minerd_process, _minerd_addr) = start_minerd(sniffer_sv1_addr, None, None, false).await;
     sniffer_sv1
@@ -23,6 +24,7 @@ async fn test_basic_sv1() {
     sniffer_sv1
         .wait_for_message(&["mining.notify"], MessageDirection::ToDownstream)
         .await;
+    shutdown_all!(translator, pool);
 }
 
 /// This test demonstrates the `SnifferSV1::wait_and_assert` feature, which allows you to:
@@ -45,8 +47,9 @@ async fn test_sniffer_sv1_wait_and_assert() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     tp.fund_wallet().expect("Failed to fund wallet");
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
-    let (_, tproxy_addr) = start_sv2_translator(&[pool_addr], false, vec![], vec![], None).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (translator, tproxy_addr) =
+        start_sv2_translator(&[pool_addr], false, vec![], vec![], None).await;
     let (sniffer_sv1, sniffer_sv1_addr) = start_sv1_sniffer(tproxy_addr);
     let (_minerd_process, _minerd_addr) = start_minerd(sniffer_sv1_addr, None, None, false).await;
 
@@ -133,4 +136,5 @@ async fn test_sniffer_sv1_wait_and_assert() {
             },
         )
         .await;
+    shutdown_all!(translator, pool);
 }

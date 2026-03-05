@@ -44,10 +44,12 @@ pub struct TranslatorConfig {
     /// If true, all miners share one channel. If false, each miner gets its own channel.
     pub aggregate_channels: bool,
     /// Protocol extensions that the translator supports (will request if supported by server).
+    #[serde(default)]
     pub supported_extensions: Vec<u16>,
     /// Protocol extensions that the translator requires (server must support these).
     /// If the upstream server doesn't support these, the translator will fail over to another
     /// upstream.
+    #[serde(default)]
     pub required_extensions: Vec<u16>,
     /// The path to the log file for the Translator.
     #[serde(default, deserialize_with = "opt_path_from_toml")]

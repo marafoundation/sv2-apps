@@ -49,13 +49,6 @@ supported_extensions = [
     0x0002,  # Worker-Specific Hashrate Tracking
 ]
 
-# Extensions that the JDC requires (downstream clients must support these to connect)
-# Use with caution - requiring extensions may prevent some clients from connecting
-required_extensions = [
-    # Example: require Worker-Specific Hashrate Tracking
-    # 0x0002,
-]
-
 # Monitoring HTTP server address for exposing channel data (optional)
 monitoring_address = "0.0.0.0:9091"
 monitoring_cache_refresh_secs = 15
@@ -77,7 +70,8 @@ pool_port = 33333
 jds_address = "75.119.150.111"
 jds_port = 33334
 
-# Local Sv2 Template Provider config
-[template_provider_type.Sv2Tp]
+# Template providers in priority order (first = primary, rest = fallbacks)
 # address accepts "ip:port" or "hostname:port" (e.g. "tp.example.com:8442")
+[[template_provider_types]]
+type = "Sv2Tp"
 address = "127.0.0.1:38442"

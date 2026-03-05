@@ -14,7 +14,10 @@
 use async_channel::{unbounded, Receiver, Sender};
 use std::{
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
     time::Duration,
 };
 use stratum_apps::{
@@ -22,6 +25,7 @@ use stratum_apps::{
     task_manager::TaskManager,
     utils::types::{Sv2Frame, GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS},
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -50,9 +54,12 @@ pub mod sv2;
 pub mod utils;
 
 /// The main struct that manages the SV1/SV2 translator.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TranslatorSv2 {
     config: TranslatorConfig,
+    cancellation_token: CancellationToken,
+    shutdown_notify: Arc<Notify>,
+    is_alive: Arc<AtomicBool>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -62,7 +69,12 @@ impl TranslatorSv2 {
     /// Initializes the translator with the given configuration and sets up
     /// the reconnect wait time.
     pub fn new(config: TranslatorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            cancellation_token: CancellationToken::new(),
+            shutdown_notify: Arc::new(Notify::new()),
+            is_alive: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     /// Starts the translator.
@@ -79,7 +91,7 @@ impl TranslatorSv2 {
             .set(self.config.downstream_difficulty_config.enable_vardiff)
             .expect("VARDIFF_ENABLED initialized more than once");
 
-        let cancellation_token = CancellationToken::new();
+        let cancellation_token = self.cancellation_token.clone();
         let mut fallback_coordinator = FallbackCoordinator::new();
 
         let task_manager = Arc::new(TaskManager::new());
@@ -137,6 +149,8 @@ impl TranslatorSv2 {
             .await
         {
             error!("Failed to initialize any upstream connection: {e:?}");
+            self.shutdown_notify.notify_waiters();
+            self.is_alive.store(false, Ordering::Relaxed);
             return;
         }
 
@@ -214,6 +228,9 @@ impl TranslatorSv2 {
                 _ = tokio::signal::ctrl_c() => {
                     info!("Ctrl+C received — initiating graceful shutdown...");
                     cancellation_token.cancel();
+                    break;
+                }
+                _ = cancellation_token.cancelled() => {
                     break;
                 }
                 message = status_receiver.recv() => {
@@ -379,7 +396,20 @@ impl TranslatorSv2 {
                 warn!("Forced shutdown complete");
             }
         }
+        self.shutdown_notify.notify_waiters();
+        self.is_alive.store(false, Ordering::Relaxed);
         info!("TranslatorSv2 shutdown complete.");
+    }
+
+    pub async fn shutdown(&self) {
+        if !self.is_alive.load(Ordering::Relaxed) {
+            return;
+        }
+        // The Notified future is guaranteed to receive wakeups from notify_waiters()
+        // as soon as it has been created, even if it has not yet been polled.
+        let notified = self.shutdown_notify.notified();
+        self.cancellation_token.cancel();
+        notified.await;
     }
 
     /// Initializes the upstream connection list, handling retries, fallbacks, and flagging.
@@ -579,4 +609,11 @@ pub fn vardiff_enabled() -> bool {
 #[cfg(test)]
 pub fn vardiff_enabled() -> bool {
     *VARDIFF_ENABLED.get_or_init(|| true)
+}
+
+impl Drop for TranslatorSv2 {
+    fn drop(&mut self) {
+        info!("TranslatorSv2 dropped");
+        self.cancellation_token.cancel();
+    }
 }

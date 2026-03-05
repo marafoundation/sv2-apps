@@ -244,7 +244,7 @@ impl Sv2Tp {
             .tp_receiver
             .recv()
             .await
-            .map_err(JDCError::shutdown)?;
+            .map_err(JDCError::fallback)?;
 
         debug!("Received SV2 frame from Template provider.");
         let header = sv2_frame.get_header().ok_or_else(|| {
@@ -293,7 +293,7 @@ impl Sv2Tp {
                 .channel_manager_receiver
                 .recv()
                 .await
-                .map_err(JDCError::shutdown)?,
+                .map_err(JDCError::fallback)?,
         );
         debug!("Forwarding message from channel manager to outbound_tx");
         let sv2_frame: Sv2Frame = msg.try_into().map_err(JDCError::shutdown)?;

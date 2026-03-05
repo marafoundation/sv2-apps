@@ -25,12 +25,15 @@ pub fn spawn_io_tasks(
     fallback_coordinator: FallbackCoordinator,
 ) {
     let caller = std::panic::Location::caller();
-    let inbound_tx_clone = inbound_tx.clone();
     let outbound_rx_clone = outbound_rx.clone();
+    // Dedicated token for reader→writer notification on read errors.
+    // When the reader fails, it cancels this token to unblock the writer.
+    let io_cancellation = CancellationToken::new();
 
     {
         let cancellation_token_clone = cancellation_token.clone();
         let fallback_coordinator_clone = fallback_coordinator.clone();
+        let io_cancellation_clone = io_cancellation.clone();
 
         task_manager.spawn(
             async move {
@@ -84,6 +87,9 @@ pub fn spawn_io_tasks(
                 }
                 inbound_tx.close();
                 outbound_rx_clone.close();
+                // Signal the writer task to exit so it drops its inbound_tx clone,
+                // allowing tp_receiver.recv() to return Err and propagate fallback.
+                io_cancellation_clone.cancel();
                 drop(inbound_tx);
                 drop(outbound_rx_clone);
 
@@ -114,12 +120,17 @@ pub fn spawn_io_tasks(
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
                             trace!("Received shutdown signal");
-                            inbound_tx_clone.close();
+                            outbound_rx.close();
                             break;
                         }
                         _ = fallback_token.cancelled() => {
                             trace!("Received fallback signal");
-                            inbound_tx_clone.close();
+                            outbound_rx.close();
+                            break;
+                        }
+                        _ = io_cancellation.cancelled() => {
+                            trace!("Reader signaled exit");
+                            outbound_rx.close();
                             break;
                         }
                         res = outbound_rx.recv() => {
@@ -142,9 +153,7 @@ pub fn spawn_io_tasks(
                     }
                 }
                 outbound_rx.close();
-                inbound_tx_clone.close();
                 drop(outbound_rx);
-                drop(inbound_tx_clone);
 
                 // signal fallback coordinator that this task has completed its cleanup
                 fallback_handler.done();

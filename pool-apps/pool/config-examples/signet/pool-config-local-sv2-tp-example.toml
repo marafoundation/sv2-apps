@@ -26,24 +26,11 @@ shares_per_minute = 6.0
 # How many shares do we want to acknowledge in a batch
 share_batch_size = 10
 
-# Protocol Extensions Configuration
-# Extensions that the pool supports (will accept if requested by clients)
-# Comment/uncomment to enable/disable specific extensions:
-supported_extensions = [
-    # 0x0002,  # Worker-Specific Hashrate Tracking
-]
-
-# Extensions that the pool requires (clients must support these to connect)
-# Use with caution - requiring extensions may prevent some clients from connecting
-required_extensions = [
-    # Example: require Worker-Specific Hashrate Tracking
-    # 0x0002,
-]
-
 monitoring_address = "127.0.0.1:9090"
 monitoring_cache_refresh_secs = 15
 
-# Local Sv2 Template Provider config
-[template_provider_type.Sv2Tp]
+# Template providers in priority order (first = primary, rest = fallbacks)
 # address accepts "ip:port" or "hostname:port" (e.g. "tp.example.com:8442")
+[[template_provider_types]]
+type = "Sv2Tp"
 address = "127.0.0.1:38442"

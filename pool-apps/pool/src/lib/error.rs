@@ -22,7 +22,8 @@ use stratum_apps::{
         parsers_sv2::{Mining, ParserError},
     },
     utils::types::{
-        CanDisconnect, CanShutdown, ChannelId, DownstreamId, ExtensionType, MessageType,
+        CanDisconnect, CanFallback, CanShutdown, ChannelId, DownstreamId, ExtensionType,
+        MessageType,
     },
 };
 
@@ -48,11 +49,14 @@ pub struct PoolError<Owner> {
 pub enum Action {
     Log,
     Disconnect(DownstreamId),
+    Fallback,
     Shutdown,
 }
 
 impl CanDisconnect for Downstream {}
 impl CanDisconnect for ChannelManager {}
+
+impl CanFallback for TemplateProvider {}
 
 impl CanShutdown for ChannelManager {}
 impl CanShutdown for TemplateProvider {}
@@ -76,6 +80,19 @@ where
         Self {
             kind: kind.into(),
             action: Action::Disconnect(downstream_id),
+            _owner: PhantomData,
+        }
+    }
+}
+
+impl<O> PoolError<O>
+where
+    O: CanFallback,
+{
+    pub fn fallback<E: Into<PoolErrorKind>>(kind: E) -> Self {
+        Self {
+            kind: kind.into(),
+            action: Action::Fallback,
             _owner: PhantomData,
         }
     }

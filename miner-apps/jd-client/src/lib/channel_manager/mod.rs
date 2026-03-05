@@ -135,8 +135,9 @@ pub struct ChannelManagerData {
     last_future_template: Option<NewTemplate<'static>>,
     // The last **new prevhash** received from the upstream.
     pub last_new_prev_hash: Option<SetNewPrevHashTdp<'static>>,
-    // The most recent set of **allocation tokens** received from the JDS.
-    allocate_tokens: Option<AllocateMiningJobTokenSuccess<'static>>,
+    // FIFO buffer of allocation tokens received from the JDS.
+    // Oldest token is consumed first to minimize risk of JDS-side expiration.
+    allocate_tokens: VecDeque<AllocateMiningJobTokenSuccess<'static>>,
     // Stores new templates as they arrive, mapped by their **template ID**.
     template_store: HashMap<TemplateId, NewTemplate<'static>>,
     // Stores the last declared job, keyed by the `request_id` used when
@@ -203,7 +204,7 @@ impl ChannelManagerData {
         self.extranonce_prefix_factory_standard =
             ExtendedExtranonce::new(range_0, range_1, range_2, None).expect("valid ranges");
 
-        self.allocate_tokens = None;
+        self.allocate_tokens.clear();
         self.upstream_channel = None;
         self.pool_tag_string = None;
 
@@ -312,7 +313,7 @@ impl ChannelManager {
             sequence_number_factory: AtomicU32::new(1),
             last_future_template: None,
             last_new_prev_hash: None,
-            allocate_tokens: None,
+            allocate_tokens: VecDeque::new(),
             template_store: HashMap::new(),
             last_declare_job_store: HashMap::new(),
             template_id_to_upstream_job_id: HashMap::new(),

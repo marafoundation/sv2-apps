@@ -39,7 +39,7 @@ pub async fn connect_to_bitcoin_core(
 
                 handle_error::<error::TemplateProvider>(
                     &status_sender,
-                    PoolError::shutdown(PoolErrorKind::BitcoinCoreSv2CancellationTokenActivated),
+                    PoolError::fallback(PoolErrorKind::BitcoinCoreSv2CancellationTokenActivated),
                 )
                 .await;
             }

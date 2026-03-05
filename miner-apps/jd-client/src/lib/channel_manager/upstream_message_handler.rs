@@ -166,13 +166,18 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     debug!("Applied last_new_prev_hash to new extended channel");
                 }
 
-                let set_custom_job = if get_jd_mode() == JdMode::CoinbaseOnly {
-                    if let (Some(job_factory), Some(token), Some(template), Some(prevhash)) = (
-                        data.job_factory.as_mut(),
-                        data.allocate_tokens.clone(),
-                        data.last_future_template.clone(),
-                        data.last_new_prev_hash.clone(),
-                    ) {
+                let set_custom_job = if get_jd_mode() == JdMode::CoinbaseOnly
+                    && data.job_factory.is_some()
+                    && data.last_future_template.is_some()
+                    && data.last_new_prev_hash.is_some()
+                {
+                    if let Some(token) = data.allocate_tokens.pop_front() {
+                        let job_factory = data.job_factory.as_mut().expect("this must be some");
+                        let template = data
+                            .last_future_template
+                            .clone()
+                            .expect("this must be some");
+                        let prevhash = data.last_new_prev_hash.clone().expect("this must be some");
                         let request_id = data.request_id_factory.fetch_add(1, Ordering::Relaxed);
 
                         let full_extranonce_size = extended_channel.get_full_extranonce_size();
@@ -180,7 +185,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                         if let Ok(custom_job) = job_factory.new_custom_job(
                             extended_channel.get_channel_id(),
                             request_id,
-                            token.clone().mining_job_token,
+                            token.mining_job_token,
                             prevhash.clone().into(),
                             template.clone(),
                             outputs,
@@ -201,6 +206,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                             None
                         }
                     } else {
+                        warn!("No token available, discarding custom job");
                         None
                     }
                 } else {
@@ -290,7 +296,6 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 .send(sv2_frame)
                 .await
                 .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
-            _ = self.allocate_tokens(1).await;
         }
 
         Ok(())

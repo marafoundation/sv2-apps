@@ -83,6 +83,8 @@ pub enum State {
     },
     /// Template receiver has shut down with a reason.
     TemplateReceiverShutdown(PoolErrorKind),
+    /// Template receiver requests fallback to next template provider.
+    TemplateReceiverShutdownFallback(PoolErrorKind),
     /// Channel manager has shut down with a reason.
     ChannelManagerShutdown(PoolErrorKind),
 }
@@ -119,6 +121,15 @@ async fn send_status<O>(sender: &StatusSender, error: PoolError<O>) -> bool {
                 std::process::abort();
             }
             matches!(sender, StatusSender::Downstream { .. })
+        }
+        Fallback => {
+            let state = State::TemplateReceiverShutdownFallback(error.kind);
+
+            if let Err(e) = sender.send(Status { state }).await {
+                tracing::error!("Failed to send fallback status from {:?}: {:?}", sender, e);
+                std::process::abort();
+            }
+            matches!(sender, StatusSender::TemplateReceiver(_))
         }
         Shutdown => {
             let state = match sender {

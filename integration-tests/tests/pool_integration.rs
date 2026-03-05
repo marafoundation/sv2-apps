@@ -23,7 +23,7 @@ async fn success_pool_template_provider_connection() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let (sniffer, sniffer_addr) = start_sniffer("", tp_addr, true, vec![], None);
-    let _ = start_pool(sv2_tp_config(sniffer_addr), vec![], vec![]).await;
+    let (pool, _) = start_pool(sv2_tp_config(sniffer_addr), vec![], vec![]).await;
     // here we assert that the downstream(pool in this case) have sent `SetupConnection` message
     // with the correct parameters, protocol, flags, min_version and max_version.  Note that the
     // macro can take any number of arguments after the message argument, but the order is
@@ -74,6 +74,7 @@ async fn success_pool_template_provider_connection() {
         )
         .await;
     assert_tp_message!(sniffer.next_message_from_upstream(), SetNewPrevHash);
+    pool.shutdown().await;
 }
 
 // This test starts a Template Provider, a Pool, and a Translator Proxy, and verifies the
@@ -100,7 +101,7 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
         "header_timestamp_value_assertion_in_new_extended_mining_job tp_pool sniffer";
     let (tp_pool_sniffer, tp_pool_sniffer_addr) =
         start_sniffer(tp_pool_sniffer_identifier, tp_addr, false, vec![], None);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_pool_sniffer_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_pool_sniffer_addr), vec![], vec![]).await;
     let pool_translator_sniffer_identifier =
         "header_timestamp_value_assertion_in_new_extended_mining_job pool_translator sniffer";
     let (pool_translator_sniffer, pool_translator_sniffer_addr) = start_sniffer(
@@ -117,7 +118,7 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
         ],
         None,
     );
-    let (_tproxy, tproxy_addr) =
+    let (translator, tproxy_addr) =
         start_sv2_translator(&[pool_translator_sniffer_addr], false, vec![], vec![], None).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
 
@@ -173,6 +174,7 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
         Some(header_timestamp_to_check),
         "The `minntime` field of the second NewExtendedMiningJob does not match the `header_timestamp`!"
     );
+    shutdown_all!(translator, pool);
 }
 
 // This test starts a Pool, a Sniffer, and a Sv2 Mining Device.  It then checks if the Pool receives
@@ -182,7 +184,7 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
 async fn pool_standard_channel_receives_share() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
     let (sniffer, sniffer_addr) = start_sniffer("A", pool_addr, false, vec![], None);
     start_mining_device_sv2(sniffer_addr, None, None, None, 1, None, true);
     sniffer
@@ -228,6 +230,7 @@ async fn pool_standard_channel_receives_share() {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
+    pool.shutdown().await;
 }
 
 // This test verifies that the Pool does not send SetNewPrevHash and NewExtendedMiningJob (future
@@ -238,11 +241,11 @@ async fn pool_does_not_send_jobs_to_jdc() {
     let sv2_interval = Some(5);
     let (tp, tp_addr) = start_template_provider(sv2_interval, DifficultyLevel::Low);
     tp.fund_wallet().unwrap();
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
     let (pool_jdc_sniffer, pool_jdc_sniffer_addr) =
         start_sniffer("pool_jdc", pool_addr, false, vec![], None);
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
-    let (_jdc, jdc_addr) = start_jdc(
+    let (jdc, jdc_addr) = start_jdc(
         &[(pool_jdc_sniffer_addr, jds_addr)],
         sv2_tp_config(tp_addr),
         vec![],
@@ -267,7 +270,7 @@ async fn pool_does_not_send_jobs_to_jdc() {
         ],
         None,
     );
-    let (_translator, tproxy_addr) =
+    let (translator, tproxy_addr) =
         start_sv2_translator(&[tproxy_jdc_sniffer_addr], false, vec![], vec![], None).await;
 
     // Add SV1 sniffer between translator and miner
@@ -350,6 +353,7 @@ async fn pool_does_not_send_jobs_to_jdc() {
             .await,
         "Pool should NOT send non-future NewExtendedMiningJob messages to JDC"
     );
+    shutdown_all!(translator, jdc, pool);
 }
 
 // The test runs pool and translator, with translator sending a SetupConnection message
@@ -359,7 +363,7 @@ async fn pool_does_not_send_jobs_to_jdc() {
 async fn pool_reject_setup_connection_with_non_mining_protocol() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
     let endpoint_host = "127.0.0.1".to_string().into_bytes().try_into().unwrap();
     let vendor = String::new().try_into().unwrap();
     let hardware_version = String::new().try_into().unwrap();
@@ -391,7 +395,7 @@ async fn pool_reject_setup_connection_with_non_mining_protocol() {
         vec![setup_connection_replace.into()],
         None,
     );
-    let (_tproxy, _) =
+    let (translator, _) =
         start_sv2_translator(&[pool_translator_sniffer_addr], false, vec![], vec![], None).await;
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -415,6 +419,7 @@ async fn pool_reject_setup_connection_with_non_mining_protocol() {
         "unsupported-protocol",
         "SetupConnectionError message error code should be unsupported-protocol"
     );
+    shutdown_all!(translator, pool);
 }
 
 // This test launches a Pool and leverages a MockDownstream to test the correct functionalities of
@@ -425,7 +430,7 @@ async fn pool_group_extended_channels() {
     let sv2_interval = Some(5);
     let (tp, tp_addr) = start_template_provider(sv2_interval, DifficultyLevel::Low);
     tp.fund_wallet().unwrap();
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
 
     let (sniffer, sniffer_addr) = start_sniffer("sniffer", pool_addr, false, vec![], None);
 
@@ -580,6 +585,7 @@ async fn pool_group_extended_channels() {
             .await,
         "There should be no second SetNewPrevHash message"
     );
+    pool.shutdown().await;
 }
 
 // This test launches a Pool and leverages a MockDownstream to test the correct functionalities of
@@ -590,7 +596,7 @@ async fn pool_group_standard_channels() {
     let sv2_interval = Some(5);
     let (tp, tp_addr) = start_template_provider(sv2_interval, DifficultyLevel::Low);
     tp.fund_wallet().unwrap();
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
 
     let (sniffer, sniffer_addr) = start_sniffer("sniffer", pool_addr, false, vec![], None);
 
@@ -757,6 +763,7 @@ async fn pool_group_standard_channels() {
             .await,
         "There should be no extra SetNewPrevHash messages"
     );
+    pool.shutdown().await;
 }
 
 // This test launches a Pool and leverages a MockDownstream to test the correct functionalities of
@@ -767,7 +774,7 @@ async fn pool_require_standard_jobs_set_does_not_group_standard_channels() {
     let sv2_interval = Some(5);
     let (tp, tp_addr) = start_template_provider(sv2_interval, DifficultyLevel::Low);
     tp.fund_wallet().unwrap();
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
 
     let (sniffer, sniffer_addr) = start_sniffer("sniffer", pool_addr, false, vec![], None);
 
@@ -914,4 +921,5 @@ async fn pool_require_standard_jobs_set_does_not_group_standard_channels() {
             "Channel ID must be different from the group channel ID"
         );
     }
+    pool.shutdown().await;
 }

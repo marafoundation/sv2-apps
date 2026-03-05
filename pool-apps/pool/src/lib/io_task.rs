@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_channel::{Receiver, Sender};
 use bitcoin_core_sv2::CancellationToken;
 use stratum_apps::{
+    fallback_coordinator::FallbackCoordinator,
     network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
     stratum_core::framing_sv2::framing::Frame,
     task_manager::TaskManager,
@@ -12,6 +13,7 @@ use tracing::{error, trace, warn, Instrument as _};
 
 /// Spawns async reader and writer tasks for handling framed I/O with shutdown support.
 #[track_caller]
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), hotpath::measure)]
 pub fn spawn_io_tasks(
     task_manager: Arc<TaskManager>,
@@ -20,21 +22,34 @@ pub fn spawn_io_tasks(
     outbound_rx: Receiver<Sv2Frame>,
     inbound_tx: Sender<Sv2Frame>,
     cancellation_token: CancellationToken,
+    fallback_coordinator: FallbackCoordinator,
 ) {
     let caller = std::panic::Location::caller();
-    let inbound_tx_clone = inbound_tx.clone();
     let outbound_rx_clone = outbound_rx.clone();
+    // Dedicated token for reader→writer notification on read errors.
+    // When the reader fails, it cancels this token to unblock the writer.
+    let io_cancellation = CancellationToken::new();
 
     {
-        let cancellation_token = cancellation_token.clone();
+        let cancellation_token_clone = cancellation_token.clone();
+        let fallback_coordinator_clone = fallback_coordinator.clone();
+        let io_cancellation_clone = io_cancellation.clone();
 
         task_manager.spawn(
             async move {
+                let fallback_handler = fallback_coordinator_clone.register();
+                let fallback_token = fallback_coordinator_clone.token();
+
                 trace!("Reader task started");
                 loop {
                     tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            trace!("Received shutdown");
+                        _ = cancellation_token_clone.cancelled() => {
+                            trace!("Received shutdown signal");
+                            inbound_tx.close();
+                            break;
+                        }
+                        _ = fallback_token.cancelled() => {
+                            trace!("Received fallback signal");
                             inbound_tx.close();
                             break;
                         }
@@ -68,8 +83,12 @@ pub fn spawn_io_tasks(
                 }
                 inbound_tx.close();
                 outbound_rx_clone.close();
+                // Signal the writer task to exit so it drops its inbound_tx clone,
+                // allowing tp_receiver.recv() to return Err and propagate fallback.
+                io_cancellation_clone.cancel();
                 drop(inbound_tx);
                 drop(outbound_rx_clone);
+                fallback_handler.done();
                 warn!("Reader task exited.");
             }
             .instrument(tracing::trace_span!(
@@ -80,14 +99,27 @@ pub fn spawn_io_tasks(
     }
 
     {
-        let cancellation_token = cancellation_token.clone();
+        let fallback_coordinator_clone = fallback_coordinator.clone();
         task_manager.spawn(
             async move {
+                let fallback_handler = fallback_coordinator_clone.register();
+                let fallback_token = fallback_coordinator_clone.token();
+
                 trace!("Writer task started");
                 loop {
                     tokio::select! {
                         _ = cancellation_token.cancelled() => {
-                            trace!("Received shutdown");
+                            trace!("Received shutdown signal");
+                            outbound_rx.close();
+                            break;
+                        }
+                        _ = fallback_token.cancelled() => {
+                            trace!("Received fallback signal");
+                            outbound_rx.close();
+                            break;
+                        }
+                        _ = io_cancellation.cancelled() => {
+                            trace!("Reader signaled exit");
                             outbound_rx.close();
                             break;
                         }
@@ -111,9 +143,8 @@ pub fn spawn_io_tasks(
                     }
                 }
                 outbound_rx.close();
-                inbound_tx_clone.close();
                 drop(outbound_rx);
-                drop(inbound_tx_clone);
+                fallback_handler.done();
                 warn!("Writer task exited.");
             }
             .instrument(tracing::trace_span!(

@@ -5,11 +5,11 @@ use stratum_apps::stratum_core::{common_messages_sv2::*, mining_sv2::*};
 async fn jd_non_aggregated_tproxy_integration() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
     let (jdc_pool_sniffer, jdc_pool_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
-    let (_jdc, jdc_addr) = start_jdc(
+    let (jdc, jdc_addr) = start_jdc(
         &[(jdc_pool_sniffer_addr, jds_addr)],
         sv2_tp_config(tp_addr),
         vec![],
@@ -17,7 +17,7 @@ async fn jd_non_aggregated_tproxy_integration() {
     );
     let (tproxy_jdc_sniffer, tproxy_jdc_sniffer_addr) =
         start_sniffer("1", jdc_addr, false, vec![], None);
-    let (_translator, tproxy_addr) =
+    let (translator, tproxy_addr) =
         start_sv2_translator(&[tproxy_jdc_sniffer_addr], false, vec![], vec![], None).await;
 
     // start two minerd processes
@@ -74,17 +74,18 @@ async fn jd_non_aggregated_tproxy_integration() {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
+    shutdown_all!(translator, jdc, pool);
 }
 
 #[tokio::test]
 async fn jd_aggregated_tproxy_integration() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+    let (pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
     let (jdc_pool_sniffer, jdc_pool_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
-    let (_jdc, jdc_addr) = start_jdc(
+    let (jdc, jdc_addr) = start_jdc(
         &[(jdc_pool_sniffer_addr, jds_addr)],
         sv2_tp_config(tp_addr),
         vec![],
@@ -92,7 +93,7 @@ async fn jd_aggregated_tproxy_integration() {
     );
     let (tproxy_jdc_sniffer, tproxy_jdc_sniffer_addr) =
         start_sniffer("1", jdc_addr, false, vec![], None);
-    let (_translator, tproxy_addr) =
+    let (translator, tproxy_addr) =
         start_sv2_translator(&[tproxy_jdc_sniffer_addr], true, vec![], vec![], None).await;
 
     // start two minerd processes
@@ -149,4 +150,5 @@ async fn jd_aggregated_tproxy_integration() {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
+    shutdown_all!(translator, jdc, pool);
 }

@@ -26,27 +26,14 @@ shares_per_minute = 6.0
 # How many shares do we want to acknowledge in a batch
 share_batch_size = 10
 
-# Protocol Extensions Configuration
-# Extensions that the pool supports (will accept if requested by clients)
-# Comment/uncomment to enable/disable specific extensions:
-supported_extensions = [
-    # 0x0002,  # Worker-Specific Hashrate Tracking
-]
-
-# Extensions that the pool requires (clients must support these to connect)
-# Use with caution - requiring extensions may prevent some clients from connecting
-required_extensions = [
-    # Example: require Worker-Specific Hashrate Tracking
-    # 0x0002,
-]
-
 monitoring_address = "127.0.0.1:9090"
 monitoring_cache_refresh_secs = 15
 
-# Bitcoin Core IPC config
+# Template providers in priority order (first = primary, rest = fallbacks)
 # Supported networks: mainnet, testnet4, signet, regtest
 # Default data_dir: ~/.bitcoin (Linux) or ~/Library/Application Support/Bitcoin (macOS)
-[template_provider_type.BitcoinCoreIpc]
+[[template_provider_types]]
+type = "BitcoinCoreIpc"
 network = "signet"
 # data_dir = "/custom/bitcoin/data"  # Optional: override default data directory
 fee_threshold = 100

@@ -10,6 +10,7 @@ use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::CancellationToken;
 use stratum_apps::{
     custom_mutex::Mutex,
+    fallback_coordinator::FallbackCoordinator,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
         channels_sv2::server::{
@@ -121,6 +122,8 @@ impl Downstream {
         // Create a per-connection child token so we can cancel this
         // connection's I/O tasks independently of the global shutdown.
         let connection_token = cancellation_token.child_token();
+        // Downstream IO tasks use a standalone FallbackCoordinator that is
+        // never triggered, so miner connections persist across TP fallbacks.
         spawn_io_tasks(
             task_manager,
             noise_stream_reader,
@@ -128,6 +131,7 @@ impl Downstream {
             outbound_rx,
             inbound_tx,
             connection_token.clone(),
+            FallbackCoordinator::new(),
         );
 
         let downstream_channel = DownstreamChannel {

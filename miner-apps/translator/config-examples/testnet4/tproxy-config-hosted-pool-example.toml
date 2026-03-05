@@ -28,13 +28,7 @@ aggregate_channels = true
 # Extensions that the translator supports (will request if required by server)
 # Example: supported_extensions = [0x0002, 0x0003]
 supported_extensions = [
-    # 0x0002,  # Worker-Specific Hashrate Tracking
-]
-
-# Extensions that the translator requires (server must support these)
-# If the upstream server doesn't support these, the translator will fail over to another upstream
-required_extensions = [
-    # 0x0002,  # Worker-Specific Hashrate Tracking
+    0x0002,  # Worker-Specific Hashrate Tracking
 ]
 
 # Monitoring HTTP server address for exposing channel data (optional)
