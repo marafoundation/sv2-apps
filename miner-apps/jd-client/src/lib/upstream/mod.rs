@@ -48,7 +48,7 @@ use crate::{
 };
 
 /// Timeout for extension negotiation response (30 seconds)
-const EXTENSION_NEGOTIATION_TIMEOUT_SECS: u64 = 30;
+const EXTENSION_NEGOTIATION_TIMEOUT_SECS: u64 = 10;
 
 mod message_handler;
 
