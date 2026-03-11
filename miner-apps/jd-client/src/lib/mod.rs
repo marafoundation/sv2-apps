@@ -291,9 +291,7 @@ impl JobDeclaratorClient {
             .await
         {
             Ok((upstream, job_declarator)) => {
-                // Start upstream and wait for extension negotiation to complete
-                // This returns the negotiated extensions which we need to store
-                // BEFORE starting the downstream server
+                // Start upstream and wait for extension negotiation to complete.
                 let negotiated_extensions = upstream
                     .start(
                         self.config.min_supported_version(),
@@ -302,17 +300,14 @@ impl JobDeclaratorClient {
                         fallback_coordinator.clone(),
                         status_sender.clone(),
                         task_manager.clone(),
+                        &mut channel_manager_clone,
                     )
                     .await;
 
-                // Store the negotiated extensions in the ChannelManager
-                // This ensures the ChannelManager knows which extensions are active
-                // BEFORE the downstream server starts accepting connections
                 info!(
                     "Upstream extension negotiation complete. Negotiated extensions: {:?}",
                     negotiated_extensions
                 );
-                channel_manager_clone.set_negotiated_extensions(negotiated_extensions);
 
                 job_declarator
                     .start(
@@ -471,6 +466,7 @@ impl JobDeclaratorClient {
                                                 fallback_coordinator.clone(),
                                                 status_sender.clone(),
                                                 task_manager.clone(),
+                                                &mut channel_manager,
                                             )
                                             .await;
 

@@ -20,15 +20,10 @@ use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     network_helpers::{connect_with_noise, noise_stream::NoiseTcpStream, resolve_host},
     stratum_core::{
-        binary_sv2::{self, Seq064K},
-        codec_sv2::HandshakeRole,
-        extensions_sv2::{
-            RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
-            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
-        },
+        binary_sv2::Seq064K,
+        extensions_sv2::RequestExtensions,
         framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
-        noise_sv2::Initiator,
+        handlers_sv2::{HandleCommonMessagesFromServerAsync, HandleExtensionsFromServerAsync},
         parsers_sv2::AnyMessage,
     },
     task_manager::TaskManager,
@@ -41,13 +36,14 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    channel_manager::ChannelManager,
     error::{self, JDCError, JDCErrorKind, JDCResult},
     io_task::spawn_io_tasks,
     status::{handle_error, Status, StatusSender},
     utils::{get_setup_connection_message, UpstreamEntry},
 };
 
-/// Timeout for extension negotiation response (30 seconds)
+/// Timeout for extension negotiation response (10 seconds)
 const EXTENSION_NEGOTIATION_TIMEOUT_SECS: u64 = 10;
 
 mod message_handler;
@@ -174,6 +170,7 @@ impl Upstream {
         &mut self,
         min_version: u16,
         max_version: u16,
+        channel_manager: &mut ChannelManager,
     ) -> JDCResult<Vec<u16>, error::Upstream> {
         info!("Upstream: initiating SV2 handshake...");
         let setup_connection =
@@ -218,7 +215,7 @@ impl Upstream {
         // Send RequestExtensions after successful SetupConnection if there are required extensions
         // and wait for the response before returning
         if !self.required_extensions.is_empty() {
-            let negotiated = self.negotiate_extensions().await?;
+            let negotiated = self.negotiate_extensions(channel_manager).await?;
             return Ok(negotiated);
         }
 
@@ -230,12 +227,18 @@ impl Upstream {
     /// This method handles the extension negotiation flow:
     /// 1. Sends RequestExtensions with required extensions
     /// 2. Waits for RequestExtensionsSuccess or RequestExtensionsError
-    /// 3. Validates that all required extensions are supported
+    /// 3. Delegates response handling to the `ChannelManager` via its
+    ///    `HandleExtensionsFromServerAsync` trait implementation
+    /// 4. If the server requires additional extensions we support, the ChannelManager
+    ///    sends a retry `RequestExtensions`; this method detects and forwards it
     ///
     /// # Returns
     /// * `Ok(Vec<u16>)` - The list of successfully negotiated extensions
     /// * `Err(JDCError)` - Extension negotiation failed
-    async fn negotiate_extensions(&mut self) -> JDCResult<Vec<u16>, error::Upstream> {
+    async fn negotiate_extensions(
+        &mut self,
+        channel_manager: &mut ChannelManager,
+    ) -> JDCResult<Vec<u16>, error::Upstream> {
         let requested_extensions =
             Seq064K::new(self.required_extensions.clone()).map_err(JDCError::shutdown)?;
 
@@ -262,129 +265,77 @@ impl Upstream {
                 JDCError::fallback(JDCErrorKind::ChannelErrorSender)
             })?;
 
-        // Wait for extension negotiation response with timeout
-        let response = tokio::time::timeout(
-            Duration::from_secs(EXTENSION_NEGOTIATION_TIMEOUT_SECS),
-            self.upstream_channel.upstream_receiver.recv(),
-        )
-        .await
-        .map_err(|_| {
-            error!(
-                "Extension negotiation timed out after {} seconds",
-                EXTENSION_NEGOTIATION_TIMEOUT_SECS
-            );
-            JDCError::fallback(JDCErrorKind::ExtensionNegotiationTimeout)
-        })?
-        .map_err(|e| {
-            error!("Failed to receive extension negotiation response: {}", e);
-            JDCError::fallback(e)
-        })?;
+        loop {
+            // Wait for extension negotiation response with timeout
+            let response = tokio::time::timeout(
+                Duration::from_secs(EXTENSION_NEGOTIATION_TIMEOUT_SECS),
+                self.upstream_channel.upstream_receiver.recv(),
+            )
+            .await
+            .map_err(|_| {
+                error!(
+                    "Extension negotiation timed out after {} seconds",
+                    EXTENSION_NEGOTIATION_TIMEOUT_SECS
+                );
+                JDCError::fallback(JDCErrorKind::ExtensionNegotiationTimeout)
+            })?
+            .map_err(|e| {
+                error!("Failed to receive extension negotiation response: {}", e);
+                JDCError::fallback(e)
+            })?;
 
-        self.handle_extension_response(response).await
+            // Delegate response handling to the ChannelManager's trait implementation.
+            // This checks the frame, validates required extensions, and may send a
+            // retry RequestExtensions if the server requires extensions we support.
+            self.handle_extension_response(response, channel_manager)
+                .await?;
+
+            // If the ChannelManager sent a retry RequestExtensions (via its upstream_sender),
+            // pick it up and forward it directly to the pool, then loop to await the next response.
+            if let Ok(retry_frame) = self.upstream_channel.channel_manager_receiver.try_recv() {
+                info!("Forwarding retry RequestExtensions to upstream pool...");
+                self.upstream_channel
+                    .upstream_sender
+                    .send(retry_frame)
+                    .await
+                    .map_err(|e| {
+                        error!(?e, "Failed to forward retry RequestExtensions to pool");
+                        JDCError::fallback(JDCErrorKind::ChannelErrorSender)
+                    })?;
+                continue;
+            }
+
+            // No retry pending — negotiation is complete.
+            // Return the extensions stored by the ChannelManager's trait implementation.
+            return channel_manager
+                .get_negotiated_extensions_with_server(None)
+                .map_err(|e| JDCError::fallback(e.kind));
+        }
     }
 
-    /// Handles the extension negotiation response (Success or Error).
+    /// Checks that the response is an extension message and delegates handling to the
+    /// `ChannelManager` via its `HandleExtensionsFromServerAsync` trait implementation.
+    ///
+    /// The ChannelManager's implementation in `extensions_message_handler.rs` performs
+    /// validation and stores the negotiated extensions. On a `RequestExtensionsError`
+    /// where the server requires extensions we support, it sends a retry `RequestExtensions`
+    /// via its upstream channel.
     async fn handle_extension_response(
         &mut self,
         mut response: Sv2Frame,
-    ) -> JDCResult<Vec<u16>, error::Upstream> {
+        channel_manager: &mut ChannelManager,
+    ) -> JDCResult<(), error::Upstream> {
         let header = response.get_header().ok_or_else(|| {
             error!("Extension response frame missing header");
             JDCError::fallback(JDCErrorKind::UnexpectedMessage(0, 0))
         })?;
 
-        let msg_type = header.msg_type();
-        let payload = response.payload();
+        channel_manager
+            .handle_extensions_message_frame_from_server(None, header, response.payload())
+            .await
+            .map_err(|e| JDCError::fallback(e.kind))?;
 
-        match msg_type {
-            MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS => {
-                let msg: RequestExtensionsSuccess =
-                    binary_sv2::from_bytes(payload).map_err(|e| {
-                        error!("Failed to parse RequestExtensionsSuccess: {:?}", e);
-                        JDCError::fallback(JDCErrorKind::BinarySv2(e))
-                    })?;
-
-                let supported: Vec<u16> = msg.supported_extensions.into_inner();
-                info!("Extension negotiation success: supported={:?}", supported);
-
-                // Check if all required extensions are supported
-                let missing_required: Vec<u16> = self
-                    .required_extensions
-                    .iter()
-                    .filter(|ext| !supported.contains(ext))
-                    .copied()
-                    .collect();
-
-                if !missing_required.is_empty() {
-                    error!(
-                        "Server does not support required extensions: {:?}",
-                        missing_required
-                    );
-                    return Err(JDCError::fallback(
-                        JDCErrorKind::RequiredExtensionsNotSupported(missing_required),
-                    ));
-                }
-
-                info!("Successfully negotiated extensions: {:?}", supported);
-                Ok(supported)
-            }
-            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR => {
-                let msg: RequestExtensionsError = binary_sv2::from_bytes(payload).map_err(|e| {
-                    error!("Failed to parse RequestExtensionsError: {:?}", e);
-                    JDCError::fallback(JDCErrorKind::BinarySv2(e))
-                })?;
-
-                let unsupported: Vec<u16> = msg.unsupported_extensions.into_inner();
-                let required_by_server: Vec<u16> = msg.required_extensions.into_inner();
-
-                error!(
-                    "Extension negotiation error: unsupported={:?}, required_by_server={:?}",
-                    unsupported, required_by_server
-                );
-
-                // Check if any of our required extensions were not supported
-                let missing_required: Vec<u16> = self
-                    .required_extensions
-                    .iter()
-                    .filter(|ext| unsupported.contains(ext))
-                    .copied()
-                    .collect();
-
-                if !missing_required.is_empty() {
-                    error!(
-                        "Server does not support required extensions: {:?}",
-                        missing_required
-                    );
-                    return Err(JDCError::fallback(
-                        JDCErrorKind::RequiredExtensionsNotSupported(missing_required),
-                    ));
-                }
-
-                // If server requires extensions we don't support, fail
-                if !required_by_server.is_empty() {
-                    error!(
-                        "Server requires extensions that we don't support: {:?}",
-                        required_by_server
-                    );
-                    return Err(JDCError::fallback(
-                        JDCErrorKind::ServerRequiresUnsupportedExtensions(required_by_server),
-                    ));
-                }
-
-                // No required extensions failed, return empty
-                Ok(vec![])
-            }
-            _ => {
-                error!(
-                    "Unexpected message type during extension negotiation: {}",
-                    msg_type
-                );
-                Err(JDCError::fallback(JDCErrorKind::UnexpectedMessage(
-                    header.ext_type(),
-                    msg_type,
-                )))
-            }
-        }
+        Ok(())
     }
 
     /// Start unified upstream loop.
@@ -408,10 +359,14 @@ impl Upstream {
         fallback_coordinator: FallbackCoordinator,
         status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
+        channel_manager: &mut ChannelManager,
     ) -> Vec<u16> {
         let status_sender = StatusSender::Upstream(status_sender);
 
-        let negotiated_extensions = match self.setup_connection(min_version, max_version).await {
+        let negotiated_extensions = match self
+            .setup_connection(min_version, max_version, channel_manager)
+            .await
+        {
             Ok(extensions) => {
                 info!(
                     "Upstream: extension negotiation complete. Extensions: {:?}",

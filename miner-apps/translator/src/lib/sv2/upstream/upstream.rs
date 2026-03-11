@@ -2,7 +2,7 @@ use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
     io_task::spawn_io_tasks,
     status::{handle_error, Status, StatusSender},
-    sv2::upstream::channel::UpstreamChannelState,
+    sv2::{channel_manager::ChannelManager, upstream::channel::UpstreamChannelState},
     utils::UpstreamEntry,
 };
 use async_channel::{unbounded, Receiver, Sender};
@@ -11,14 +11,10 @@ use stratum_apps::{
     fallback_coordinator::FallbackCoordinator,
     network_helpers::{self, connect_with_noise, resolve_host},
     stratum_core::{
-        binary_sv2::{self, Seq064K},
-        codec_sv2::HandshakeRole,
+        binary_sv2::Seq064K,
         common_messages_sv2::{Protocol, SetupConnection},
-        extensions_sv2::{
-            RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess,
-            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR, MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS,
-        },
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
+        extensions_sv2::RequestExtensions,
+        handlers_sv2::{HandleCommonMessagesFromServerAsync, HandleExtensionsFromServerAsync},
         parsers_sv2::{AnyMessage, Mining},
     },
     task_manager::TaskManager,
@@ -199,13 +195,14 @@ impl Upstream {
         fallback_coordinator: FallbackCoordinator,
         status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
+        channel_manager: &mut ChannelManager,
     ) -> TproxyResult<Vec<u16>, error::Upstream> {
         let fallback_token: CancellationToken = fallback_coordinator.token();
         let negotiated_extensions;
 
         // Wait for connection setup or cancellation signal
         tokio::select! {
-            result = self.setup_connection() => {
+            result = self.setup_connection(channel_manager) => {
                 match result {
                     Ok(extensions) => {
                         negotiated_extensions = extensions;
@@ -254,7 +251,10 @@ impl Upstream {
     /// # Returns
     /// * `Ok(Vec<u16>)` - The list of negotiated extensions (empty if none were requested)
     /// * `Err(TproxyError)` - Error during handshake or extension negotiation
-    pub async fn setup_connection(&mut self) -> TproxyResult<Vec<u16>, error::Upstream> {
+    pub async fn setup_connection(
+        &mut self,
+        channel_manager: &mut ChannelManager,
+    ) -> TproxyResult<Vec<u16>, error::Upstream> {
         debug!("Upstream: initiating SV2 handshake...");
         // Build SetupConnection message
         let setup_conn_msg = Self::get_setup_connection_message(2, 2, &self.address, false)
@@ -303,7 +303,7 @@ impl Upstream {
         // Send RequestExtensions message if there are any required extensions
         // and wait for the response before returning
         if !self.required_extensions.is_empty() {
-            let negotiated = self.negotiate_extensions().await?;
+            let negotiated = self.negotiate_extensions(channel_manager).await?;
             return Ok(negotiated);
         }
 
@@ -315,13 +315,18 @@ impl Upstream {
     /// This method handles the extension negotiation flow:
     /// 1. Sends RequestExtensions with required extensions
     /// 2. Waits for RequestExtensionsSuccess or RequestExtensionsError
-    /// 3. Validates that all required extensions are supported
-    /// 4. Handles retry if server requires additional extensions we support
+    /// 3. Delegates response handling to the `ChannelManager` via its
+    ///    `HandleExtensionsFromServerAsync` trait implementation
+    /// 4. If the server requires additional extensions we support, the ChannelManager
+    ///    sends a retry `RequestExtensions`; this method detects and forwards it
     ///
     /// # Returns
     /// * `Ok(Vec<u16>)` - The list of successfully negotiated extensions
     /// * `Err(TproxyError)` - Extension negotiation failed
-    async fn negotiate_extensions(&mut self) -> TproxyResult<Vec<u16>, error::Upstream> {
+    async fn negotiate_extensions(
+        &mut self,
+        channel_manager: &mut ChannelManager,
+    ) -> TproxyResult<Vec<u16>, error::Upstream> {
         let request_extensions = RequestExtensions {
             request_id: 1,
             requested_extensions: Seq064K::new(self.required_extensions.clone()).unwrap(),
@@ -345,130 +350,81 @@ impl Upstream {
                 TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
             })?;
 
-        // Wait for extension negotiation response with timeout
-        let response = tokio::time::timeout(
-            Duration::from_secs(EXTENSION_NEGOTIATION_TIMEOUT_SECS),
-            self.upstream_channel_state.upstream_receiver.recv(),
-        )
-        .await
-        .map_err(|_| {
-            error!(
-                "Extension negotiation timed out after {} seconds",
-                EXTENSION_NEGOTIATION_TIMEOUT_SECS
-            );
-            TproxyError::fallback(TproxyErrorKind::ExtensionNegotiationTimeout)
-        })?
-        .map_err(|e| {
-            error!("Failed to receive extension negotiation response: {}", e);
-            TproxyError::fallback(e)
-        })?;
+        loop {
+            // Wait for extension negotiation response with timeout
+            let response = tokio::time::timeout(
+                Duration::from_secs(EXTENSION_NEGOTIATION_TIMEOUT_SECS),
+                self.upstream_channel_state.upstream_receiver.recv(),
+            )
+            .await
+            .map_err(|_| {
+                error!(
+                    "Extension negotiation timed out after {} seconds",
+                    EXTENSION_NEGOTIATION_TIMEOUT_SECS
+                );
+                TproxyError::fallback(TproxyErrorKind::ExtensionNegotiationTimeout)
+            })?
+            .map_err(|e| {
+                error!("Failed to receive extension negotiation response: {}", e);
+                TproxyError::fallback(e)
+            })?;
 
-        self.handle_extension_response(response).await
+            // Delegate response handling to the ChannelManager's trait implementation.
+            // This validates required extensions and may send a retry RequestExtensions
+            // if the server requires extensions we support.
+            self.handle_extension_response(response, channel_manager)
+                .await?;
+
+            // If the ChannelManager sent a retry RequestExtensions (via its upstream_sender),
+            // pick it up and forward it directly to the pool, then loop to await the next response.
+            if let Ok(retry_frame) = self
+                .upstream_channel_state
+                .channel_manager_receiver
+                .try_recv()
+            {
+                info!("Forwarding retry RequestExtensions to upstream pool...");
+                self.upstream_channel_state
+                    .upstream_sender
+                    .send(retry_frame)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to forward retry RequestExtensions to pool: {:?}", e);
+                        TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
+                    })?;
+                continue;
+            }
+
+            // No retry pending — negotiation is complete.
+            // Return the extensions stored by the ChannelManager's trait implementation.
+            return channel_manager
+                .get_negotiated_extensions_with_server(None)
+                .map_err(|e| TproxyError::fallback(e.kind));
+        }
     }
 
-    /// Handles the extension negotiation response (Success or Error).
+    /// Checks that the response is an extension message and delegates handling to the
+    /// `ChannelManager` via its `HandleExtensionsFromServerAsync` trait implementation.
+    ///
+    /// The ChannelManager's implementation in `extensions_message_handler.rs` performs
+    /// validation and stores the negotiated extensions. On a `RequestExtensionsError`
+    /// where the server requires extensions we support, it sends a retry `RequestExtensions`
+    /// via its upstream channel.
     async fn handle_extension_response(
         &mut self,
         mut response: Sv2Frame,
-    ) -> TproxyResult<Vec<u16>, error::Upstream> {
+        channel_manager: &mut ChannelManager,
+    ) -> TproxyResult<(), error::Upstream> {
         let header = response.get_header().ok_or_else(|| {
             error!("Extension response frame missing header");
             TproxyError::fallback(TproxyErrorKind::UnexpectedMessage(0, 0))
         })?;
 
-        let msg_type = header.msg_type();
-        let payload = response.payload();
+        channel_manager
+            .handle_extensions_message_frame_from_server(None, header, response.payload())
+            .await
+            .map_err(|e| TproxyError::fallback(e.kind))?;
 
-        match msg_type {
-            MESSAGE_TYPE_REQUEST_EXTENSIONS_SUCCESS => {
-                let msg: RequestExtensionsSuccess =
-                    binary_sv2::from_bytes(payload).map_err(|e| {
-                        error!("Failed to parse RequestExtensionsSuccess: {:?}", e);
-                        TproxyError::fallback(TproxyErrorKind::BinarySv2(e))
-                    })?;
-
-                let supported: Vec<u16> = msg.supported_extensions.into_inner();
-                info!("Extension negotiation success: supported={:?}", supported);
-
-                // Check if all required extensions are supported
-                let missing_required: Vec<u16> = self
-                    .required_extensions
-                    .iter()
-                    .filter(|ext| !supported.contains(ext))
-                    .copied()
-                    .collect();
-
-                if !missing_required.is_empty() {
-                    error!(
-                        "Server does not support required extensions: {:?}",
-                        missing_required
-                    );
-                    return Err(TproxyError::fallback(
-                        TproxyErrorKind::RequiredExtensionsNotSupported(missing_required),
-                    ));
-                }
-
-                info!("Successfully negotiated extensions: {:?}", supported);
-                Ok(supported)
-            }
-            MESSAGE_TYPE_REQUEST_EXTENSIONS_ERROR => {
-                let msg: RequestExtensionsError = binary_sv2::from_bytes(payload).map_err(|e| {
-                    error!("Failed to parse RequestExtensionsError: {:?}", e);
-                    TproxyError::fallback(TproxyErrorKind::BinarySv2(e))
-                })?;
-
-                let unsupported: Vec<u16> = msg.unsupported_extensions.into_inner();
-                let required_by_server: Vec<u16> = msg.required_extensions.into_inner();
-
-                error!(
-                    "Extension negotiation error: unsupported={:?}, required_by_server={:?}",
-                    unsupported, required_by_server
-                );
-
-                // Check if any of our required extensions were not supported
-                let missing_required: Vec<u16> = self
-                    .required_extensions
-                    .iter()
-                    .filter(|ext| unsupported.contains(ext))
-                    .copied()
-                    .collect();
-
-                if !missing_required.is_empty() {
-                    error!(
-                        "Server does not support required extensions: {:?}",
-                        missing_required
-                    );
-                    return Err(TproxyError::fallback(
-                        TproxyErrorKind::RequiredExtensionsNotSupported(missing_required),
-                    ));
-                }
-
-                // If server requires extensions we don't support, fail
-                if !required_by_server.is_empty() {
-                    error!(
-                        "Server requires extensions that we don't support: {:?}",
-                        required_by_server
-                    );
-                    return Err(TproxyError::fallback(
-                        TproxyErrorKind::ServerRequiresUnsupportedExtensions(required_by_server),
-                    ));
-                }
-
-                // No required extensions failed, return empty (negotiation succeeded with no
-                // extensions)
-                Ok(vec![])
-            }
-            _ => {
-                error!(
-                    "Unexpected message type during extension negotiation: {}",
-                    msg_type
-                );
-                Err(TproxyError::fallback(TproxyErrorKind::UnexpectedMessage(
-                    header.ext_type(),
-                    msg_type,
-                )))
-            }
-        }
+        Ok(())
     }
 
     /// Processes incoming messages from the upstream SV2 server.
