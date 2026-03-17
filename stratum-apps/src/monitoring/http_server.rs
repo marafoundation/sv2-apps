@@ -161,17 +161,17 @@ impl MonitoringServer {
         let has_server = server_monitoring.is_some();
         let has_sv2_clients = sv2_clients_monitoring.is_some();
 
-        // Create the snapshot cache
-        let cache = Arc::new(SnapshotCache::new(
-            refresh_interval,
-            server_monitoring,
-            sv2_clients_monitoring,
-        ));
-
-        // Do initial refresh
-        cache.refresh();
-
         let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, false)?;
+
+        // Create the snapshot cache with metrics attached so refresh()
+        // updates Prometheus gauges atomically alongside the snapshot data.
+        let cache = Arc::new(
+            SnapshotCache::new(refresh_interval, server_monitoring, sv2_clients_monitoring)
+                .with_metrics(metrics.clone()),
+        );
+
+        // Do initial refresh (populates both snapshot and Prometheus gauges)
+        cache.refresh();
 
         Ok(Self {
             bind_address,
@@ -196,18 +196,21 @@ impl MonitoringServer {
         let has_server = snapshot.server_info.is_some();
         let has_sv2_clients = snapshot.sv2_clients_summary.is_some();
 
-        // Add Sv1 clients source to the cache
+        // Re-create metrics with SV1 enabled
+        let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, true)?;
+
+        // Add Sv1 clients source and attach new metrics to the cache
         let cache = Arc::new(
             Arc::try_unwrap(self.state.cache)
                 .unwrap_or_else(|arc| (*arc).clone())
-                .with_sv1_clients_source(sv1_monitoring),
+                .with_sv1_clients_source(sv1_monitoring)
+                .with_metrics(metrics.clone()),
         );
 
-        // Refresh cache with new SV1 data
+        // Refresh cache with new SV1 data (also updates Prometheus gauges)
         cache.refresh();
 
-        // Re-create metrics with SV1 enabled
-        self.state.metrics = PrometheusMetrics::new(has_server, has_sv2_clients, true)?;
+        self.state.metrics = metrics;
         self.state.cache = cache;
 
         Ok(self)
@@ -733,10 +736,18 @@ async fn handle_sv1_client_by_id(
     }
 }
 
-/// Handler for Prometheus metrics endpoint
+/// Handler for Prometheus metrics endpoint.
+///
+/// All GaugeVec metric values are updated atomically by the background cache refresh
+/// task in `SnapshotCache::refresh()`. This handler only needs to:
+/// 1. Set the uptime gauge (requires wall-clock time at scrape time)
+/// 2. Gather and encode all registered metrics
+///
+/// Because metric values are always kept in sync with the snapshot data, there is
+/// never a gap where label series momentarily disappear. Tests can assert on metrics
+/// directly after a cache refresh without polling for transient states.
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
-    let snapshot = state.cache.get_snapshot();
-
+    // Uptime is the only metric set at scrape time (needs current wall clock)
     let uptime_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -744,163 +755,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
 
-    // Reset per-channel metrics before repopulating
-    if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_server_channel_hashrate {
-        metric.reset();
-    }
-    if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-        metric.reset();
-    }
-
-    // Collect server metrics
-    if let Some(ref summary) = snapshot.server_summary {
-        if let Some(ref metric) = state.metrics.sv2_server_channels {
-            metric
-                .with_label_values(&["extended"])
-                .set(summary.extended_channels as f64);
-            metric
-                .with_label_values(&["standard"])
-                .set(summary.standard_channels as f64);
-        }
-        if let Some(ref metric) = state.metrics.sv2_server_hashrate_total {
-            metric.set(summary.total_hashrate as f64);
-        }
-    }
-
-    if let Some(ref server) = snapshot.server_info {
-        for channel in &server.extended_channels {
-            let channel_id = channel.channel_id.to_string();
-            let user = &channel.user_identity;
-
-            if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.shares_acknowledged as f64);
-            }
-            if let (Some(ref metric), Some(hashrate)) = (
-                &state.metrics.sv2_server_channel_hashrate,
-                channel.nominal_hashrate,
-            ) {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(hashrate as f64);
-            }
-        }
-
-        for channel in &server.standard_channels {
-            let channel_id = channel.channel_id.to_string();
-            let user = &channel.user_identity;
-
-            if let Some(ref metric) = state.metrics.sv2_server_shares_accepted_total {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(channel.shares_acknowledged as f64);
-            }
-            if let (Some(ref metric), Some(hashrate)) = (
-                &state.metrics.sv2_server_channel_hashrate,
-                channel.nominal_hashrate,
-            ) {
-                metric
-                    .with_label_values(&[&channel_id, user])
-                    .set(hashrate as f64);
-            }
-        }
-
-        if let Some(ref metric) = state.metrics.sv2_server_blocks_found_total {
-            let total: u64 = server
-                .extended_channels
-                .iter()
-                .map(|c| c.blocks_found as u64)
-                .chain(
-                    server
-                        .standard_channels
-                        .iter()
-                        .map(|c| c.blocks_found as u64),
-                )
-                .sum();
-            metric.set(total as f64);
-        }
-    }
-
-    // Collect Sv2 clients metrics
-    if let Some(ref summary) = snapshot.sv2_clients_summary {
-        if let Some(ref metric) = state.metrics.sv2_clients_total {
-            metric.set(summary.total_clients as f64);
-        }
-        if let Some(ref metric) = state.metrics.sv2_client_channels {
-            metric
-                .with_label_values(&["extended"])
-                .set(summary.extended_channels as f64);
-            metric
-                .with_label_values(&["standard"])
-                .set(summary.standard_channels as f64);
-        }
-        if let Some(ref metric) = state.metrics.sv2_client_hashrate_total {
-            metric.set(summary.total_hashrate as f64);
-        }
-
-        let mut client_blocks_total: u64 = 0;
-
-        for client in snapshot.sv2_clients.as_deref().unwrap_or(&[]) {
-            let client_id = client.client_id.to_string();
-
-            for channel in &client.extended_channels {
-                let channel_id = channel.channel_id.to_string();
-                let user = &channel.user_identity;
-
-                if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_accepted as f64);
-                }
-                if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.nominal_hashrate as f64);
-                }
-                client_blocks_total += channel.blocks_found as u64;
-            }
-
-            for channel in &client.standard_channels {
-                let channel_id = channel.channel_id.to_string();
-                let user = &channel.user_identity;
-
-                if let Some(ref metric) = state.metrics.sv2_client_shares_accepted_total {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.shares_accepted as f64);
-                }
-                if let Some(ref metric) = state.metrics.sv2_client_channel_hashrate {
-                    metric
-                        .with_label_values(&[&client_id, &channel_id, user])
-                        .set(channel.nominal_hashrate as f64);
-                }
-                client_blocks_total += channel.blocks_found as u64;
-            }
-        }
-
-        if let Some(ref metric) = state.metrics.sv2_client_blocks_found_total {
-            metric.set(client_blocks_total as f64);
-        }
-    }
-
-    // Collect SV1 client metrics
-    if let Some(ref summary) = snapshot.sv1_clients_summary {
-        if let Some(ref metric) = state.metrics.sv1_clients_total {
-            metric.set(summary.total_clients as f64);
-        }
-        if let Some(ref metric) = state.metrics.sv1_hashrate_total {
-            metric.set(summary.total_hashrate as f64);
-        }
-    }
-
-    // Encode and return metrics
+    // Gather and encode — all other metrics were set by the last cache refresh
     let encoder = TextEncoder::new();
     let metric_families = state.metrics.registry.gather();
     let mut buffer = Vec::new();
@@ -931,6 +786,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use std::sync::Mutex;
     use tower::ServiceExt;
 
     // ── helpers ──────────────────────────────────────────────────────
@@ -1066,7 +922,16 @@ mod tests {
         clients: Option<Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>>,
         sv1: Option<Arc<dyn super::super::sv1::Sv1ClientsMonitoring + Send + Sync>>,
     ) -> Router {
-        let cache = Arc::new(SnapshotCache::new(Duration::from_secs(60), server, clients));
+        let has_server = server.is_some();
+        let has_clients = clients.is_some();
+        let has_sv1 = sv1.is_some();
+
+        let metrics = PrometheusMetrics::new(has_server, has_clients, has_sv1).unwrap();
+
+        let cache = Arc::new(
+            SnapshotCache::new(Duration::from_secs(60), server, clients)
+                .with_metrics(metrics.clone()),
+        );
 
         let cache = if let Some(sv1_source) = sv1 {
             Arc::new(
@@ -1079,12 +944,6 @@ mod tests {
         };
 
         cache.refresh();
-
-        let has_server = cache.get_snapshot().server_info.is_some();
-        let has_clients = cache.get_snapshot().sv2_clients_summary.is_some();
-        let has_sv1 = cache.get_snapshot().sv1_clients.is_some();
-
-        let metrics = PrometheusMetrics::new(has_server, has_clients, has_sv1).unwrap();
 
         let start_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1549,5 +1408,91 @@ mod tests {
         // Server/client metrics should NOT be present when sources are None
         assert!(!body.contains("sv2_server_channels"));
         assert!(!body.contains("sv2_clients_total"));
+    }
+
+    // Mutable mock that allows changing data between requests
+    struct MutableMockClients(Mutex<Vec<Sv2ClientInfo>>);
+    impl super::super::client::Sv2ClientsMonitoring for MutableMockClients {
+        fn get_sv2_clients(&self) -> Vec<Sv2ClientInfo> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Verify that stale channel labels are removed without a reset gap.
+    ///
+    /// Scenario: First scrape has client with channel 1 and channel 2.
+    /// Second scrape: channel 2 is gone. The test verifies that:
+    /// - Channel 1 metrics are still present (no gap)
+    /// - Channel 2 metrics are removed (stale cleanup)
+    #[tokio::test]
+    async fn metrics_stale_labels_removed_without_reset_gap() {
+        let initial_clients = vec![Sv2ClientInfo {
+            client_id: 1,
+            extended_channels: vec![
+                create_extended_channel_info(1, 100.0),
+                create_extended_channel_info(2, 200.0),
+            ],
+            standard_channels: vec![],
+        }];
+
+        let mock_clients = Arc::new(MutableMockClients(Mutex::new(initial_clients)));
+        let metrics = PrometheusMetrics::new(false, true, false).unwrap();
+        let cache = Arc::new(
+            SnapshotCache::new(
+                Duration::from_secs(60),
+                None,
+                Some(mock_clients.clone()
+                    as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            )
+            .with_metrics(metrics.clone()),
+        );
+        cache.refresh();
+
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let state = ServerState {
+            cache: cache.clone(),
+            start_time,
+            metrics,
+        };
+
+        let app = Router::new()
+            .route("/metrics", get(handle_prometheus_metrics))
+            .with_state(state);
+
+        // First scrape — both channels present
+        let response = app.clone().oneshot(make_request("/metrics")).await.unwrap();
+        let body = get_body(response).await;
+        // Prometheus sorts label keys alphabetically: channel_id, client_id, user_identity
+        assert!(
+            body.contains("sv2_client_shares_accepted_total{channel_id=\"1\",client_id=\"1\""),
+            "Channel 1 should be present on first scrape"
+        );
+        assert!(
+            body.contains("sv2_client_shares_accepted_total{channel_id=\"2\",client_id=\"1\""),
+            "Channel 2 should be present on first scrape"
+        );
+
+        // Remove channel 2 from mock data and refresh cache
+        {
+            let mut clients = mock_clients.0.lock().unwrap();
+            clients[0].extended_channels.retain(|c| c.channel_id == 1);
+        }
+        cache.refresh();
+
+        // Second scrape — channel 2 should be removed, channel 1 still present
+        let response = app.clone().oneshot(make_request("/metrics")).await.unwrap();
+        let body = get_body(response).await;
+        assert!(
+            body.contains("sv2_client_shares_accepted_total{channel_id=\"1\",client_id=\"1\""),
+            "Channel 1 should still be present after stale removal"
+        );
+        assert!(
+            !body.contains("sv2_client_shares_accepted_total{channel_id=\"2\",client_id=\"1\""),
+            "Channel 2 should be removed as stale"
+        );
     }
 }

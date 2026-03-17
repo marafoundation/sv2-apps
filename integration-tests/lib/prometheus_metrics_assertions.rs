@@ -38,15 +38,22 @@ pub(crate) fn parse_metric_value(metrics_text: &str, metric_name: &str) -> Optio
         if line.starts_with('#') {
             continue;
         }
-        // For labeled metrics, match the prefix up to the closing brace
         if let Some(rest) = line.strip_prefix(metric_name) {
-            // The value follows a space after the metric name (or after the closing brace)
-            let value_str = rest.trim();
-            // If there are labels and the name didn't include them, skip
-            if value_str.starts_with('{') {
+            let rest = rest.trim();
+            if rest.is_empty() {
                 continue;
             }
-            return value_str.parse::<f64>().ok();
+            // Bare metric (no labels): value follows directly after the name
+            if rest.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+                return rest.parse::<f64>().ok();
+            }
+            // Labeled metric: skip past the closing brace to get the value
+            if rest.starts_with('{') {
+                if let Some(brace_end) = rest.find('}') {
+                    let value_str = rest[brace_end + 1..].trim();
+                    return value_str.parse::<f64>().ok();
+                }
+            }
         }
     }
     None
@@ -135,15 +142,11 @@ pub fn assert_metric_present(metrics_text: &str, metric_name: &str) {
     );
 }
 
-/// Poll the `/metrics` endpoint until any line matching `metric_name` (with any labels) has a
-/// value >= `min`, then return the full metrics text. Panics if the condition is not met within
-/// `timeout`.
+/// Poll `/metrics` until `metric_name` is present with a value >= `min`, or panic after
+/// `timeout`. Polls every 100ms to react quickly while tolerating cache refresh jitter.
 ///
-/// Use this instead of a fixed `sleep` for `GaugeVec` metrics (per-channel shares, blocks found)
-/// that only appear in Prometheus output after the monitoring snapshot cache has refreshed with
-/// observed label combinations. The handler calls `.reset()` on every `/metrics` request before
-/// repopulating from the cached snapshot, so a label combination is only present when the
-/// snapshot contains a non-default value for it.
+/// Returns the full metrics text from the successful scrape so callers can make additional
+/// assertions without a second fetch.
 pub async fn poll_until_metric_gte(
     monitoring_addr: SocketAddr,
     metric_name: &str,
@@ -153,30 +156,10 @@ pub async fn poll_until_metric_gte(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let metrics = fetch_metrics(monitoring_addr).await;
-        let satisfied = metrics.lines().any(|line| {
-            if line.starts_with('#') {
-                return false;
+        if let Some(v) = parse_metric_value(&metrics, metric_name) {
+            if v >= min {
+                return metrics;
             }
-            if let Some(rest) = line.strip_prefix(metric_name) {
-                // Match bare name followed by space, or labeled name followed by '{'
-                let value_str = if rest.starts_with(' ') {
-                    rest.trim()
-                } else if rest.starts_with('{') {
-                    // Skip past the closing brace to get the value
-                    rest.find('}')
-                        .and_then(|i| rest.get(i + 1..))
-                        .map(|s| s.trim())
-                        .unwrap_or("")
-                } else {
-                    return false;
-                };
-                value_str.parse::<f64>().map(|v| v >= min).unwrap_or(false)
-            } else {
-                false
-            }
-        });
-        if satisfied {
-            return metrics;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
@@ -184,7 +167,7 @@ pub async fn poll_until_metric_gte(
                 metric_name, min, timeout, metrics
             );
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
