@@ -55,9 +55,11 @@ use super::{
 /// remove only stale series instead of calling `.reset()` (which would create a
 /// gap where all label series momentarily disappear).
 #[derive(Default)]
-struct PreviousPrometheusLabelSets {
+struct PreviousLabelSets {
     /// Labels for server per-channel GaugeVecs: [channel_id, user_identity]
     server_channel_labels: HashSet<[String; 2]>,
+    /// Labels for server rejection GaugeVec: [channel_id, user_identity, error_code]
+    server_rejection_labels: HashSet<[String; 3]>,
     /// Labels for client per-channel GaugeVecs: [client_id, channel_id, user_identity]
     client_channel_labels: HashSet<[String; 3]>,
 }
@@ -90,23 +92,17 @@ pub struct SnapshotCache {
     sv2_clients_source: Option<Arc<dyn Sv2ClientsMonitoring + Send + Sync>>,
     sv1_clients_source: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync>>,
     metrics: Option<PrometheusMetrics>,
-    previous_metrics_labels: Mutex<PreviousPrometheusLabelSets>,
+    previous_labels: Mutex<PreviousLabelSets>,
 }
 
 impl Clone for SnapshotCache {
     fn clone(&self) -> Self {
         // Clone creates a new cache with the same sources and current snapshot.
-        // previous_metrics_labels is cloned so the new cache can correctly detect
-        // stale label combinations on its first refresh.
+        // previous_labels is cloned so the new cache can correctly detect stale
+        // label combinations on its first refresh.
         let current_snapshot = self.snapshot.read().unwrap().clone();
-        // Recovering from a poisoned mutex is safe here: the inner sets only
-        // track which Prometheus label combinations were populated last refresh,
-        // used solely to compute stale-label removals. The data has no
-        // cross-field invariants, and worst-case drift (a stale label surviving
-        // one cycle, or an idempotent remove that we already log at debug) is
-        // harmless. Panicking here would crash the monitoring server.
-        let previous_metrics_labels = self
-            .previous_metrics_labels
+        let prev = self
+            .previous_labels
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         Self {
@@ -116,9 +112,10 @@ impl Clone for SnapshotCache {
             sv2_clients_source: self.sv2_clients_source.clone(),
             sv1_clients_source: self.sv1_clients_source.clone(),
             metrics: self.metrics.clone(),
-            previous_metrics_labels: Mutex::new(PreviousPrometheusLabelSets {
-                server_channel_labels: previous_metrics_labels.server_channel_labels.clone(),
-                client_channel_labels: previous_metrics_labels.client_channel_labels.clone(),
+            previous_labels: Mutex::new(PreviousLabelSets {
+                server_channel_labels: prev.server_channel_labels.clone(),
+                server_rejection_labels: prev.server_rejection_labels.clone(),
+                client_channel_labels: prev.client_channel_labels.clone(),
             }),
         }
     }
@@ -144,7 +141,7 @@ impl SnapshotCache {
             sv2_clients_source,
             sv1_clients_source: None,
             metrics: None,
-            previous_metrics_labels: Mutex::new(PreviousPrometheusLabelSets::default()),
+            previous_labels: Mutex::new(PreviousLabelSets::default()),
         }
     }
 
@@ -219,6 +216,7 @@ impl SnapshotCache {
     /// label combinations that are no longer present.
     fn update_metrics(&self, metrics: &PrometheusMetrics, snapshot: &MonitoringSnapshot) {
         let mut current_server_labels: HashSet<[String; 2]> = HashSet::new();
+        let mut current_server_rejection_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_client_labels: HashSet<[String; 3]> = HashSet::new();
 
         // Server metrics
@@ -244,6 +242,21 @@ impl SnapshotCache {
                     m.with_label_values(&[&channel_id, user])
                         .set(channel.shares_acknowledged as f64);
                 }
+                if let Some(ref m) = metrics.sv2_server_shares_submitted_total {
+                    m.with_label_values(&[&channel_id, user])
+                        .set(channel.shares_submitted as f64);
+                }
+                if let Some(ref m) = metrics.sv2_server_shares_rejected_total {
+                    for (error_code, count) in &channel.shares_rejected_by_reason {
+                        m.with_label_values(&[&channel_id, user, error_code])
+                            .set(*count as f64);
+                        current_server_rejection_labels.insert([
+                            channel_id.clone(),
+                            user.clone(),
+                            error_code.clone(),
+                        ]);
+                    }
+                }
                 if let (Some(ref m), Some(hashrate)) = (
                     &metrics.sv2_server_channel_hashrate,
                     channel.nominal_hashrate,
@@ -262,6 +275,21 @@ impl SnapshotCache {
                 if let Some(ref m) = metrics.sv2_server_shares_accepted_total {
                     m.with_label_values(&[&channel_id, user])
                         .set(channel.shares_acknowledged as f64);
+                }
+                if let Some(ref m) = metrics.sv2_server_shares_submitted_total {
+                    m.with_label_values(&[&channel_id, user])
+                        .set(channel.shares_submitted as f64);
+                }
+                if let Some(ref m) = metrics.sv2_server_shares_rejected_total {
+                    for (error_code, count) in &channel.shares_rejected_by_reason {
+                        m.with_label_values(&[&channel_id, user, error_code])
+                            .set(*count as f64);
+                        current_server_rejection_labels.insert([
+                            channel_id.clone(),
+                            user.clone(),
+                            error_code.clone(),
+                        ]);
+                    }
                 }
                 if let (Some(ref m), Some(hashrate)) = (
                     &metrics.sv2_server_channel_hashrate,
@@ -318,6 +346,10 @@ impl SnapshotCache {
                         m.with_label_values(&[&client_id, &channel_id, user])
                             .set(channel.shares_accepted as f64);
                     }
+                    if let Some(ref m) = metrics.sv2_client_shares_rejected_total {
+                        m.with_label_values(&[&client_id, &channel_id, user])
+                            .set(channel.shares_rejected as f64);
+                    }
                     if let Some(ref m) = metrics.sv2_client_channel_hashrate {
                         m.with_label_values(&[&client_id, &channel_id, user])
                             .set(channel.nominal_hashrate as f64);
@@ -334,6 +366,10 @@ impl SnapshotCache {
                     if let Some(ref m) = metrics.sv2_client_shares_accepted_total {
                         m.with_label_values(&[&client_id, &channel_id, user])
                             .set(channel.shares_accepted as f64);
+                    }
+                    if let Some(ref m) = metrics.sv2_client_shares_rejected_total {
+                        m.with_label_values(&[&client_id, &channel_id, user])
+                            .set(channel.shares_rejected as f64);
                     }
                     if let Some(ref m) = metrics.sv2_client_channel_hashrate {
                         m.with_label_values(&[&client_id, &channel_id, user])
@@ -360,12 +396,12 @@ impl SnapshotCache {
         }
 
         // Remove stale label combinations that are no longer in the snapshot
-        let mut previous_metrics_labels = self
-            .previous_metrics_labels
+        let mut prev = self
+            .previous_labels
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        for stale in previous_metrics_labels
+        for stale in prev
             .server_channel_labels
             .difference(&current_server_labels)
         {
@@ -375,6 +411,11 @@ impl SnapshotCache {
                     debug!(labels = ?label_refs, error = %e, "failed to remove stale server shares label");
                 }
             }
+            if let Some(ref m) = metrics.sv2_server_shares_submitted_total {
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale server shares submitted label");
+                }
+            }
             if let Some(ref m) = metrics.sv2_server_channel_hashrate {
                 if let Err(e) = m.remove_label_values(&label_refs) {
                     debug!(labels = ?label_refs, error = %e, "failed to remove stale server hashrate label");
@@ -382,7 +423,19 @@ impl SnapshotCache {
             }
         }
 
-        for stale in previous_metrics_labels
+        for stale in prev
+            .server_rejection_labels
+            .difference(&current_server_rejection_labels)
+        {
+            let label_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            if let Some(ref m) = metrics.sv2_server_shares_rejected_total {
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale server rejection label");
+                }
+            }
+        }
+
+        for stale in prev
             .client_channel_labels
             .difference(&current_client_labels)
         {
@@ -392,6 +445,11 @@ impl SnapshotCache {
                     debug!(labels = ?label_refs, error = %e, "failed to remove stale client shares label");
                 }
             }
+            if let Some(ref m) = metrics.sv2_client_shares_rejected_total {
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale client shares rejected label");
+                }
+            }
             if let Some(ref m) = metrics.sv2_client_channel_hashrate {
                 if let Err(e) = m.remove_label_values(&label_refs) {
                     debug!(labels = ?label_refs, error = %e, "failed to remove stale client hashrate label");
@@ -399,8 +457,9 @@ impl SnapshotCache {
             }
         }
 
-        previous_metrics_labels.server_channel_labels = current_server_labels;
-        previous_metrics_labels.client_channel_labels = current_client_labels;
+        prev.server_channel_labels = current_server_labels;
+        prev.server_rejection_labels = current_server_rejection_labels;
+        prev.client_channel_labels = current_client_labels;
     }
 
     /// Get the refresh interval

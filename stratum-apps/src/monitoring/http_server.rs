@@ -196,7 +196,7 @@ impl MonitoringServer {
         let has_server = snapshot.server_info.is_some();
         let has_sv2_clients = snapshot.sv2_clients_summary.is_some();
 
-        // Create metrics with SV1 monitoring enabled
+        // Re-create metrics with SV1 enabled
         let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, true)?;
 
         // Add Sv1 clients source and attach new metrics to the cache
@@ -806,6 +806,7 @@ mod tests {
             rollable_extranonce_size: 4,
             expected_shares_per_minute: 1.0,
             shares_accepted: 10,
+            shares_rejected: 0,
             share_work_sum: 100.0,
             last_share_sequence_number: 5,
             best_diff: 50.0,
@@ -829,6 +830,7 @@ mod tests {
             extranonce_prefix_hex: "bb".into(),
             expected_shares_per_minute: 2.0,
             shares_accepted: 20,
+            shares_rejected: 0,
             share_work_sum: 200.0,
             last_share_sequence_number: 8,
             best_diff: 80.0,
