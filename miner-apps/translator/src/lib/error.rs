@@ -15,6 +15,7 @@ use std::{
     sync::PoisonError,
 };
 use stratum_apps::{
+    extensions_negotiation::ExtensionNegotiationError,
     stratum_core::{
         binary_sv2,
         channels_sv2::client::error::GroupChannelError,
@@ -398,6 +399,20 @@ impl HandlerErrorType for TproxyErrorKind {
 
     fn unexpected_message(extension_type: ExtensionType, message_type: MessageType) -> Self {
         TproxyErrorKind::UnexpectedMessage(extension_type, message_type)
+    }
+}
+
+impl From<ExtensionNegotiationError> for TproxyErrorKind {
+    fn from(e: ExtensionNegotiationError) -> Self {
+        match e {
+            ExtensionNegotiationError::SendError => TproxyErrorKind::ChannelErrorSender,
+            ExtensionNegotiationError::ReceiveError(_) => TproxyErrorKind::UnexpectedMessage(0, 0),
+            ExtensionNegotiationError::Timeout => TproxyErrorKind::ExtensionNegotiationTimeout,
+            ExtensionNegotiationError::UnexpectedMessage(ext, msg) => {
+                TproxyErrorKind::UnexpectedMessage(ext, msg as u8)
+            }
+            ExtensionNegotiationError::HandlerError(_) => TproxyErrorKind::UnexpectedMessage(0, 0),
+        }
     }
 }
 

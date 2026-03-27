@@ -78,3 +78,7 @@ pub mod coinbase_output_constraints;
 
 /// Fallback coordinator
 pub mod fallback_coordinator;
+
+/// Extension negotiation utilities shared by JDC and Translator
+pub mod extensions_negotiation;
+pub use extensions_negotiation::{negotiate_extensions, ExtensionNegotiationError};

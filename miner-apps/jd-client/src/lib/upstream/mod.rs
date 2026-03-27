@@ -10,22 +10,16 @@
 //! - Forward SV2 mining messages between upstream and channel manager
 //! - Handle common messages from upstream
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
     custom_mutex::Mutex,
+    extensions_negotiation::negotiate_extensions,
     fallback_coordinator::FallbackCoordinator,
-    key_utils::Secp256k1PublicKey,
-    network_helpers::{connect_with_noise, noise_stream::NoiseTcpStream, resolve_host},
-    stratum_core::{
-        binary_sv2::Seq064K,
-        extensions_sv2::RequestExtensions,
-        framing_sv2,
-        handlers_sv2::{HandleCommonMessagesFromServerAsync, HandleExtensionsFromServerAsync},
-        parsers_sv2::AnyMessage,
-    },
+    network_helpers::{connect_with_noise, resolve_host},
+    stratum_core::{framing_sv2, handlers_sv2::HandleCommonMessagesFromServerAsync},
     task_manager::TaskManager,
     utils::{
         protocol_message_type::{protocol_message_type, MessageType},
@@ -42,9 +36,6 @@ use crate::{
     status::{handle_error, Status, StatusSender},
     utils::{get_setup_connection_message, UpstreamEntry},
 };
-
-/// Timeout for extension negotiation response (10 seconds)
-const EXTENSION_NEGOTIATION_TIMEOUT_SECS: u64 = 10;
 
 mod message_handler;
 
@@ -224,13 +215,7 @@ impl Upstream {
 
     /// Sends RequestExtensions and waits for the response.
     ///
-    /// This method handles the extension negotiation flow:
-    /// 1. Sends RequestExtensions with required extensions
-    /// 2. Waits for RequestExtensionsSuccess or RequestExtensionsError
-    /// 3. Delegates response handling to the `ChannelManager` via its
-    ///    `HandleExtensionsFromServerAsync` trait implementation
-    /// 4. If the server requires additional extensions we support, the ChannelManager
-    ///    sends a retry `RequestExtensions`; this method detects and forwards it
+    /// Delegates to the shared [`stratum_apps::extensions_negotiation::negotiate_extensions`] function.
     ///
     /// # Returns
     /// * `Ok(Vec<u16>)` - The list of successfully negotiated extensions
@@ -239,103 +224,15 @@ impl Upstream {
         &mut self,
         channel_manager: &mut ChannelManager,
     ) -> JDCResult<Vec<u16>, error::Upstream> {
-        let requested_extensions =
-            Seq064K::new(self.required_extensions.clone()).map_err(JDCError::shutdown)?;
-
-        let request_extensions = RequestExtensions {
-            request_id: 0,
-            requested_extensions,
-        };
-
-        info!(
-            "Sending RequestExtensions to upstream with required extensions: {:?}",
-            self.required_extensions
-        );
-
-        let sv2_frame: Sv2Frame = AnyMessage::Extensions(request_extensions.into_static().into())
-            .try_into()
-            .map_err(JDCError::shutdown)?;
-
-        self.upstream_channel
-            .upstream_sender
-            .send(sv2_frame)
-            .await
-            .map_err(|e| {
-                error!(?e, "Failed to send RequestExtensions to upstream");
-                JDCError::fallback(JDCErrorKind::ChannelErrorSender)
-            })?;
-
-        loop {
-            // Wait for extension negotiation response with timeout
-            let response = tokio::time::timeout(
-                Duration::from_secs(EXTENSION_NEGOTIATION_TIMEOUT_SECS),
-                self.upstream_channel.upstream_receiver.recv(),
-            )
-            .await
-            .map_err(|_| {
-                error!(
-                    "Extension negotiation timed out after {} seconds",
-                    EXTENSION_NEGOTIATION_TIMEOUT_SECS
-                );
-                JDCError::fallback(JDCErrorKind::ExtensionNegotiationTimeout)
-            })?
-            .map_err(|e| {
-                error!("Failed to receive extension negotiation response: {}", e);
-                JDCError::fallback(e)
-            })?;
-
-            // Delegate response handling to the ChannelManager's trait implementation.
-            // This checks the frame, validates required extensions, and may send a
-            // retry RequestExtensions if the server requires extensions we support.
-            self.handle_extension_response(response, channel_manager)
-                .await?;
-
-            // If the ChannelManager sent a retry RequestExtensions (via its upstream_sender),
-            // pick it up and forward it directly to the pool, then loop to await the next response.
-            if let Ok(retry_frame) = self.upstream_channel.channel_manager_receiver.try_recv() {
-                info!("Forwarding retry RequestExtensions to upstream pool...");
-                self.upstream_channel
-                    .upstream_sender
-                    .send(retry_frame)
-                    .await
-                    .map_err(|e| {
-                        error!(?e, "Failed to forward retry RequestExtensions to pool");
-                        JDCError::fallback(JDCErrorKind::ChannelErrorSender)
-                    })?;
-                continue;
-            }
-
-            // No retry pending — negotiation is complete.
-            // Return the extensions stored by the ChannelManager's trait implementation.
-            return channel_manager
-                .get_negotiated_extensions_with_server(None)
-                .map_err(|e| JDCError::fallback(e.kind));
-        }
-    }
-
-    /// Checks that the response is an extension message and delegates handling to the
-    /// `ChannelManager` via its `HandleExtensionsFromServerAsync` trait implementation.
-    ///
-    /// The ChannelManager's implementation in `extensions_message_handler.rs` performs
-    /// validation and stores the negotiated extensions. On a `RequestExtensionsError`
-    /// where the server requires extensions we support, it sends a retry `RequestExtensions`
-    /// via its upstream channel.
-    async fn handle_extension_response(
-        &mut self,
-        mut response: Sv2Frame,
-        channel_manager: &mut ChannelManager,
-    ) -> JDCResult<(), error::Upstream> {
-        let header = response.get_header().ok_or_else(|| {
-            error!("Extension response frame missing header");
-            JDCError::fallback(JDCErrorKind::UnexpectedMessage(0, 0))
-        })?;
-
-        channel_manager
-            .handle_extensions_message_frame_from_server(None, header, response.payload())
-            .await
-            .map_err(|e| JDCError::fallback(e.kind))?;
-
-        Ok(())
+        negotiate_extensions(
+            self.required_extensions.clone(),
+            self.upstream_channel.upstream_sender.clone(),
+            self.upstream_channel.upstream_receiver.clone(),
+            self.upstream_channel.channel_manager_receiver.clone(),
+            channel_manager,
+        )
+        .await
+        .map_err(|e| JDCError::fallback(JDCErrorKind::from(e)))
     }
 
     /// Start unified upstream loop.

@@ -171,7 +171,7 @@ impl JobDeclaratorClient {
             });
         }
 
-        let channel_manager_clone = channel_manager.clone();
+        let mut channel_manager_clone = channel_manager.clone();
         let mut bitcoin_core_sv2_join_handle: Option<JoinHandle<()>> = None;
 
         match self.config.template_provider_type().clone() {

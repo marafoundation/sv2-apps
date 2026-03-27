@@ -17,6 +17,7 @@ use std::{
     marker::PhantomData,
 };
 use stratum_apps::{
+    extensions_negotiation::ExtensionNegotiationError,
     network_helpers,
     stratum_core::{
         binary_sv2, bitcoin,
@@ -506,6 +507,20 @@ impl From<ExtendedExtranonceError> for JDCErrorKind {
 impl From<GroupChannelError> for JDCErrorKind {
     fn from(value: GroupChannelError) -> Self {
         JDCErrorKind::ChannelSv2(ChannelSv2Error::GroupChannelServerSide(value))
+    }
+}
+
+impl From<ExtensionNegotiationError> for JDCErrorKind {
+    fn from(e: ExtensionNegotiationError) -> Self {
+        match e {
+            ExtensionNegotiationError::SendError => JDCErrorKind::ChannelErrorSender,
+            ExtensionNegotiationError::ReceiveError(_) => JDCErrorKind::UnexpectedMessage(0, 0),
+            ExtensionNegotiationError::Timeout => JDCErrorKind::ExtensionNegotiationTimeout,
+            ExtensionNegotiationError::UnexpectedMessage(ext, msg) => {
+                JDCErrorKind::UnexpectedMessage(ext, msg as u8)
+            }
+            ExtensionNegotiationError::HandlerError(_) => JDCErrorKind::UnexpectedMessage(0, 0),
+        }
     }
 }
 
