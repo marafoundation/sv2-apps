@@ -407,6 +407,43 @@ pub fn into_static(m: AnyMessage<'_>) -> AnyMessage<'static> {
 }
 
 pub mod http {
+    /// Make a GET request that returns both the HTTP status code and the response body.
+    /// Unlike `make_get_request`, this does NOT panic on non-2xx status codes (e.g. 404),
+    /// making it suitable for testing API error responses.
+    /// Only retries on 5xx errors or connection failures.
+    pub fn make_get_request_with_status(url: &str, retries: usize) -> (i32, Vec<u8>) {
+        for attempt in 1..=retries {
+            let response = minreq::get(url).send();
+            match response {
+                Ok(res) => {
+                    let status_code = res.status_code;
+                    if (500..600).contains(&status_code) {
+                        eprintln!(
+                            "Attempt {attempt}: URL {url} returned a server error code {status_code}"
+                        );
+                    } else {
+                        return (status_code, res.as_bytes().to_vec());
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Attempt {}: Failed to fetch URL {}: {:?}",
+                        attempt + 1,
+                        url,
+                        err
+                    );
+                }
+            }
+
+            if attempt < retries {
+                let delay = 1u64 << (attempt - 1);
+                eprintln!("Retrying in {delay} seconds (exponential backoff)...");
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+            }
+        }
+        panic!("Cannot reach URL {url} after {retries} attempts");
+    }
+
     pub fn make_get_request(download_url: &str, retries: usize) -> Vec<u8> {
         for attempt in 1..=retries {
             let response = minreq::get(download_url).send();

@@ -6,6 +6,7 @@ use super::{
         Sv2ClientsMonitoring, Sv2ClientsSummary,
     },
     prometheus_metrics::PrometheusMetrics,
+    routes,
     server::{
         ServerExtendedChannelInfo, ServerMonitoring, ServerStandardChannelInfo, ServerSummary,
     },
@@ -21,7 +22,7 @@ use axum::{
     Router,
 };
 use prometheus::{Encoder, TextEncoder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
     net::SocketAddr,
@@ -36,6 +37,9 @@ use utoipa_swagger_ui::SwaggerUi;
 #[derive(OpenApi)]
 #[openapi(
     info(
+        // This `info` block is the single source of truth for the API title
+        // and version. `handle_root` reads them back from `ApiDoc::openapi()`
+        // at runtime instead of duplicating the literals.
         title = "SRI Monitoring API",
         version = "0.1.0",
         description = "HTTP JSON API for monitoring SV2 applications"
@@ -248,21 +252,30 @@ impl MonitoringServer {
 
         // Versioned JSON API under /api/v1
         let api_v1 = Router::new()
-            .route("/health", get(handle_health))
-            .route("/global", get(handle_global))
-            .route("/server", get(handle_server))
-            .route("/server/channels", get(handle_server_channels))
-            .route("/clients", get(handle_clients))
-            .route("/clients/{client_id}", get(handle_client_by_id))
-            .route("/clients/{client_id}/channels", get(handle_client_channels))
-            .route("/sv1/clients", get(handle_sv1_clients))
-            .route("/sv1/clients/{client_id}", get(handle_sv1_client_by_id));
+            .route(routes::segments::HEALTH, get(handle_health))
+            .route(routes::segments::GLOBAL, get(handle_global))
+            .route(routes::segments::SERVER, get(handle_server))
+            .route(
+                routes::segments::SERVER_CHANNELS,
+                get(handle_server_channels),
+            )
+            .route(routes::segments::CLIENTS, get(handle_clients))
+            .route(routes::segments::CLIENT_BY_ID, get(handle_client_by_id))
+            .route(
+                routes::segments::CLIENT_CHANNELS,
+                get(handle_client_channels),
+            )
+            .route(routes::segments::SV1_CLIENTS, get(handle_sv1_clients))
+            .route(
+                routes::segments::SV1_CLIENT_BY_ID,
+                get(handle_sv1_client_by_id),
+            );
 
         let app = Router::new()
-            .route("/", get(handle_root))
-            .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-            .nest("/api/v1", api_v1)
-            .route("/metrics", get(handle_prometheus_metrics))
+            .route(routes::ROOT, get(handle_root))
+            .merge(SwaggerUi::new(routes::SWAGGER_UI).url(routes::OPENAPI_SPEC, ApiDoc::openapi()))
+            .nest(routes::API_V1_PREFIX, api_v1)
+            .route(routes::METRICS, get(handle_prometheus_metrics))
             .with_state(self.state);
 
         info!(
@@ -290,92 +303,141 @@ impl MonitoringServer {
     }
 }
 
-// Response types - used for both actual responses and OpenAPI documentation
-#[derive(serde::Serialize, ToSchema)]
-struct HealthResponse {
-    status: String,
-    timestamp: u64,
+// Response types — used for both actual responses, OpenAPI documentation,
+// and as the canonical types for JSON deserialization in tests (both
+// in-crate unit tests and downstream integration tests).
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct HealthResponse {
+    pub status: String,
+    pub timestamp: u64,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct ErrorResponse {
-    error: String,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct ServerResponse {
-    extended_channels_count: usize,
-    standard_channels_count: usize,
-    total_hashrate: f32,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct ServerResponse {
+    pub extended_channels_count: usize,
+    pub standard_channels_count: usize,
+    pub total_hashrate: f32,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct ServerChannelsResponse {
-    offset: usize,
-    limit: usize,
-    total_extended: usize,
-    total_standard: usize,
-    extended_channels: Vec<ServerExtendedChannelInfo>,
-    standard_channels: Vec<ServerStandardChannelInfo>,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct ServerChannelsResponse {
+    pub offset: usize,
+    pub limit: usize,
+    pub total_extended: usize,
+    pub total_standard: usize,
+    pub extended_channels: Vec<ServerExtendedChannelInfo>,
+    pub standard_channels: Vec<ServerStandardChannelInfo>,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct Sv2ClientsResponse {
-    offset: usize,
-    limit: usize,
-    total: usize,
-    items: Vec<Sv2ClientMetadata>,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct Sv2ClientsResponse {
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub items: Vec<Sv2ClientMetadata>,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct Sv2ClientResponse {
-    client_id: usize,
-    extended_channels_count: usize,
-    standard_channels_count: usize,
-    total_hashrate: f32,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct Sv2ClientResponse {
+    pub client_id: usize,
+    pub extended_channels_count: usize,
+    pub standard_channels_count: usize,
+    pub total_hashrate: f32,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct Sv2ClientChannelsResponse {
-    client_id: usize,
-    offset: usize,
-    limit: usize,
-    total_extended: usize,
-    total_standard: usize,
-    extended_channels: Vec<ExtendedChannelInfo>,
-    standard_channels: Vec<StandardChannelInfo>,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct Sv2ClientChannelsResponse {
+    pub client_id: usize,
+    pub offset: usize,
+    pub limit: usize,
+    pub total_extended: usize,
+    pub total_standard: usize,
+    pub extended_channels: Vec<ExtendedChannelInfo>,
+    pub standard_channels: Vec<StandardChannelInfo>,
 }
 
-#[derive(serde::Serialize, ToSchema)]
-struct Sv1ClientsResponse {
-    offset: usize,
-    limit: usize,
-    total: usize,
-    items: Vec<Sv1ClientInfo>,
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct Sv1ClientsResponse {
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub items: Vec<Sv1ClientInfo>,
+}
+
+/// Response shape for the root `/` endpoint: a service banner plus a map of
+/// available endpoints to their human-readable descriptions.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct RootResponse {
+    pub service: String,
+    pub version: String,
+    pub endpoints: std::collections::BTreeMap<String, String>,
 }
 
 /// Root endpoint - lists all available APIs
-async fn handle_root() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "service": "SRI Monitoring API",
-        "version": "0.1.0",
-        "endpoints": {
-            "/": "This endpoint - API listing",
-            "/swagger-ui": "Swagger UI (interactive API documentation)",
-            "/api-docs/openapi.json": "OpenAPI specification",
-            "/api/v1/health": "Health check",
-            "/api/v1/global": "Global statistics",
-            "/api/v1/server": "Server metadata",
-            "/api/v1/server/channels": "Server channels (paginated)",
-            "/api/v1/clients": "All Sv2 clients metadata (paginated)",
-            "/api/v1/clients/{id}": "Single Sv2 client metadata",
-            "/api/v1/clients/{id}/channels": "Sv2 client channels (paginated)",
-            "/api/v1/sv1/clients": "Sv1 clients (Translator Proxy only, paginated)",
-            "/api/v1/sv1/clients/{id}": "Single Sv1 client (Translator Proxy only)",
-            "/metrics": "Prometheus metrics"
-        }
-    }))
+async fn handle_root() -> Json<RootResponse> {
+    let mut endpoints = std::collections::BTreeMap::new();
+    endpoints.insert(
+        routes::ROOT.to_string(),
+        "This endpoint - API listing".to_string(),
+    );
+    endpoints.insert(
+        routes::SWAGGER_UI.to_string(),
+        "Swagger UI (interactive API documentation)".to_string(),
+    );
+    endpoints.insert(
+        routes::OPENAPI_SPEC.to_string(),
+        "OpenAPI specification".to_string(),
+    );
+    endpoints.insert(routes::HEALTH.to_string(), "Health check".to_string());
+    endpoints.insert(routes::GLOBAL.to_string(), "Global statistics".to_string());
+    endpoints.insert(routes::SERVER.to_string(), "Server metadata".to_string());
+    endpoints.insert(
+        routes::SERVER_CHANNELS.to_string(),
+        "Server channels (paginated)".to_string(),
+    );
+    endpoints.insert(
+        routes::CLIENTS.to_string(),
+        "All Sv2 clients metadata (paginated)".to_string(),
+    );
+    endpoints.insert(
+        routes::CLIENT_BY_ID_PATTERN.to_string(),
+        "Single Sv2 client metadata".to_string(),
+    );
+    endpoints.insert(
+        routes::CLIENT_CHANNELS_PATTERN.to_string(),
+        "Sv2 client channels (paginated)".to_string(),
+    );
+    endpoints.insert(
+        routes::SV1_CLIENTS.to_string(),
+        "Sv1 clients (Translator Proxy only, paginated)".to_string(),
+    );
+    endpoints.insert(
+        routes::SV1_CLIENT_BY_ID_PATTERN.to_string(),
+        "Single Sv1 client (Translator Proxy only)".to_string(),
+    );
+    endpoints.insert(
+        routes::METRICS.to_string(),
+        "Prometheus metrics".to_string(),
+    );
+
+    // Pull title/version from the OpenAPI spec so the `/` listing, the
+    // OpenAPI document, and Swagger UI always agree.
+    let info = ApiDoc::openapi().info;
+    Json(RootResponse {
+        service: info.title,
+        version: info.version,
+        endpoints,
+    })
 }
+
+// Note: the `path = "..."` arguments to `#[utoipa::path(...)]` below must be
+// string literals — utoipa parses them at macro-expansion time and does not
+// accept `const` references. They must be kept in sync with `routes::*`.
 
 /// Health check endpoint
 #[utoipa::path(
@@ -784,6 +846,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitoring::server::ServerInfo;
     use axum::body::Body;
     use http_body_util::BodyExt;
     use std::{collections::HashMap, sync::Mutex};
@@ -792,11 +855,8 @@ mod tests {
 
     // ── helpers ──────────────────────────────────────────────────────
 
-    fn create_extended_channel_info(
-        channel_id: u32,
-        hashrate: f32,
-    ) -> super::super::client::ExtendedChannelInfo {
-        super::super::client::ExtendedChannelInfo {
+    fn create_extended_channel_info(channel_id: u32, hashrate: f32) -> ExtendedChannelInfo {
+        ExtendedChannelInfo {
             channel_id,
             user_identity: format!("user-ext-{}", channel_id),
             nominal_hashrate: hashrate,
@@ -820,11 +880,8 @@ mod tests {
         }
     }
 
-    fn create_standard_channel_info(
-        channel_id: u32,
-        hashrate: f32,
-    ) -> super::super::client::StandardChannelInfo {
-        super::super::client::StandardChannelInfo {
+    fn create_standard_channel_info(channel_id: u32, hashrate: f32) -> StandardChannelInfo {
+        StandardChannelInfo {
             channel_id,
             user_identity: format!("user-std-{}", channel_id),
             nominal_hashrate: hashrate,
@@ -913,22 +970,22 @@ mod tests {
         }
     }
 
-    struct MockServer(super::super::server::ServerInfo);
+    struct MockServer(ServerInfo);
     impl ServerMonitoring for MockServer {
-        fn get_server(&self) -> super::super::server::ServerInfo {
+        fn get_server(&self) -> ServerInfo {
             self.0.clone()
         }
     }
 
     struct MockClients(Vec<Sv2ClientInfo>);
-    impl super::super::client::Sv2ClientsMonitoring for MockClients {
+    impl Sv2ClientsMonitoring for MockClients {
         fn get_sv2_clients(&self) -> Vec<Sv2ClientInfo> {
             self.0.clone()
         }
     }
 
     struct MockSv1Clients(Vec<Sv1ClientInfo>);
-    impl super::super::sv1::Sv1ClientsMonitoring for MockSv1Clients {
+    impl Sv1ClientsMonitoring for MockSv1Clients {
         fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
             self.0.clone()
         }
@@ -937,8 +994,8 @@ mod tests {
     /// Build a full Router with mock data for integration testing.
     fn build_test_app(
         server: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
-        clients: Option<Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>>,
-        sv1: Option<Arc<dyn super::super::sv1::Sv1ClientsMonitoring + Send + Sync>>,
+        clients: Option<Arc<dyn Sv2ClientsMonitoring + Send + Sync>>,
+        sv1: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync>>,
     ) -> Router {
         let has_server = server.is_some();
         let has_clients = clients.is_some();
@@ -975,20 +1032,29 @@ mod tests {
         };
 
         let api_v1 = Router::new()
-            .route("/health", get(handle_health))
-            .route("/global", get(handle_global))
-            .route("/server", get(handle_server))
-            .route("/server/channels", get(handle_server_channels))
-            .route("/clients", get(handle_clients))
-            .route("/clients/{client_id}", get(handle_client_by_id))
-            .route("/clients/{client_id}/channels", get(handle_client_channels))
-            .route("/sv1/clients", get(handle_sv1_clients))
-            .route("/sv1/clients/{client_id}", get(handle_sv1_client_by_id));
+            .route(routes::segments::HEALTH, get(handle_health))
+            .route(routes::segments::GLOBAL, get(handle_global))
+            .route(routes::segments::SERVER, get(handle_server))
+            .route(
+                routes::segments::SERVER_CHANNELS,
+                get(handle_server_channels),
+            )
+            .route(routes::segments::CLIENTS, get(handle_clients))
+            .route(routes::segments::CLIENT_BY_ID, get(handle_client_by_id))
+            .route(
+                routes::segments::CLIENT_CHANNELS,
+                get(handle_client_channels),
+            )
+            .route(routes::segments::SV1_CLIENTS, get(handle_sv1_clients))
+            .route(
+                routes::segments::SV1_CLIENT_BY_ID,
+                get(handle_sv1_client_by_id),
+            );
 
         Router::new()
-            .route("/", get(handle_root))
-            .nest("/api/v1", api_v1)
-            .route("/metrics", get(handle_prometheus_metrics))
+            .route(routes::ROOT, get(handle_root))
+            .nest(routes::API_V1_PREFIX, api_v1)
+            .route(routes::METRICS, get(handle_prometheus_metrics))
             .with_state(state)
     }
 
@@ -1087,25 +1153,24 @@ mod tests {
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
         let app = build_test_app(None, None, None);
-        let response = app.oneshot(make_request("/api/v1/health")).await.unwrap();
+        let response = app.oneshot(make_request(routes::HEALTH)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["status"], "ok");
-        assert!(json["timestamp"].as_u64().is_some());
+        let resp: HealthResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "ok");
     }
 
     #[tokio::test]
     async fn root_endpoint_lists_endpoints() {
         let app = build_test_app(None, None, None);
-        let response = app.oneshot(make_request("/")).await.unwrap();
+        let response = app.oneshot(make_request(routes::ROOT)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["service"], "SRI Monitoring API");
-        assert!(json["endpoints"].is_object());
+        let resp: RootResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.service, ApiDoc::openapi().info.title);
+        assert!(resp.endpoints.contains_key(routes::HEALTH));
     }
 
     #[tokio::test]
@@ -1127,19 +1192,18 @@ mod tests {
     #[tokio::test]
     async fn global_endpoint_with_no_sources() {
         let app = build_test_app(None, None, None);
-        let response = app.oneshot(make_request("/api/v1/global")).await.unwrap();
+        let response = app.oneshot(make_request(routes::GLOBAL)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(json["server"].is_null());
-        assert!(json["sv2_clients"].is_null());
-        assert!(json["uptime_secs"].as_u64().is_some());
+        let resp: GlobalInfo = serde_json::from_str(&body).unwrap();
+        assert!(resp.server.is_none());
+        assert!(resp.sv2_clients.is_none());
     }
 
     #[tokio::test]
     async fn global_endpoint_with_data() {
-        let server = Arc::new(MockServer(super::super::server::ServerInfo {
+        let server = Arc::new(MockServer(ServerInfo {
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![],
         }));
@@ -1151,28 +1215,28 @@ mod tests {
 
         let app = build_test_app(
             Some(server as Arc<dyn ServerMonitoring + Send + Sync>),
-            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             None,
         );
-        let response = app.oneshot(make_request("/api/v1/global")).await.unwrap();
+        let response = app.oneshot(make_request(routes::GLOBAL)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["server"]["extended_channels"], 1);
-        assert_eq!(json["sv2_clients"]["total_clients"], 1);
+        let resp: GlobalInfo = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.server.as_ref().unwrap().extended_channels, 1);
+        assert_eq!(resp.sv2_clients.as_ref().unwrap().total_clients, 1);
     }
 
     #[tokio::test]
     async fn server_endpoint_not_available() {
         let app = build_test_app(None, None, None);
-        let response = app.oneshot(make_request("/api/v1/server")).await.unwrap();
+        let response = app.oneshot(make_request(routes::SERVER)).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn server_endpoint_with_data() {
-        let server = Arc::new(MockServer(super::super::server::ServerInfo {
+        let server = Arc::new(MockServer(ServerInfo {
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![create_server_standard_channel_info(2, Some(50.0))],
         }));
@@ -1182,18 +1246,18 @@ mod tests {
             None,
             None,
         );
-        let response = app.oneshot(make_request("/api/v1/server")).await.unwrap();
+        let response = app.oneshot(make_request(routes::SERVER)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["extended_channels_count"], 1);
-        assert_eq!(json["standard_channels_count"], 1);
+        let resp: ServerResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.extended_channels_count, 1);
+        assert_eq!(resp.standard_channels_count, 1);
     }
 
     #[tokio::test]
     async fn server_channels_endpoint_with_pagination() {
-        let server = Arc::new(MockServer(super::super::server::ServerInfo {
+        let server = Arc::new(MockServer(ServerInfo {
             extended_channels: vec![
                 create_server_extended_channel_info(1, Some(100.0)),
                 create_server_extended_channel_info(2, Some(200.0)),
@@ -1208,22 +1272,25 @@ mod tests {
             None,
         );
         let response = app
-            .oneshot(make_request("/api/v1/server/channels?offset=1&limit=1"))
+            .oneshot(make_request(&format!(
+                "{}?offset=1&limit=1",
+                routes::SERVER_CHANNELS
+            )))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["total_extended"], 3);
-        assert_eq!(json["offset"], 1);
-        assert_eq!(json["limit"], 1);
-        assert_eq!(json["extended_channels"].as_array().unwrap().len(), 1);
+        let resp: ServerChannelsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.total_extended, 3);
+        assert_eq!(resp.offset, 1);
+        assert_eq!(resp.limit, 1);
+        assert_eq!(resp.extended_channels.len(), 1);
     }
 
     #[tokio::test]
     async fn server_channels_endpoint_keeps_rejected_shares_total_compatible() {
-        let server = Arc::new(MockServer(super::super::server::ServerInfo {
+        let server = Arc::new(MockServer(ServerInfo {
             extended_channels: vec![],
             standard_channels: vec![create_server_standard_channel_info(1, Some(50.0))],
         }));
@@ -1234,7 +1301,7 @@ mod tests {
             None,
         );
         let response = app
-            .oneshot(make_request("/api/v1/server/channels"))
+            .oneshot(make_request(routes::SERVER_CHANNELS))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1253,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn clients_endpoint_not_available() {
         let app = build_test_app(None, None, None);
-        let response = app.oneshot(make_request("/api/v1/clients")).await.unwrap();
+        let response = app.oneshot(make_request(routes::CLIENTS)).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1274,17 +1341,17 @@ mod tests {
 
         let app = build_test_app(
             None,
-            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             None,
         );
-        let response = app.oneshot(make_request("/api/v1/clients")).await.unwrap();
+        let response = app.oneshot(make_request(routes::CLIENTS)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["total"], 2);
-        assert_eq!(json["items"].as_array().unwrap().len(), 2);
-        assert_eq!(json["items"][0]["client_id"], 1);
+        let resp: Sv2ClientsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.items.len(), 2);
+        assert_eq!(resp.items[0].client_id, 1);
     }
 
     #[tokio::test]
@@ -1297,20 +1364,20 @@ mod tests {
 
         let app = build_test_app(
             None,
-            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             None,
         );
         let response = app
-            .oneshot(make_request("/api/v1/clients/42"))
+            .oneshot(make_request(&routes::client_by_id(42)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["client_id"], 42);
-        assert_eq!(json["extended_channels_count"], 1);
-        assert_eq!(json["standard_channels_count"], 1);
+        let resp: Sv2ClientResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.client_id, 42);
+        assert_eq!(resp.extended_channels_count, 1);
+        assert_eq!(resp.standard_channels_count, 1);
     }
 
     #[tokio::test]
@@ -1323,11 +1390,11 @@ mod tests {
 
         let app = build_test_app(
             None,
-            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             None,
         );
         let response = app
-            .oneshot(make_request("/api/v1/clients/999"))
+            .oneshot(make_request(&routes::client_by_id(999)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1347,27 +1414,31 @@ mod tests {
 
         let app = build_test_app(
             None,
-            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             None,
         );
         let response = app
-            .oneshot(make_request("/api/v1/clients/1/channels?offset=1&limit=2"))
+            .oneshot(make_request(&format!(
+                "{}?offset=1&limit=2",
+                routes::client_channels(1)
+            )))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["client_id"], 1);
-        assert_eq!(json["total_extended"], 3);
-        assert_eq!(json["extended_channels"].as_array().unwrap().len(), 2);
+        let resp: Sv2ClientChannelsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.client_id, 1);
+        assert_eq!(resp.total_extended, 3);
+        assert_eq!(resp.total_standard, 1);
+        assert_eq!(resp.extended_channels.len(), 2);
     }
 
     #[tokio::test]
     async fn sv1_clients_not_available() {
         let app = build_test_app(None, None, None);
         let response = app
-            .oneshot(make_request("/api/v1/sv1/clients"))
+            .oneshot(make_request(routes::SV1_CLIENTS))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1383,18 +1454,18 @@ mod tests {
         let app = build_test_app(
             None,
             None,
-            Some(sv1 as Arc<dyn super::super::sv1::Sv1ClientsMonitoring + Send + Sync>),
+            Some(sv1 as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
         );
         let response = app
-            .oneshot(make_request("/api/v1/sv1/clients"))
+            .oneshot(make_request(routes::SV1_CLIENTS))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["total"], 2);
-        assert_eq!(json["items"].as_array().unwrap().len(), 2);
+        let resp: Sv1ClientsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.total, 2);
+        assert_eq!(resp.items.len(), 2);
     }
 
     #[tokio::test]
@@ -1404,17 +1475,17 @@ mod tests {
         let app = build_test_app(
             None,
             None,
-            Some(sv1 as Arc<dyn super::super::sv1::Sv1ClientsMonitoring + Send + Sync>),
+            Some(sv1 as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
         );
         let response = app
-            .oneshot(make_request("/api/v1/sv1/clients/7"))
+            .oneshot(make_request(&routes::sv1_client_by_id(7)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["client_id"], 7);
+        let resp: Sv1ClientInfo = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.client_id, 7);
     }
 
     #[tokio::test]
@@ -1424,10 +1495,10 @@ mod tests {
         let app = build_test_app(
             None,
             None,
-            Some(sv1 as Arc<dyn super::super::sv1::Sv1ClientsMonitoring + Send + Sync>),
+            Some(sv1 as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
         );
         let response = app
-            .oneshot(make_request("/api/v1/sv1/clients/999"))
+            .oneshot(make_request(&routes::sv1_client_by_id(999)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1435,7 +1506,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_returns_prometheus_format() {
-        let server = Arc::new(MockServer(super::super::server::ServerInfo {
+        let server = Arc::new(MockServer(ServerInfo {
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![],
         }));
@@ -1447,10 +1518,10 @@ mod tests {
 
         let app = build_test_app(
             Some(server as Arc<dyn ServerMonitoring + Send + Sync>),
-            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             None,
         );
-        let response = app.oneshot(make_request("/metrics")).await.unwrap();
+        let response = app.oneshot(make_request(routes::METRICS)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
@@ -1462,7 +1533,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_with_no_sources() {
         let app = build_test_app(None, None, None);
-        let response = app.oneshot(make_request("/metrics")).await.unwrap();
+        let response = app.oneshot(make_request(routes::METRICS)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = get_body(response).await;
@@ -1475,7 +1546,7 @@ mod tests {
 
     // Mutable mock that allows changing data between requests
     struct MutableMockClients(Mutex<Vec<Sv2ClientInfo>>);
-    impl super::super::client::Sv2ClientsMonitoring for MutableMockClients {
+    impl Sv2ClientsMonitoring for MutableMockClients {
         fn get_sv2_clients(&self) -> Vec<Sv2ClientInfo> {
             self.0.lock().unwrap().clone()
         }
@@ -1506,8 +1577,7 @@ mod tests {
             SnapshotCache::new(
                 Duration::from_secs(60),
                 None,
-                Some(mock_clients.clone()
-                    as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+                Some(mock_clients.clone() as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
             )
             .with_metrics(metrics.clone()),
         );
@@ -1525,11 +1595,15 @@ mod tests {
         };
 
         let app = Router::new()
-            .route("/metrics", get(handle_prometheus_metrics))
+            .route(routes::METRICS, get(handle_prometheus_metrics))
             .with_state(state);
 
         // First scrape — both channels present
-        let response = app.clone().oneshot(make_request("/metrics")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(make_request(routes::METRICS))
+            .await
+            .unwrap();
         let body = get_body(response).await;
         // Prometheus sorts label keys alphabetically: channel_id, client_id, user_identity
         assert!(
@@ -1553,7 +1627,11 @@ mod tests {
         cache.refresh();
 
         // Second scrape — channel 2 should be removed, channel 1 still present
-        let response = app.clone().oneshot(make_request("/metrics")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(make_request(routes::METRICS))
+            .await
+            .unwrap();
         let body = get_body(response).await;
         assert!(
             body.contains("sv2_client_shares_accepted_total{channel_id=\"1\",client_id=\"1\""),
@@ -1606,7 +1684,7 @@ mod tests {
             None,
         );
 
-        let response = app.oneshot(make_request("/metrics")).await.unwrap();
+        let response = app.oneshot(make_request(routes::METRICS)).await.unwrap();
         let body = get_body(response).await;
 
         // Both metrics MUST appear with the spec-defined error_code labels pre-seeded to 0.
@@ -1622,5 +1700,194 @@ mod tests {
             body.contains("sv2_client_shares_rejected_total{channel_id=\"1\",client_id=\"1\",error_code=\"stale-share\""),
             "sv2_client_shares_rejected_total stale-share label must be pre-seeded to 0; got:\n{body}"
         );
+    }
+
+    // ── Edge-case unit tests (pagination, missing data, invalid params) ──
+
+    #[test]
+    fn paginate_with_limit_zero() {
+        // effective_limit(Some(0)) = 0.min(MAX_LIMIT) = 0, so take(0) returns nothing
+        let items: Vec<i32> = (0..50).collect();
+        let params = Pagination {
+            offset: 0,
+            limit: Some(0),
+        };
+        let (total, result) = paginate(&items, &params);
+        assert_eq!(total, 50);
+        assert!(result.is_empty(), "limit=0 should return no items");
+    }
+
+    #[tokio::test]
+    async fn server_channels_not_available() {
+        let app = build_test_app(None, None, None);
+        let response = app
+            .oneshot(make_request(routes::SERVER_CHANNELS))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = get_body(response).await;
+        let resp: ErrorResponse = serde_json::from_str(&body).unwrap();
+        assert!(!resp.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_by_id_no_monitoring() {
+        // When client monitoring is not available at all, any client_id returns 404
+        let app = build_test_app(None, None, None);
+        let response = app
+            .oneshot(make_request(&routes::client_by_id(1)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = get_body(response).await;
+        let resp: ErrorResponse = serde_json::from_str(&body).unwrap();
+        assert!(!resp.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_channels_client_not_found() {
+        // Client monitoring is available but the specific client_id does not exist
+        let clients = Arc::new(MockClients(vec![Sv2ClientInfo {
+            client_id: 1,
+            extended_channels: vec![],
+            standard_channels: vec![],
+        }]));
+
+        let app = build_test_app(
+            None,
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
+            None,
+        );
+        let response = app
+            .oneshot(make_request(&routes::client_channels(999)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = get_body(response).await;
+        let resp: ErrorResponse = serde_json::from_str(&body).unwrap();
+        assert!(resp.error.contains("999"));
+    }
+
+    #[tokio::test]
+    async fn client_channels_no_monitoring() {
+        // When client monitoring is not available at all
+        let app = build_test_app(None, None, None);
+        let response = app
+            .oneshot(make_request(&routes::client_channels(1)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sv1_client_by_id_no_monitoring() {
+        // When SV1 monitoring is not available at all
+        let app = build_test_app(None, None, None);
+        let response = app
+            .oneshot(make_request(&routes::sv1_client_by_id(1)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = get_body(response).await;
+        let resp: ErrorResponse = serde_json::from_str(&body).unwrap();
+        assert!(!resp.error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clients_pagination_offset_and_limit() {
+        let clients = Arc::new(MockClients(vec![
+            Sv2ClientInfo {
+                client_id: 1,
+                extended_channels: vec![create_extended_channel_info(1, 100.0)],
+                standard_channels: vec![],
+            },
+            Sv2ClientInfo {
+                client_id: 2,
+                extended_channels: vec![],
+                standard_channels: vec![create_standard_channel_info(1, 50.0)],
+            },
+            Sv2ClientInfo {
+                client_id: 3,
+                extended_channels: vec![create_extended_channel_info(2, 200.0)],
+                standard_channels: vec![],
+            },
+        ]));
+
+        let app = build_test_app(
+            None,
+            Some(clients as Arc<dyn Sv2ClientsMonitoring + Send + Sync>),
+            None,
+        );
+        let response = app
+            .oneshot(make_request(&format!(
+                "{}?offset=1&limit=1",
+                routes::CLIENTS
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = get_body(response).await;
+        let resp: Sv2ClientsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.total, 3);
+        assert_eq!(resp.offset, 1);
+        assert_eq!(resp.limit, 1);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].client_id, 2);
+    }
+
+    #[tokio::test]
+    async fn sv1_clients_pagination() {
+        let sv1 = Arc::new(MockSv1Clients(vec![
+            create_sv1_client_info(1, Some(100.0)),
+            create_sv1_client_info(2, Some(200.0)),
+            create_sv1_client_info(3, Some(300.0)),
+        ]));
+
+        let app = build_test_app(
+            None,
+            None,
+            Some(sv1 as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let response = app
+            .oneshot(make_request(&format!(
+                "{}?offset=2&limit=10",
+                routes::SV1_CLIENTS
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = get_body(response).await;
+        let resp: Sv1ClientsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.total, 3);
+        assert_eq!(resp.offset, 2);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].client_id, 3);
+    }
+
+    #[tokio::test]
+    async fn global_endpoint_with_sv1_data() {
+        let sv1 = Arc::new(MockSv1Clients(vec![create_sv1_client_info(1, Some(100.0))]));
+
+        let app = build_test_app(
+            None,
+            None,
+            Some(sv1 as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let response = app.oneshot(make_request(routes::GLOBAL)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = get_body(response).await;
+        let resp: GlobalInfo = serde_json::from_str(&body).unwrap();
+        // Server and SV2 clients should be None
+        assert!(resp.server.is_none());
+        assert!(resp.sv2_clients.is_none());
+        // SV1 clients should be present
+        assert_eq!(resp.sv1_clients.as_ref().unwrap().total_clients, 1);
     }
 }

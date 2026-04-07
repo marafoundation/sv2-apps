@@ -12,6 +12,7 @@
 pub mod client;
 pub mod http_server;
 pub mod prometheus_metrics;
+pub mod routes;
 pub mod server;
 pub mod snapshot_cache;
 pub mod sv1;
@@ -20,7 +21,11 @@ pub use client::{
     ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
     Sv2ClientsMonitoring, Sv2ClientsSummary,
 };
-pub use http_server::MonitoringServer;
+pub use http_server::{
+    ErrorResponse, HealthResponse, MonitoringServer, RootResponse, ServerChannelsResponse,
+    ServerResponse, Sv1ClientsResponse, Sv2ClientChannelsResponse, Sv2ClientResponse,
+    Sv2ClientsResponse,
+};
 pub use server::{
     ServerExtendedChannelInfo, ServerInfo, ServerMonitoring, ServerStandardChannelInfo,
     ServerSummary,
@@ -28,6 +33,7 @@ pub use server::{
 pub use snapshot_cache::{MonitoringSnapshot, SnapshotCache};
 pub use sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary};
 
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// Global statistics from `/api/v1/global` endpoint
@@ -38,7 +44,7 @@ use utoipa::ToSchema;
 /// Typical configurations:
 /// - **Pool/JDC**: `server` and `sv2_clients` are `Some`, `sv1_clients` is `None`
 /// - **tProxy**: `server` and `sv1_clients` are `Some`, `sv2_clients` is `None`
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GlobalInfo {
     /// Server (upstream) summary - `None` if server monitoring is not enabled
     pub server: Option<ServerSummary>,
