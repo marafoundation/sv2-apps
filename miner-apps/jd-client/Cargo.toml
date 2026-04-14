@@ -1,6 +1,6 @@
 [package]
 name = "jd_client_sv2"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["The Stratum V2 Developers"]
 edition = "2021"
 description = "Job Declarator Client (JDC) role"

@@ -20,9 +20,8 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    error::{self, PoolError, PoolErrorKind, PoolResult},
+    error::{self, Action, PoolError, PoolErrorKind, PoolResult},
     io_task::spawn_io_tasks,
-    status::{handle_error, Status, StatusSender},
     utils::get_setup_connection_message_tp,
 };
 
@@ -144,11 +143,8 @@ impl Sv2Tp {
         mut self,
         socket_address: String,
         cancellation_token: CancellationToken,
-        status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
     ) -> PoolResult<(), error::TemplateProvider> {
-        let status_sender = StatusSender::TemplateReceiver(status_sender);
-
         info!("Initialized state for starting template receiver");
         self.setup_connection(socket_address).await?;
 
@@ -165,16 +161,30 @@ impl Sv2Tp {
                     res = self_clone_1.handle_template_provider_message() => {
                         if let Err(e) = res {
                             error!("TemplateReceiver template provider handler failed: {e:?}");
-                            if handle_error(&status_sender, e).await {
-                                break;
+                            match e.action {
+                                Action::Shutdown => {
+                                    cancellation_token.cancel();
+                                    break;
+                                }
+                                Action::Log => {
+                                    warn!("Log-only error from Template Provider: {:?}", e.kind);
+                                }
+                                _ => {}
                             }
                         }
                     }
                     res = self_clone_2.handle_channel_manager_message() => {
                         if let Err(e) = res {
                             error!("TemplateReceiver channel manager handler failed: {e:?}");
-                            if handle_error(&status_sender, e).await {
-                                break;
+                            match e.action {
+                                Action::Shutdown => {
+                                    cancellation_token.cancel();
+                                    break;
+                                }
+                                Action::Log => {
+                                    warn!("Log-only error from Template Provider: {:?}", e.kind);
+                                }
+                                _ => {}
                             }
                         }
                     },

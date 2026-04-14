@@ -1,6 +1,6 @@
 [package]
 name = "translator_sv2"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["The Stratum V2 Developers"]
 edition = "2021"
 description = "SV1 to SV2 translation proxy"

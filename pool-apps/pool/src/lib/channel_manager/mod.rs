@@ -45,8 +45,7 @@ use jd_server_sv2::job_declarator::JobDeclarator;
 use crate::{
     config::PoolConfig,
     downstream::Downstream,
-    error::{self, PoolError, PoolErrorKind, PoolResult},
-    status::{handle_error, Status, StatusSender},
+    error::{self, Action, PoolError, PoolErrorKind, PoolResult},
     utils::DownstreamMessage,
 };
 
@@ -234,7 +233,6 @@ impl ChannelManager {
         listening_address: SocketAddr,
         task_manager: Arc<TaskManager>,
         cancellation_token: CancellationToken,
-        status_sender: Sender<Status>,
         channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
     ) -> PoolResult<(), error::ChannelManager> {
         // todo: let start_downstream_server accept Arc, instead of clone.
@@ -286,11 +284,11 @@ impl ChannelManager {
 
                                 let this = Arc::clone(&this);
                                 let cancellation_token_inner = cancellation_token_clone.clone();
-                                let status_sender_inner = status_sender.clone();
                                 let channel_manager_sender_inner = channel_manager_sender.clone();
                                 let task_manager_inner = task_manager_clone.clone();
 
                                 task_manager_clone.spawn(async move {
+                                    let cancellation_token_clone = cancellation_token_inner.clone();
                                     let noise_stream = tokio::select! {
                                         result = accept_noise_connection(stream, authority_public_key, authority_secret_key, cert_validity_sec) => {
                                             match result {
@@ -317,8 +315,7 @@ impl ChannelManager {
                                         Some(group_channel) => group_channel,
                                         None => {
                                             error!("Failed to bootstrap group channel - disconnecting downstream {downstream_id}");
-                                            let error = PoolError::<error::ChannelManager>::shutdown(PoolErrorKind::CouldNotInitiateSystem);
-                                            handle_error(&StatusSender::ChannelManager(status_sender_inner), error).await;
+                                            cancellation_token_clone.cancel();
                                             return;
                                         }
                                     };
@@ -347,8 +344,8 @@ impl ChannelManager {
                                     downstream
                                         .start(
                                             cancellation_token_inner,
-                                            status_sender_inner,
                                             task_manager_inner,
+                                            move |downstream_id| this.remove_downstream(downstream_id)
                                         )
                                         .await;
                                 });
@@ -374,12 +371,9 @@ impl ChannelManager {
     pub async fn start(
         self,
         cancellation_token: CancellationToken,
-        status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
         coinbase_outputs: Vec<TxOut>,
     ) -> PoolResult<(), error::ChannelManager> {
-        let status_sender = StatusSender::ChannelManager(status_sender);
-
         self.coinbase_output_constraints(coinbase_outputs).await?;
 
         task_manager.spawn(async move {
@@ -400,16 +394,34 @@ impl ChannelManager {
                     res = cm_template.handle_template_provider_message() => {
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Template Receiver message");
-                            if handle_error(&status_sender, e).await {
-                                break;
+                            match e.action {
+                                Action::Shutdown => {
+                                   cancellation_token.cancel();
+                                    break;
+                                }
+                                Action::Disconnect(downstream_id) => {
+                                    cm_downstreams.remove_downstream(downstream_id);
+                                }
+                                Action::Log => {
+                                    warn!("Log-only error from channel manager: {:?}", e.kind);
+                                }
                             }
                         }
                     }
                     res = cm_downstreams.handle_downstream_mining_message() => {
                         if let Err(e) = res {
                             error!(error = ?e, "Error handling Downstreams message");
-                            if handle_error(&status_sender, e).await {
-                                break;
+                            match e.action {
+                                Action::Shutdown => {
+                                   cancellation_token.cancel();
+                                    break;
+                                }
+                                Action::Disconnect(downstream_id) => {
+                                    cm_downstreams.remove_downstream(downstream_id);
+                                }
+                                Action::Log => {
+                                    warn!("Log-only error from channel manager: {:?}", e.kind);
+                                }
                             }
                         }
                     }
@@ -424,11 +436,7 @@ impl ChannelManager {
     // Given a `downstream_id`, this method:
     // 1. Removes the corresponding Downstream from the `downstream` map.
     // 2. Removes the channels of the corresponding Downstream from `vardiff` map.
-    #[allow(clippy::result_large_err)]
-    pub fn remove_downstream(
-        &self,
-        downstream_id: DownstreamId,
-    ) -> PoolResult<(), error::ChannelManager> {
+    pub fn remove_downstream(&self, downstream_id: DownstreamId) {
         self.channel_manager_data.super_safe_lock(|cm_data| {
             cm_data.downstream.remove(&downstream_id);
             cm_data
@@ -438,7 +446,6 @@ impl ChannelManager {
         self.channel_manager_channel
             .downstream_sender
             .super_safe_lock(|map| map.remove(&downstream_id));
-        Ok(())
     }
 
     // Handles messages received from the TP subsystem.

@@ -32,9 +32,8 @@ use stratum_apps::{
 use tracing::{debug, error, warn};
 
 use crate::{
-    error::{self, PoolError, PoolErrorKind, PoolResult},
+    error::{self, Action, PoolError, PoolErrorKind, PoolResult},
     io_task::spawn_io_tasks,
-    status::{handle_error, Status, StatusSender},
     utils::PayoutMode,
 };
 
@@ -76,10 +75,6 @@ pub struct DownstreamChannel {
     channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
     downstream_sender: Sender<Sv2Frame>,
     downstream_receiver: Receiver<Sv2Frame>,
-    /// Per-connection cancellation token (child of the global token).
-    /// Cancelled when this downstream's message loop exits, causing
-    /// the associated I/O tasks to shut down.
-    connection_token: CancellationToken,
 }
 
 /// Represents a downstream client connected to this node.
@@ -94,6 +89,10 @@ pub struct Downstream {
     pub supported_extensions: Vec<u16>,
     /// Extensions that the pool requires
     pub required_extensions: Vec<u16>,
+    /// Per-connection cancellation token (child of the global token).
+    /// Cancelled when this downstream's message loop exits, causing
+    /// the associated I/O tasks to shut down.
+    downstream_connection_token: CancellationToken,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -118,14 +117,14 @@ impl Downstream {
 
         // Create a per-connection child token so we can cancel this
         // connection's I/O tasks independently of the global shutdown.
-        let connection_token = cancellation_token.child_token();
+        let downstream_connection_token = cancellation_token.child_token();
         spawn_io_tasks(
             task_manager,
             noise_stream_reader,
             noise_stream_writer,
             outbound_rx,
             inbound_tx,
-            connection_token.clone(),
+            downstream_connection_token.clone(),
         );
 
         let downstream_channel = DownstreamChannel {
@@ -133,7 +132,6 @@ impl Downstream {
             channel_manager_sender,
             downstream_sender: outbound_tx,
             downstream_receiver: inbound_rx,
-            connection_token,
         };
 
         let downstream_data = Arc::new(Mutex::new(DownstreamData {
@@ -153,6 +151,7 @@ impl Downstream {
             requires_custom_work: Arc::new(AtomicBool::new(false)),
             supported_extensions,
             required_extensions,
+            downstream_connection_token,
         }
     }
 
@@ -165,14 +164,9 @@ impl Downstream {
     pub async fn start(
         mut self,
         cancellation_token: CancellationToken,
-        status_sender: Sender<Status>,
         task_manager: Arc<TaskManager>,
+        remove_downstream: impl FnOnce(DownstreamId) + Send + 'static,
     ) {
-        let status_sender = StatusSender::Downstream {
-            downstream_id: self.downstream_id,
-            tx: status_sender,
-        };
-
         // Setup initial connection
         if let Err(e) = self.setup_connection_with_downstream().await {
             error!(?e, "Failed to set up downstream connection");
@@ -181,7 +175,21 @@ impl Downstream {
             // before we break the TCP connection
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-            handle_error(&status_sender, e).await;
+            match e.action {
+                Action::Shutdown => {
+                    cancellation_token.cancel();
+                }
+                Action::Disconnect(_) => {
+                    self.downstream_connection_token.cancel();
+                }
+                Action::Log => {
+                    warn!(
+                        "Log-only error from downstream {}: {:?}",
+                        self.downstream_id, e.kind
+                    );
+                }
+            }
+            remove_downstream(self.downstream_id);
             return;
         }
 
@@ -198,23 +206,43 @@ impl Downstream {
                     res = self_clone_1.handle_downstream_message() => {
                         if let Err(e) = res {
                             error!(?e, "Error handling downstream message for {downstream_id}");
-                            if handle_error(&status_sender, e).await {
-                                break;
+                            match e.action {
+                                Action::Shutdown => {
+                                    cancellation_token.cancel();
+                                    break;
+                                }
+                                Action::Log => {
+                                    warn!("Log-only error from downstream {downstream_id}: {:?}", e.kind);
+                                }
+                                Action::Disconnect(_) => {
+                                    self_clone_1.downstream_connection_token.cancel();
+                                    break;
+                                }
                             }
                         }
                     }
                     res = self_clone_2.handle_channel_manager_message() => {
                         if let Err(e) = res {
                             error!(?e, "Error handling channel manager message for {downstream_id}");
-                            if handle_error(&status_sender, e).await {
-                                break;
+                            match e.action {
+                                Action::Shutdown => {
+                                    cancellation_token.cancel();
+                                    break;
+                                }
+                                Action::Log => {
+                                    warn!("Log-only error from downstream {downstream_id}: {:?}", e.kind);
+                                }
+                                Action::Disconnect(_) => {
+                                    self_clone_1.downstream_connection_token.cancel();
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
-
-            self.downstream_channel.connection_token.cancel();
+            self.downstream_connection_token.cancel();
+            remove_downstream(self.downstream_id);
             warn!("Downstream: unified message loop exited.");
         });
     }

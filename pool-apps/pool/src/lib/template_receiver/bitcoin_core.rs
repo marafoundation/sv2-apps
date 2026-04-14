@@ -1,7 +1,3 @@
-use crate::{
-    error::PoolErrorKind,
-    status::{State, Status},
-};
 use async_channel::{Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::{BitcoinCoreSv2TDP, CancellationToken};
 use std::{path::PathBuf, sync::Arc, thread::JoinHandle};
@@ -22,9 +18,9 @@ pub async fn connect_to_bitcoin_core(
     bitcoin_core_config: BitcoinCoreSv2TDPConfig,
     cancellation_token: CancellationToken,
     task_manager: Arc<TaskManager>,
-    status_sender: Sender<Status>,
 ) -> JoinHandle<()> {
     let bitcoin_core_canc_token = bitcoin_core_config.cancellation_token.clone();
+    let cancellation_token_clone = cancellation_token.clone();
 
     // spawn a task to handle shutdown signals and cancellation token activations
     task_manager.spawn(async move {
@@ -47,13 +43,7 @@ pub async fn connect_to_bitcoin_core(
             Ok(rt) => rt,
             Err(e) => {
                 tracing::error!("Failed to create Tokio runtime: {:?}", e);
-
-                // we can't use handle_error here because we're not in a async context yet
-                let _ = status_sender.send_blocking(Status {
-                    state: State::TemplateReceiverShutdown(
-                        PoolErrorKind::FailedToCreateBitcoinCoreTokioRuntime,
-                    ),
-                });
+                cancellation_token_clone.cancel();
                 return;
             }
         };
