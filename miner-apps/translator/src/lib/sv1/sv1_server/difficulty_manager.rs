@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use crate::{is_aggregated, is_non_aggregated, sv1::sv1_server::sv1_server::PendingTargetUpdate};
-
+use crate::{sv1::sv1_server::sv1_server::PendingTargetUpdate, sv1::Sv1Server};
 use stratum_apps::{
     stratum_core::{
         bitcoin::Target,
@@ -13,8 +12,6 @@ use stratum_apps::{
     utils::types::{ChannelId, DownstreamId, Hashrate},
 };
 use tracing::{debug, error, info, trace, warn};
-
-use crate::sv1::Sv1Server;
 
 enum AggregatedSnapshot {
     Active {
@@ -189,7 +186,7 @@ impl Sv1Server {
                                                                         * new_target,
                                                                         * new_hashrate) */
     ) {
-        if is_aggregated() {
+        if self.is_aggregated() {
             // Aggregated mode: Send single UpdateChannel with minimum target and total hashrate of
             // ALL downstreams
             self.send_aggregated_update_channel(all_updates).await;
@@ -303,7 +300,7 @@ impl Sv1Server {
             set_target.channel_id, new_upstream_target
         );
 
-        if is_aggregated() {
+        if self.is_aggregated() {
             return self
                 .handle_aggregated_set_target(new_upstream_target, set_target.channel_id)
                 .await;
@@ -458,7 +455,7 @@ impl Sv1Server {
     /// (e.g., disconnect). Calculates total hashrate and minimum target among all remaining
     /// downstreams.
     pub async fn send_update_channel_on_downstream_state_change(&self) {
-        if is_non_aggregated() {
+        if self.is_non_aggregated() {
             return;
         }
 

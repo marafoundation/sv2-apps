@@ -1,9 +1,9 @@
 use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
-    is_aggregated,
     status::{handle_error, Status, StatusSender},
     sv2::channel_manager::channel::ChannelState,
     utils::{AggregatedState, AtomicAggregatedState, AGGREGATED_CHANNEL_ID},
+    TproxyMode,
 };
 use async_channel::{Receiver, Sender};
 use dashmap::DashMap;
@@ -92,6 +92,10 @@ pub struct ChannelManager {
     /// Tracks whether the single upstream channel in aggregated mode is absent,
     /// being established, or connected.
     pub aggregated_channel_state: AtomicAggregatedState,
+    /// Operating mode for the translator (Aggregated or NonAggregated)
+    pub tproxy_mode: TproxyMode,
+    /// Whether to report hashrate in monitoring (true when vardiff is enabled)
+    pub report_hashrate: bool,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -103,11 +107,12 @@ impl ChannelManager {
     /// * `upstream_receiver` - Channel to receive messages from upstream
     /// * `sv1_server_sender` - Channel to send messages to SV1 server
     /// * `sv1_server_receiver` - Channel to receive messages from SV1 server
-    /// * `mode` - Operating mode (Aggregated or NonAggregated)
     /// * `supported_extensions` - Extensions that the translator supports (will request if required
     ///   by server)
     /// * `required_extensions` - Extensions that the translator requires (must be supported by
     ///   server)
+    /// * `tproxy_mode` - Operating mode for the translator
+    /// * `report_hashrate` - Whether to report hashrate in monitoring
     ///
     /// # Returns
     /// A new ChannelManager instance ready to handle message routing
@@ -120,6 +125,8 @@ impl ChannelManager {
         status_sender: Sender<Status>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        tproxy_mode: TproxyMode,
+        report_hashrate: bool,
     ) -> Self {
         let channel_state = ChannelState::new(
             upstream_sender,
@@ -140,7 +147,19 @@ impl ChannelManager {
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
             extranonce_factories: Arc::new(DashMap::new()),
             aggregated_channel_state: AtomicAggregatedState::new(AggregatedState::NoChannel),
+            tproxy_mode,
+            report_hashrate,
         }
+    }
+
+    #[inline]
+    pub fn is_aggregated(&self) -> bool {
+        self.tproxy_mode.is_aggregated()
+    }
+
+    #[inline]
+    pub fn is_non_aggregated(&self) -> bool {
+        self.tproxy_mode.is_non_aggregated()
     }
 
     /// Spawns and runs the main channel manager task loop.
@@ -309,7 +328,7 @@ impl ChannelManager {
                 let hashrate = m.nominal_hash_rate;
                 let min_extranonce_size = m.min_extranonce_size as usize;
 
-                if is_aggregated() {
+                if self.is_aggregated() {
                     match self.aggregated_channel_state.get() {
                         AggregatedState::Connected => {
                             return self
@@ -351,7 +370,7 @@ impl ChannelManager {
                     }
                 }
                 // In aggregated mode, add extra bytes for translator search space allocation
-                let upstream_min_extranonce_size = if is_aggregated() {
+                let upstream_min_extranonce_size = if self.is_aggregated() {
                     min_extranonce_size + AGGREGATED_MODE_TRANSLATOR_SEARCH_SPACE_BYTES
                 } else {
                     min_extranonce_size
@@ -364,7 +383,7 @@ impl ChannelManager {
                 // used in the `OpenExtendedMiningChannel.Success` handler.
                 // In aggregated mode it was already inserted in the `AggregatedState::NoChannel`
                 // match arm above.
-                if !is_aggregated() {
+                if !self.is_aggregated() {
                     self.pending_downstream_channels.insert(
                         open_channel_msg.request_id as DownstreamId,
                         (user_identity, hashrate, min_extranonce_size),
@@ -400,7 +419,7 @@ impl ChannelManager {
                             )
                         });
                 if let Some((Ok(_result), _share_accounting)) = value {
-                    if is_aggregated()
+                    if self.is_aggregated()
                         && self.extended_channels.contains_key(&AGGREGATED_CHANNEL_ID)
                     {
                         let upstream_extended_channel_id = self
@@ -552,7 +571,7 @@ impl ChannelManager {
             Mining::UpdateChannel(mut m) => {
                 debug!("Received UpdateChannel from SV1Server: {}", m);
 
-                if is_aggregated() {
+                if self.is_aggregated() {
                     // Update the aggregated channel's nominal hashrate so
                     // that monitoring reports a value consistent with the
                     // downstream vardiff estimate.
@@ -810,6 +829,8 @@ mod tests {
             status_sender,
             vec![],
             vec![],
+            TproxyMode::Aggregated,
+            true,
         )
     }
 

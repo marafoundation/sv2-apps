@@ -1,6 +1,5 @@
 use crate::{
     error::{self, TproxyError, TproxyErrorKind},
-    is_aggregated,
     sv2::ChannelManager,
     utils::{proxy_extranonce_prefix_len, AggregatedState, AGGREGATED_CHANNEL_ID},
 };
@@ -126,7 +125,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
             // If we are in aggregated mode, we need to create a new extranonce prefix and
             // insert the extended channel into the map
-            if is_aggregated() {
+            if self.is_aggregated() {
                 // Store the upstream extended channel under AGGREGATED_CHANNEL_ID
                 self.extended_channels
                     .insert(AGGREGATED_CHANNEL_ID, extended_channel.clone());
@@ -274,7 +273,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
         // In aggregated mode, serve any downstream requests that were buffered in
         // pending_channels while the upstream channel was being established (Pending state).
-        if is_aggregated() {
+        if self.is_aggregated() {
             let pending_requests: Vec<(u32, String, Hashrate, usize)> = self
                 .pending_downstream_channels
                 .iter()
@@ -333,7 +332,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
         // are we working in aggregated mode?
-        if is_aggregated() {
+        if self.is_aggregated() {
             // even if aggregated channel_id != m.channel_id, we should trigger fallback
             // because why would a sane server send a CloseChannel message to a different
             // channel?
@@ -395,7 +394,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         // In aggregated mode, the Pool responds with the upstream channel ID, but the
         // channel is stored under AGGREGATED_CHANNEL_ID in the DashMap.
         // In non-aggregated mode, m.channel_id matches the DashMap key directly.
-        let key = if is_aggregated() {
+        let key = if self.is_aggregated() {
             AGGREGATED_CHANNEL_ID
         } else {
             m.channel_id
@@ -417,7 +416,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         warn!("Received: {} ❌", m);
 
-        let key = if is_aggregated() {
+        let key = if self.is_aggregated() {
             AGGREGATED_CHANNEL_ID
         } else {
             m.channel_id
@@ -457,7 +456,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             let mut new_extended_mining_job_messages = Vec::new();
 
             // are we in aggregated mode?
-            if is_aggregated() {
+            if self.is_aggregated() {
                 // Validate that the message is for the aggregated channel or its group
                 let aggregated_channel_id = self
                     .extended_channels
@@ -599,7 +598,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 let mut set_new_prev_hash_messages = Vec::new();
                 let mut new_extended_mining_job_messages = Vec::new();
 
-                if is_aggregated() {
+                if self.is_aggregated() {
                     // Validate that the message is for the aggregated channel or its group
                     let aggregated_channel_id = self
                         .extended_channels
@@ -810,7 +809,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             let mut set_target_messages = Vec::new();
 
             // are in aggregated mode?
-            if is_aggregated() {
+            if self.is_aggregated() {
                 let aggregated_channel_id = self
                     .extended_channels
                     .get(&AGGREGATED_CHANNEL_ID)

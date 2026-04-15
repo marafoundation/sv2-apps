@@ -6,18 +6,15 @@
 
 use stratum_apps::monitoring::server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring};
 
-use crate::{
-    sv2::channel_manager::ChannelManager, tproxy_mode, utils::AGGREGATED_CHANNEL_ID,
-    vardiff_enabled, TproxyMode,
-};
+use crate::{sv2::channel_manager::ChannelManager, utils::AGGREGATED_CHANNEL_ID, TproxyMode};
 
 impl ServerMonitoring for ChannelManager {
     fn get_server(&self) -> ServerInfo {
         let mut extended_channels = Vec::new();
         let standard_channels = Vec::new(); // tProxy only uses extended channels
-        let report_hashrate = vardiff_enabled();
+        let report_hashrate = self.report_hashrate;
 
-        match tproxy_mode() {
+        match self.tproxy_mode {
             TproxyMode::Aggregated => {
                 // In Aggregated mode: one shared channel to the server
                 // stored under AGGREGATED_CHANNEL_ID
