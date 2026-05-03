@@ -855,10 +855,10 @@ mod tests {
             rollable_extranonce_size: 4,
             version_rolling: true,
             shares_acknowledged: 10,
+            shares_submitted: 12,
             shares_rejected: 0,
             shares_rejected_by_reason: HashMap::new(),
             share_work_sum: 100.0,
-            shares_submitted: 12,
             best_diff: 50.0,
             blocks_found: 0,
         }
