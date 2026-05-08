@@ -65,6 +65,10 @@ WORKDIR /app
 ARG APP
 ENV APP=${APP}
 
+# Enable debug-level vardiff logs for the parametric-thresholds A/B experiment.
+# Revert before merge.
+ENV RUST_LOG=info,vardiff=debug
+
 COPY --from=builder /app/release/${APP} /app/${APP}
 
 ENTRYPOINT ["/bin/sh", "-c", "/app/${APP}"]
