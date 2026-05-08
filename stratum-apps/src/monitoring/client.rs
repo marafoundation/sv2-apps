@@ -4,6 +4,7 @@
 //! Each client can have multiple channels opened with the app.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::ToSchema;
 
 /// Information about an extended channel
@@ -20,6 +21,8 @@ pub struct ExtendedChannelInfo {
     pub rollable_extranonce_size: u16,
     pub expected_shares_per_minute: f32,
     pub shares_accepted: u32,
+    pub shares_rejected: u32,
+    pub shares_rejected_by_reason: HashMap<String, u32>,
     pub share_work_sum: f64,
     pub last_share_sequence_number: u32,
     pub best_diff: f64,
@@ -41,6 +44,8 @@ pub struct StandardChannelInfo {
     pub extranonce_prefix_hex: String,
     pub expected_shares_per_minute: f32,
     pub shares_accepted: u32,
+    pub shares_rejected: u32,
+    pub shares_rejected_by_reason: HashMap<String, u32>,
     pub share_work_sum: f64,
     pub last_share_sequence_number: u32,
     pub best_diff: f64,
@@ -157,6 +162,8 @@ mod tests {
             rollable_extranonce_size: 4,
             expected_shares_per_minute: 1.0,
             shares_accepted: 10,
+            shares_rejected: 0,
+            shares_rejected_by_reason: HashMap::new(),
             share_work_sum: 100.0,
             last_share_sequence_number: 5,
             best_diff: 50.0,
@@ -178,6 +185,8 @@ mod tests {
             extranonce_prefix_hex: "bb".into(),
             expected_shares_per_minute: 2.0,
             shares_accepted: 20,
+            shares_rejected: 1,
+            shares_rejected_by_reason: HashMap::from([("duplicate-share".to_string(), 1)]),
             share_work_sum: 200.0,
             last_share_sequence_number: 8,
             best_diff: 80.0,

@@ -14,6 +14,7 @@ pub struct PrometheusMetrics {
     pub sv2_server_hashrate_total: Option<Gauge>,
     pub sv2_server_channel_hashrate: Option<GaugeVec>,
     pub sv2_server_shares_accepted_total: Option<GaugeVec>,
+    pub sv2_server_shares_rejected_total: Option<GaugeVec>,
     pub sv2_server_blocks_found_total: Option<Gauge>,
     // Clients metrics (downstream connections)
     pub sv2_clients_total: Option<Gauge>,
@@ -21,6 +22,7 @@ pub struct PrometheusMetrics {
     pub sv2_client_hashrate_total: Option<Gauge>,
     pub sv2_client_channel_hashrate: Option<GaugeVec>,
     pub sv2_client_shares_accepted_total: Option<GaugeVec>,
+    pub sv2_client_shares_rejected_total: Option<GaugeVec>,
     pub sv2_client_blocks_found_total: Option<Gauge>,
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
@@ -45,6 +47,7 @@ impl PrometheusMetrics {
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
+            sv2_server_shares_rejected_total,
             sv2_server_blocks_found_total,
         ) = if enable_server_metrics {
             let channels = GaugeVec::new(
@@ -77,6 +80,15 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(shares_accepted.clone()))?;
 
+            let shares_rejected = GaugeVec::new(
+                Opts::new(
+                    "sv2_server_shares_rejected_total",
+                    "Total shares rejected per server channel by error code",
+                ),
+                &["channel_id", "user_identity", "error_code"],
+            )?;
+            registry.register(Box::new(shares_rejected.clone()))?;
+
             let blocks_found = Gauge::new(
                 "sv2_server_blocks_found_total",
                 "Total blocks found across all current server channels",
@@ -88,10 +100,11 @@ impl PrometheusMetrics {
                 Some(hashrate),
                 Some(channel_hashrate),
                 Some(shares_accepted),
+                Some(shares_rejected),
                 Some(blocks_found),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         // Clients metrics (downstream connections)
@@ -101,6 +114,7 @@ impl PrometheusMetrics {
             sv2_client_hashrate_total,
             sv2_client_channel_hashrate,
             sv2_client_shares_accepted_total,
+            sv2_client_shares_rejected_total,
             sv2_client_blocks_found_total,
         ) = if enable_clients_metrics {
             let clients_total =
@@ -137,6 +151,15 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(shares_accepted.clone()))?;
 
+            let shares_rejected = GaugeVec::new(
+                Opts::new(
+                    "sv2_client_shares_rejected_total",
+                    "Total shares rejected per client channel by error code",
+                ),
+                &["client_id", "channel_id", "user_identity", "error_code"],
+            )?;
+            registry.register(Box::new(shares_rejected.clone()))?;
+
             let blocks_found = Gauge::new(
                 "sv2_client_blocks_found_total",
                 "Total blocks found across all current client channels",
@@ -149,10 +172,11 @@ impl PrometheusMetrics {
                 Some(hashrate),
                 Some(channel_hashrate),
                 Some(shares_accepted),
+                Some(shares_rejected),
                 Some(blocks_found),
             )
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
 
         // SV1 metrics
@@ -175,12 +199,14 @@ impl PrometheusMetrics {
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
+            sv2_server_shares_rejected_total,
             sv2_server_blocks_found_total,
             sv2_clients_total,
             sv2_client_channels,
             sv2_client_hashrate_total,
             sv2_client_channel_hashrate,
             sv2_client_shares_accepted_total,
+            sv2_client_shares_rejected_total,
             sv2_client_blocks_found_total,
             sv1_clients_total,
             sv1_hashrate_total,
@@ -210,6 +236,7 @@ mod tests {
         assert!(m.sv2_server_hashrate_total.is_some());
         assert!(m.sv2_server_channel_hashrate.is_some());
         assert!(m.sv2_server_shares_accepted_total.is_some());
+        assert!(m.sv2_server_shares_rejected_total.is_some());
         // clients and sv1 should be None
         assert!(m.sv2_clients_total.is_none());
         assert!(m.sv1_clients_total.is_none());
@@ -223,6 +250,7 @@ mod tests {
         assert!(m.sv2_client_hashrate_total.is_some());
         assert!(m.sv2_client_channel_hashrate.is_some());
         assert!(m.sv2_client_shares_accepted_total.is_some());
+        assert!(m.sv2_client_shares_rejected_total.is_some());
         // server and sv1 should be None
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv1_clients_total.is_none());

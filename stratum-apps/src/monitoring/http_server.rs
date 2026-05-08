@@ -807,6 +807,8 @@ mod tests {
             rollable_extranonce_size: 4,
             expected_shares_per_minute: 1.0,
             shares_accepted: 10,
+            shares_rejected: 0,
+            shares_rejected_by_reason: HashMap::new(),
             share_work_sum: 100.0,
             last_share_sequence_number: 5,
             best_diff: 50.0,
@@ -831,6 +833,8 @@ mod tests {
             extranonce_prefix_hex: "bb".into(),
             expected_shares_per_minute: 2.0,
             shares_accepted: 20,
+            shares_rejected: 1,
+            shares_rejected_by_reason: HashMap::from([("duplicate-share".to_string(), 1)]),
             share_work_sum: 200.0,
             last_share_sequence_number: 8,
             best_diff: 80.0,
@@ -1473,12 +1477,13 @@ mod tests {
     /// - Channel 2 metrics are removed (stale cleanup)
     #[tokio::test]
     async fn metrics_stale_labels_removed_without_reset_gap() {
+        let mut channel_2 = create_extended_channel_info(2, 200.0);
+        channel_2.shares_rejected = 1;
+        channel_2.shares_rejected_by_reason = HashMap::from([("duplicate-share".to_string(), 1)]);
+
         let initial_clients = vec![Sv2ClientInfo {
             client_id: 1,
-            extended_channels: vec![
-                create_extended_channel_info(1, 100.0),
-                create_extended_channel_info(2, 200.0),
-            ],
+            extended_channels: vec![create_extended_channel_info(1, 100.0), channel_2],
             standard_channels: vec![],
         }];
 
@@ -1522,6 +1527,10 @@ mod tests {
             body.contains("sv2_client_shares_accepted_total{channel_id=\"2\",client_id=\"1\""),
             "Channel 2 should be present on first scrape"
         );
+        assert!(
+            body.contains("sv2_client_shares_rejected_total{channel_id=\"2\",client_id=\"1\",error_code=\"duplicate-share\""),
+            "Channel 2 rejected-share metric should be present on first scrape"
+        );
 
         // Remove channel 2 from mock data and refresh cache
         {
@@ -1540,6 +1549,10 @@ mod tests {
         assert!(
             !body.contains("sv2_client_shares_accepted_total{channel_id=\"2\",client_id=\"1\""),
             "Channel 2 should be removed as stale"
+        );
+        assert!(
+            !body.contains("sv2_client_shares_rejected_total{channel_id=\"2\",client_id=\"1\",error_code=\"duplicate-share\""),
+            "Channel 2 rejected-share metric should be removed as stale"
         );
     }
 }
