@@ -1555,4 +1555,59 @@ mod tests {
             "Channel 2 rejected-share metric should be removed as stale"
         );
     }
+
+    /// Regression test for lazy-loading of `sv2_*_shares_rejected_total`.
+    ///
+    /// A `GaugeVec` only emits a series after `with_label_values(...).set(...)` runs at
+    /// least once. With the rejection metric populated only inside a loop over
+    /// `channel.shares_rejected_by_reason`, a channel with zero rejections produces no
+    /// series at all in `/metrics` — Grafana panels fail to load and alerting rules
+    /// silently never fire.
+    ///
+    /// Pre-seeding the spec-defined error codes from `mining_sv2::ERROR_CODE_SUBMIT_SHARES_*`
+    /// to `0` on every refresh fixes this. This test asserts the metric is emitted with
+    /// zero rejections.
+    #[tokio::test]
+    async fn shares_rejected_metric_emitted_with_zero_rejections() {
+        // Server channel with zero rejections.
+        // Helper defaults for standard channel set shares_rejected=1; override to 0.
+        let mut server_info = super::super::server::ServerInfo {
+            extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
+            standard_channels: vec![create_server_standard_channel_info(2, Some(50.0))],
+        };
+        server_info.standard_channels[0].shares_rejected = 0;
+        server_info.standard_channels[0].shares_rejected_by_reason = HashMap::new();
+
+        let server = Arc::new(MockServer(server_info));
+
+        // Client channel with zero rejections
+        let clients = Arc::new(MockClients(vec![Sv2ClientInfo {
+            client_id: 1,
+            extended_channels: vec![create_extended_channel_info(1, 100.0)],
+            standard_channels: vec![],
+        }]));
+
+        let app = build_test_app(
+            Some(server as Arc<dyn ServerMonitoring + Send + Sync>),
+            Some(clients as Arc<dyn super::super::client::Sv2ClientsMonitoring + Send + Sync>),
+            None,
+        );
+
+        let response = app.oneshot(make_request("/metrics")).await.unwrap();
+        let body = get_body(response).await;
+
+        // Both metrics MUST appear with the spec-defined error_code labels pre-seeded to 0.
+        assert!(
+            body.contains("sv2_server_shares_rejected_total{channel_id=\"1\",error_code=\"stale-share\""),
+            "sv2_server_shares_rejected_total stale-share label must be pre-seeded to 0; got:\n{body}"
+        );
+        assert!(
+            body.contains("sv2_server_shares_rejected_total{channel_id=\"1\",error_code=\"duplicate-share\""),
+            "sv2_server_shares_rejected_total duplicate-share label must be pre-seeded to 0; got:\n{body}"
+        );
+        assert!(
+            body.contains("sv2_client_shares_rejected_total{channel_id=\"1\",client_id=\"1\",error_code=\"stale-share\""),
+            "sv2_client_shares_rejected_total stale-share label must be pre-seeded to 0; got:\n{body}"
+        );
+    }
 }

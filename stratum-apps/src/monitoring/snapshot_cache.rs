@@ -42,6 +42,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use stratum_core::mining_sv2::{
+    ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE, ERROR_CODE_SUBMIT_SHARES_DIFFICULTY_TOO_LOW,
+    ERROR_CODE_SUBMIT_SHARES_DUPLICATE_SHARE, ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID, ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE,
+    ERROR_CODE_SUBMIT_SHARES_STALE_SHARE,
+};
 use tracing::debug;
 
 use super::{
@@ -50,6 +56,23 @@ use super::{
     server::{ServerInfo, ServerMonitoring, ServerSummary},
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
 };
+
+/// All `SubmitSharesError.error_code` values defined by `mining_sv2`
+/// (sv2-spec §5.5.2 + extensions).
+///
+/// Pre-seeding these labels with `0` on every refresh ensures the
+/// `sv2_*_shares_rejected_total` GaugeVec emits its series even before
+/// the first rejection — so Grafana panels and alerting rules that
+/// reference the metric never see "no data".
+const SPEC_REJECTION_CODES: &[&str] = &[
+    ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE,
+    ERROR_CODE_SUBMIT_SHARES_STALE_SHARE,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID,
+    ERROR_CODE_SUBMIT_SHARES_DIFFICULTY_TOO_LOW,
+    ERROR_CODE_SUBMIT_SHARES_DUPLICATE_SHARE,
+    ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE,
+];
 
 /// Tracks which label combinations were set on the previous refresh so we can
 /// remove only stale series instead of calling `.reset()` (which would create a
@@ -258,6 +281,16 @@ impl SnapshotCache {
                         .set(channel.shares_acknowledged as f64);
                 }
                 if let Some(ref m) = metrics.sv2_server_shares_rejected_total {
+                    // Pre-seed spec-defined rejection codes so the metric is always emitted
+                    // (avoids GaugeVec lazy-loading hiding the series until first rejection).
+                    for &reason in SPEC_REJECTION_CODES {
+                        m.with_label_values(&[&channel_id, user, reason]).set(0.0);
+                        current_server_rejected_labels.insert([
+                            channel_id.clone(),
+                            user.clone(),
+                            reason.to_string(),
+                        ]);
+                    }
                     for (error_code, count) in &channel.shares_rejected_by_reason {
                         m.with_label_values(&[&channel_id, user, error_code])
                             .set(*count as f64);
@@ -288,6 +321,16 @@ impl SnapshotCache {
                         .set(channel.shares_acknowledged as f64);
                 }
                 if let Some(ref m) = metrics.sv2_server_shares_rejected_total {
+                    // Pre-seed spec-defined rejection codes so the metric is always emitted
+                    // (avoids GaugeVec lazy-loading hiding the series until first rejection).
+                    for &reason in SPEC_REJECTION_CODES {
+                        m.with_label_values(&[&channel_id, user, reason]).set(0.0);
+                        current_server_rejected_labels.insert([
+                            channel_id.clone(),
+                            user.clone(),
+                            reason.to_string(),
+                        ]);
+                    }
                     for (error_code, count) in &channel.shares_rejected_by_reason {
                         m.with_label_values(&[&channel_id, user, error_code])
                             .set(*count as f64);
@@ -354,6 +397,18 @@ impl SnapshotCache {
                             .set(channel.shares_accepted as f64);
                     }
                     if let Some(ref m) = metrics.sv2_client_shares_rejected_total {
+                        // Pre-seed spec-defined rejection codes so the metric is always emitted
+                        // (avoids GaugeVec lazy-loading hiding the series until first rejection).
+                        for &reason in SPEC_REJECTION_CODES {
+                            m.with_label_values(&[&client_id, &channel_id, user, reason])
+                                .set(0.0);
+                            current_client_rejected_labels.insert([
+                                client_id.clone(),
+                                channel_id.clone(),
+                                user.clone(),
+                                reason.to_string(),
+                            ]);
+                        }
                         for (error_code, count) in &channel.shares_rejected_by_reason {
                             m.with_label_values(&[&client_id, &channel_id, user, error_code])
                                 .set(*count as f64);
@@ -383,6 +438,18 @@ impl SnapshotCache {
                             .set(channel.shares_accepted as f64);
                     }
                     if let Some(ref m) = metrics.sv2_client_shares_rejected_total {
+                        // Pre-seed spec-defined rejection codes so the metric is always emitted
+                        // (avoids GaugeVec lazy-loading hiding the series until first rejection).
+                        for &reason in SPEC_REJECTION_CODES {
+                            m.with_label_values(&[&client_id, &channel_id, user, reason])
+                                .set(0.0);
+                            current_client_rejected_labels.insert([
+                                client_id.clone(),
+                                channel_id.clone(),
+                                user.clone(),
+                                reason.to_string(),
+                            ]);
+                        }
                         for (error_code, count) in &channel.shares_rejected_by_reason {
                             m.with_label_values(&[&client_id, &channel_id, user, error_code])
                                 .set(*count as f64);
