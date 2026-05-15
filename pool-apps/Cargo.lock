@@ -273,7 +273,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "binary_sv2"
 version = "5.0.1"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "buffer_sv2",
  "derive_codec_sv2",
@@ -412,7 +412,7 @@ dependencies = [
 [[package]]
 name = "buffer_sv2"
 version = "3.0.1"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "aes-gcm",
 ]
@@ -524,7 +524,7 @@ dependencies = [
 [[package]]
 name = "channels_sv2"
 version = "6.0.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -594,7 +594,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "codec_sv2"
 version = "5.0.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "common_messages_sv2"
 version = "7.2.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
 ]
@@ -791,7 +791,7 @@ dependencies = [
 [[package]]
 name = "derive_codec_sv2"
 version = "1.1.2"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 
 [[package]]
 name = "digest"
@@ -920,7 +920,7 @@ checksum = "0206175f82b8d6bf6652ff7d71a1e27fd2e4efde587fd368662814d6ec1d9ce0"
 [[package]]
 name = "extensions_sv2"
 version = "0.1.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
 ]
@@ -981,7 +981,7 @@ dependencies = [
 [[package]]
 name = "framing_sv2"
 version = "6.0.1"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
@@ -1116,7 +1116,7 @@ dependencies = [
 [[package]]
 name = "handlers_sv2"
 version = "0.4.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -1518,7 +1518,7 @@ dependencies = [
 [[package]]
 name = "job_declaration_sv2"
 version = "7.1.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
 ]
@@ -1653,7 +1653,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mining_sv2"
 version = "10.0.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
 ]
@@ -1693,7 +1693,7 @@ dependencies = [
 [[package]]
 name = "noise_sv2"
 version = "1.4.2"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -1817,7 +1817,7 @@ dependencies = [
 [[package]]
 name = "parsers_sv2"
 version = "0.4.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -2476,7 +2476,7 @@ dependencies = [
 [[package]]
 name = "stratum-core"
 version = "0.4.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -2543,7 +2543,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 [[package]]
 name = "template_distribution_sv2"
 version = "5.1.0"
-source = "git+https://github.com/plebhash/stratum?rev=9d25a87355dbeb3fdd5000dc0b241dc661041f66#9d25a87355dbeb3fdd5000dc0b241dc661041f66"
+source = "git+https://github.com/plebhash/stratum?rev=d3ede61a597f0a1f93c2a50f8f95d07a88a5060f#d3ede61a597f0a1f93c2a50f8f95d07a88a5060f"
 dependencies = [
  "binary_sv2",
 ]
