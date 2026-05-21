@@ -1,5 +1,6 @@
 use clap::Parser;
 use integration_tests_sv2::mining_device::{self, Secp256k1PublicKey};
+use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber::fmt;
 
@@ -30,6 +31,11 @@ struct Args {
         default_value = "0"
     )]
     handicap: u32,
+    #[arg(
+        long,
+        help = "Path to a file containing the handicap value (µs). The miner polls this file every second and adjusts its rate without reconnecting."
+    )]
+    handicap_file: Option<PathBuf>,
     #[arg(
         long,
         help = "User id, used when a new channel is opened, it can be used by the pool to identify the miner"
@@ -66,6 +72,11 @@ async fn main() {
 
     if let Some(n) = args.cores {
         mining_device::set_cores(n);
+    }
+
+    if let Some(path) = args.handicap_file {
+        info!("Watching handicap file: {}", path.display());
+        mining_device::start_handicap_file_watcher(path);
     }
 
     let used = mining_device::effective_worker_count();

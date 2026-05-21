@@ -43,16 +43,42 @@ use sha2::{
     digest::generic_array::{typenum::U64, GenericArray},
 };
 
-// Tuneable: how many nonces to try per mining loop iteration when fast hasher is available.
-// Runtime-configurable so the binary and benches can adjust it without changing code.
 use std::sync::atomic::AtomicU32;
+
 static NONCES_PER_CALL_RUNTIME: AtomicU32 = AtomicU32::new(32);
-// Runtime-configurable number of worker threads; 0 means "auto" (N-1)
 static WORKER_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+static HANDICAP_RUNTIME: AtomicU32 = AtomicU32::new(0);
+
+#[inline]
+pub fn set_handicap(micros: u32) {
+    HANDICAP_RUNTIME.store(micros, Ordering::Relaxed);
+}
+
+#[inline]
+fn current_handicap() -> u32 {
+    HANDICAP_RUNTIME.load(Ordering::Relaxed)
+}
+
+pub fn start_handicap_file_watcher(path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let mut last_value: Option<u32> = None;
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(micros) = contents.trim().parse::<u32>() {
+                    if last_value != Some(micros) {
+                        info!("Handicap updated from file: {}µs", micros);
+                        set_handicap(micros);
+                        last_value = Some(micros);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
 
 #[inline]
 pub fn set_nonces_per_call(n: u32) {
-    // Avoid zero (would stall the loop); clamp to at least 1
     let n = n.max(1);
     NONCES_PER_CALL_RUNTIME.store(n, Ordering::Relaxed);
 }
@@ -103,6 +129,7 @@ pub async fn connect(
     nominal_hashrate_multiplier: Option<f32>,
     single_submit: bool,
 ) {
+    set_handicap(handicap);
     let address = address
         .clone()
         .to_socket_addrs()
@@ -591,19 +618,16 @@ struct Miner {
     target: Option<U256>,
     job_id: Option<u32>,
     version: Option<u32>,
-    handicap: u32,
-    // Optimized hashing state
     fast_hasher: Option<FastSha256d>,
 }
 
 impl Miner {
-    fn new(handicap: u32) -> Self {
+    fn new(_handicap: u32) -> Self {
         Self {
             target: None,
             header: None,
             job_id: None,
             version: None,
-            handicap,
             fast_hasher: None,
         }
     }
@@ -868,11 +892,9 @@ fn format_mhs(val_mhs: f64) -> String {
     rounded.to_formatted_string(&Locale::en)
 }
 
-// returns hashrate by running all worker threads in parallel for the given duration
 fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
     use std::sync::Barrier;
 
-    // Prepare a random header template to hash
     let mut rng = thread_rng();
     let prev_hash: [u8; 32] = generate_random_32_byte_array().to_vec().try_into().unwrap();
     let prev_hash = Hash::from_byte_array(prev_hash);
@@ -892,24 +914,19 @@ fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
 
     let duration = Duration::from_secs(duration_secs);
     let p = worker_count() as usize;
-    let barrier = Arc::new(Barrier::new(p + 1)); // +1 for coordinator
+    let barrier = Arc::new(Barrier::new(p + 1));
 
     let mut handles = Vec::with_capacity(p);
-    // Log a single consolidated target-setting message for the probe
     info!("Set target to {}", "0".repeat(64));
     for _ in 0..p {
         let barrier = barrier.clone();
-        // Each thread gets its own miner and header copy
         let mut miner = Miner::new(handicap);
-        // Set target to zero (silently) so we never trigger share submits; we're only counting
-        // hashes
         miner.new_target_silent(vec![0_u8; 32]);
         miner.header = Some(header_template);
         if let Some(h) = miner.header.as_ref() {
             miner.fast_hasher = Some(FastSha256d::from_header_static(h));
         }
         handles.push(std::thread::spawn(move || {
-            // Synchronize start across threads
             barrier.wait();
             let start = Instant::now();
             let mut hashes: u64 = 0;
@@ -921,13 +938,11 @@ fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
         }));
     }
 
-    // Release all workers simultaneously
     barrier.wait();
     let mut total_hashes: u64 = 0;
     for h in handles {
         total_hashes += h.join().unwrap_or(0);
     }
-    // Each thread ran for approximately `duration`, so total hashes per second is total/duration
     (total_hashes as f64) / (duration_secs as f64)
 }
 fn generate_random_32_byte_array() -> [u8; 32] {
@@ -969,117 +984,59 @@ fn start_mining_threads(
 }
 
 fn mine(mut miner: Miner, share_send: Sender<(u32, u32, u32, u32)>, kill: Arc<AtomicBool>) {
-    if miner.handicap != 0 {
-        loop {
-            if kill.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(miner.handicap.into()));
-            // Prefer fast path with micro-batching when possible
-            let can_fast =
-                miner.fast_hasher.is_some() && miner.target.is_some() && miner.header.is_some();
-            if can_fast {
-                let header = miner.header.as_mut().unwrap();
-                let time = header.time;
-                let start = header.nonce;
-                let tgt_le = miner.target.unwrap().to_little_endian();
-                let fast = miner.fast_hasher.as_mut().unwrap();
-                let mut found = None;
-                let batch = nonces_per_call();
-                for i in 0..batch {
-                    let nonce = start.wrapping_add(i);
-                    let hash = fast.hash_with_nonce_time(nonce, time);
-                    if hash_meets_target_le(&hash, &tgt_le) {
-                        found = Some((nonce, hash));
-                        break;
-                    }
-                }
-                if let Some((nonce, hash)) = found {
-                    header.nonce = nonce;
-                    info!(
-                        "Found share with nonce: {}, for target: {:?}, with hash: {:?}",
-                        header.nonce, miner.target, hash,
-                    );
-                    let job_id = miner.job_id.unwrap();
-                    let version = miner.version;
-                    share_send
-                        .try_send((nonce, job_id, version.unwrap(), time))
-                        .unwrap();
-                }
-                // Advance nonce window
-                header.nonce = start.wrapping_add(batch);
-            } else {
-                if miner.next_share().is_valid() {
-                    let nonce = miner.header.unwrap().nonce;
-                    let time = miner.header.unwrap().time;
-                    let job_id = miner.job_id.unwrap();
-                    let version = miner.version;
-                    share_send
-                        .try_send((nonce, job_id, version.unwrap(), time))
-                        .unwrap();
-                }
-                miner
-                    .header
-                    .as_mut()
-                    .map(|h| h.nonce = h.nonce.wrapping_add(1));
-            }
+    loop {
+        if kill.load(Ordering::Relaxed) {
+            break;
         }
-    } else {
-        loop {
-            // Prefer fast path with micro-batching when possible
-            if kill.load(Ordering::Relaxed) {
-                break;
+        let handicap = current_handicap();
+        if handicap != 0 {
+            std::thread::sleep(std::time::Duration::from_micros(handicap.into()));
+        }
+        let can_fast =
+            miner.fast_hasher.is_some() && miner.target.is_some() && miner.header.is_some();
+        if can_fast {
+            let header = miner.header.as_mut().unwrap();
+            let time = header.time;
+            let start = header.nonce;
+            let tgt_le = miner.target.unwrap().to_little_endian();
+            let fast = miner.fast_hasher.as_mut().unwrap();
+            let mut found = None;
+            let batch = nonces_per_call();
+            for i in 0..batch {
+                let nonce = start.wrapping_add(i);
+                let hash = fast.hash_with_nonce_time(nonce, time);
+                if hash_meets_target_le(&hash, &tgt_le) {
+                    found = Some((nonce, hash));
+                    break;
+                }
             }
-            let can_fast =
-                miner.fast_hasher.is_some() && miner.target.is_some() && miner.header.is_some();
-            if can_fast {
-                let header = miner.header.as_mut().unwrap();
-                let time = header.time;
-                let start = header.nonce;
-                let tgt_le = miner.target.unwrap().to_little_endian();
-                let fast = miner.fast_hasher.as_mut().unwrap();
-                let mut found = None;
-                let batch = nonces_per_call();
-                for i in 0..batch {
-                    let nonce = start.wrapping_add(i);
-                    let hash = fast.hash_with_nonce_time(nonce, time);
-                    if hash_meets_target_le(&hash, &tgt_le) {
-                        found = Some((nonce, hash));
-                        break;
-                    }
-                }
-                if let Some((nonce, hash)) = found {
-                    header.nonce = nonce;
-                    info!(
-                        "Found share with nonce: {}, for target: {:?}, with hash: {:?}",
-                        header.nonce, miner.target, hash,
-                    );
-                    let job_id = miner.job_id.unwrap();
-                    let version = miner.version;
-                    share_send
-                        .try_send((nonce, job_id, version.unwrap(), time))
-                        .unwrap();
-                }
-                // Advance nonce window
-                header.nonce = start.wrapping_add(batch);
-            } else {
-                if miner.next_share().is_valid() {
-                    if kill.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let nonce = miner.header.unwrap().nonce;
-                    let time = miner.header.unwrap().time;
-                    let job_id = miner.job_id.unwrap();
-                    let version = miner.version;
-                    share_send
-                        .try_send((nonce, job_id, version.unwrap(), time))
-                        .unwrap();
-                }
-                miner
-                    .header
-                    .as_mut()
-                    .map(|h| h.nonce = h.nonce.wrapping_add(1));
+            if let Some((nonce, hash)) = found {
+                header.nonce = nonce;
+                info!(
+                    "Found share with nonce: {}, for target: {:?}, with hash: {:?}",
+                    header.nonce, miner.target, hash,
+                );
+                let job_id = miner.job_id.unwrap();
+                let version = miner.version;
+                share_send
+                    .try_send((nonce, job_id, version.unwrap(), time))
+                    .unwrap();
             }
+            header.nonce = start.wrapping_add(batch);
+        } else {
+            if miner.next_share().is_valid() {
+                let nonce = miner.header.unwrap().nonce;
+                let time = miner.header.unwrap().time;
+                let job_id = miner.job_id.unwrap();
+                let version = miner.version;
+                share_send
+                    .try_send((nonce, job_id, version.unwrap(), time))
+                    .unwrap();
+            }
+            miner
+                .header
+                .as_mut()
+                .map(|h| h.nonce = h.nonce.wrapping_add(1));
         }
     }
 }
