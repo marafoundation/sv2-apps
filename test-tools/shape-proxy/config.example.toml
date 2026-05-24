@@ -1,0 +1,20 @@
+upstream_address = "127.0.0.1:34254"
+downstream_listen = "0.0.0.0:34260"
+api_listen = "0.0.0.0:8080"
+
+# Proxy's own Noise keypair (for downstream miners)
+authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7LfzDJmwMcjdYj"
+
+# Upstream pool's authority pubkey (optional — set to skip verification)
+# upstream_authority_pubkey = "..."
+
+# Difficulty floor: bounds miner share rate to prevent runaway supply
+# Set based on miner hashrate and desired max supply (~120 spm for 200 TH/s)
+min_downstream_difficulty = 23000.0
+
+# Phantom channels for scale testing (0 = none)
+phantom_channels = 0
+
+# Certificate validity for downstream Noise handshakes
+cert_validity_secs = 86400
