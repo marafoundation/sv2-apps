@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     network_helpers::{
@@ -11,14 +13,72 @@ use stratum_apps::{
         parsers_sv2::{AnyMessage, CommonMessages},
     },
 };
-use tokio::net::TcpStream;
-use tracing::{error, info};
+use tokio::{net::TcpStream, sync::mpsc};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 
 pub type Message = AnyMessage<'static>;
 pub type Reader = NoiseTcpReadHalf<Message>;
 pub type Writer = NoiseTcpWriteHalf<Message>;
+
+/// Events sent from the upstream manager task to the proxy core.
+pub enum UpstreamEvent {
+    /// Successfully connected and completed SetupConnection handshake.
+    Connected { writer: Writer },
+    /// A frame was received from upstream.
+    Frame {
+        frame: stratum_apps::stratum_core::codec_sv2::StandardEitherFrame<Message>,
+    },
+    /// Upstream connection was lost.
+    Disconnected,
+}
+
+/// Combines connect + setup_connection into a single call.
+pub async fn connect_and_setup(config: &Config) -> Result<(Reader, Writer), String> {
+    let (mut reader, mut writer) = connect_upstream(config).await?;
+    setup_connection(&mut reader, &mut writer).await?;
+    Ok((reader, writer))
+}
+
+/// Background task that manages the upstream connection lifecycle.
+/// Connects with exponential backoff and sends events to the proxy core.
+pub async fn upstream_manager_task(config: Config, tx: mpsc::UnboundedSender<UpstreamEvent>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match connect_and_setup(&config).await {
+            Ok((mut reader, writer)) => {
+                backoff = Duration::from_secs(1);
+                info!("Upstream connection established");
+                if tx.send(UpstreamEvent::Connected { writer }).is_err() {
+                    return; // ProxyCore dropped
+                }
+                // Reader loop
+                loop {
+                    match reader.read_frame().await {
+                        Ok(frame) => {
+                            if tx.send(UpstreamEvent::Frame { frame }).is_err() {
+                                return; // ProxyCore dropped
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Upstream disconnected: {e:?}");
+                            if tx.send(UpstreamEvent::Disconnected).is_err() {
+                                return; // ProxyCore dropped
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Upstream connection failed: {e}, retrying in {backoff:?}");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
 
 pub async fn connect_upstream(
     config: &Config,

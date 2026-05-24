@@ -42,22 +42,7 @@ async fn main() {
     info!("  Difficulty floor: {}", cfg.min_downstream_difficulty);
     info!("  API listen: {}", cfg.api_listen);
 
-    let (mut reader, mut writer) = match upstream::connect_upstream(&cfg).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to connect upstream: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(e) = upstream::setup_connection(&mut reader, &mut writer).await {
-        error!("SetupConnection failed: {e}");
-        std::process::exit(1);
-    }
-
-    info!("Upstream connection established");
-
-    let proxy = match proxy::ProxyCore::new(cfg, reader, writer) {
+    let proxy = match proxy::ProxyCore::new(cfg) {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to initialize proxy: {e}");
@@ -65,7 +50,7 @@ async fn main() {
         }
     };
 
-    info!("Shape proxy running");
+    info!("Shape proxy running (upstream connection will be established in background)");
 
     if let Err(e) = proxy.run().await {
         error!("Proxy exited with error: {e}");

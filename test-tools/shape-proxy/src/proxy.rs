@@ -19,7 +19,7 @@ use crate::{
     metrics::{HeadroomStatus, RollingWindow},
     profile::RateProfile,
     share_gate::ShareGate,
-    upstream::{Message, Reader, Writer},
+    upstream::{self, Message, UpstreamEvent, Writer},
 };
 
 /// Maps a downstream channel to its upstream counterpart.
@@ -42,6 +42,13 @@ struct ChannelMapping {
     supply_window: RollingWindow,
     /// Rolling window: shares forwarded upstream.
     forward_window: RollingWindow,
+    /// The original OpenExtendedMiningChannel request for re-opening on reconnect.
+    open_request: Option<OpenExtendedMiningChannel<'static>>,
+    /// Whether this is a standard channel (vs extended).
+    #[allow(dead_code)]
+    is_standard: bool,
+    /// The original standard channel open message bytes for re-opening on reconnect.
+    open_standard_msg: Option<Mining<'static>>,
 }
 
 /// Tracks a pending channel open request we forwarded upstream.
@@ -64,8 +71,8 @@ struct DownstreamState {
 /// The core proxy event loop.
 pub struct ProxyCore {
     config: Config,
-    upstream_reader: Reader,
-    upstream_writer: Writer,
+    upstream_writer: Option<Writer>,
+    upstream_connected: bool,
     /// Authority keys for accepting downstream connections.
     pub_key: Secp256k1PublicKey,
     secret_key: Secp256k1SecretKey,
@@ -83,11 +90,7 @@ pub struct ProxyCore {
 }
 
 impl ProxyCore {
-    pub fn new(
-        config: Config,
-        upstream_reader: Reader,
-        upstream_writer: Writer,
-    ) -> Result<Self, String> {
+    pub fn new(config: Config) -> Result<Self, String> {
         let pub_key: Secp256k1PublicKey = config
             .authority_pubkey
             .parse()
@@ -99,8 +102,8 @@ impl ProxyCore {
 
         Ok(Self {
             config,
-            upstream_reader,
-            upstream_writer,
+            upstream_writer: None,
+            upstream_connected: false,
             pub_key,
             secret_key,
             next_downstream_id: AtomicU64::new(1),
@@ -120,6 +123,15 @@ impl ProxyCore {
         info!("Downstream listener bound to {}", self.config.downstream_listen);
 
         let (ds_event_tx, mut ds_event_rx) = mpsc::unbounded_channel::<DownstreamEvent>();
+
+        // Upstream manager channel
+        let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel::<UpstreamEvent>();
+
+        // Spawn the upstream manager task
+        let upstream_config = self.config.clone();
+        tokio::spawn(async move {
+            upstream::upstream_manager_task(upstream_config, upstream_tx).await;
+        });
 
         // API channels
         let (api_cmd_tx, mut api_cmd_rx) = mpsc::unbounded_channel::<ApiCommand>();
@@ -168,15 +180,29 @@ impl ProxyCore {
                     self.handle_downstream_event(event).await;
                 }
 
-                // Handle upstream frames.
-                upstream_frame = self.upstream_reader.read_frame() => {
-                    match upstream_frame {
-                        Ok(frame) => {
+                // Handle upstream events from the manager task.
+                Some(event) = upstream_rx.recv() => {
+                    match event {
+                        UpstreamEvent::Connected { writer } => {
+                            info!("Upstream connected");
+                            self.upstream_writer = Some(writer);
+                            self.upstream_connected = true;
+                            // Re-open channels for miners still connected downstream.
+                            self.reopen_channels().await;
+                        }
+                        UpstreamEvent::Frame { frame } => {
                             self.handle_upstream_frame(frame).await;
                         }
-                        Err(e) => {
-                            error!("Upstream connection lost: {e:?}");
-                            return Err("Upstream disconnected".to_string());
+                        UpstreamEvent::Disconnected => {
+                            warn!("Upstream disconnected, will retry in background");
+                            self.upstream_writer = None;
+                            self.upstream_connected = false;
+                            // Clear pending opens since those will never get responses now.
+                            self.pending_opens.clear();
+                            // Clear upstream channel IDs since they're no longer valid.
+                            for mapping in self.channels.values_mut() {
+                                mapping.upstream_channel_id = None;
+                            }
                         }
                     }
                 }
@@ -184,6 +210,90 @@ impl ProxyCore {
                 // Handle API commands.
                 Some(cmd) = api_cmd_rx.recv() => {
                     self.handle_api_command(cmd);
+                }
+            }
+        }
+    }
+
+    /// Re-open channels for all downstream miners that are still connected.
+    /// Called after upstream reconnects.
+    async fn reopen_channels(&mut self) {
+        // Collect the channel open requests we need to re-send.
+        let mut reopens: Vec<(u32, u32, DownstreamId, Option<OpenExtendedMiningChannel<'static>>, Option<Mining<'static>>)> = Vec::new();
+
+        for mapping in self.channels.values() {
+            // Only re-open if the downstream miner is still connected.
+            if !self.downstreams.contains_key(&mapping.downstream_id) {
+                continue;
+            }
+            reopens.push((
+                mapping.downstream_channel_id,
+                mapping.downstream_channel_id, // use as request_id for re-open
+                mapping.downstream_id,
+                mapping.open_request.clone(),
+                mapping.open_standard_msg.clone(),
+            ));
+        }
+
+        for (ds_channel_id, _request_id, downstream_id, open_req, open_std_msg) in reopens {
+            if let Some(open_req) = open_req {
+                info!(
+                    downstream_id,
+                    ds_channel_id,
+                    "Re-opening extended channel after upstream reconnect"
+                );
+                // Store as pending open
+                self.pending_opens.insert(
+                    open_req.request_id,
+                    PendingChannelOpen {
+                        original_request_id: open_req.request_id,
+                        downstream_channel_id: ds_channel_id,
+                        downstream_id,
+                    },
+                );
+                // Forward upstream
+                let frame: StandardSv2Frame<Message> =
+                    match Message::Mining(Mining::OpenExtendedMiningChannel(open_req)).try_into() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!("Failed to encode re-open channel: {e:?}");
+                            continue;
+                        }
+                    };
+                if let Some(ref mut writer) = self.upstream_writer {
+                    if let Err(e) = writer.write_frame(frame.into()).await {
+                        error!("Failed to send re-open channel upstream: {e:?}");
+                    }
+                }
+            } else if let Some(std_msg) = open_std_msg {
+                info!(
+                    downstream_id,
+                    ds_channel_id,
+                    "Re-opening standard channel after upstream reconnect"
+                );
+                // Extract request_id from the standard channel open message
+                if let Mining::OpenStandardMiningChannel(ref m) = std_msg {
+                    let req_id = m.get_request_id_as_u32();
+                    self.pending_opens.insert(
+                        req_id,
+                        PendingChannelOpen {
+                            original_request_id: req_id,
+                            downstream_channel_id: ds_channel_id,
+                            downstream_id,
+                        },
+                    );
+                }
+                let frame: StandardSv2Frame<Message> = match Message::Mining(std_msg).try_into() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to encode re-open standard channel: {e:?}");
+                        continue;
+                    }
+                };
+                if let Some(ref mut writer) = self.upstream_writer {
+                    if let Err(e) = writer.write_frame(frame.into()).await {
+                        error!("Failed to send re-open standard channel upstream: {e:?}");
+                    }
                 }
             }
         }
@@ -239,7 +349,7 @@ impl ProxyCore {
             .collect();
 
         ProxyStatus {
-            upstream_connected: true,
+            upstream_connected: self.upstream_connected,
             channels,
         }
     }
@@ -289,6 +399,10 @@ impl ProxyCore {
                         downstream_id: id,
                     },
                 );
+                // Store the open message for reconnect re-opening.
+                // We'll insert the channel mapping on success, but store the msg now
+                // in a temporary spot. Actually, store it after we get the mapping.
+                let open_msg_clone = msg.clone();
                 let frame: StandardSv2Frame<Message> = match Message::Mining(msg).try_into() {
                     Ok(f) => f,
                     Err(e) => {
@@ -296,9 +410,33 @@ impl ProxyCore {
                         return;
                     }
                 };
-                if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
-                    error!("Failed to send OpenStandardMiningChannel upstream: {e:?}");
+                if let Some(ref mut writer) = self.upstream_writer {
+                    if let Err(e) = writer.write_frame(frame.into()).await {
+                        error!("Failed to send OpenStandardMiningChannel upstream: {e:?}");
+                    }
+                } else {
+                    warn!(downstream_id = id, "Upstream not connected, cannot open standard channel");
                 }
+                // Store the open message temporarily so we can attach it to the mapping on success.
+                // Use a workaround: store in the pending_opens won't work, so we store in channels
+                // preemptively with upstream_channel_id = None.
+                self.channels.insert(
+                    ds_channel_id,
+                    ChannelMapping {
+                        downstream_channel_id: ds_channel_id,
+                        upstream_channel_id: None,
+                        downstream_id: id,
+                        gate: ShareGate::new(RateProfile::default()),
+                        floor_active: false,
+                        shares_forwarded: 0,
+                        shares_gated: 0,
+                        supply_window: RollingWindow::new(),
+                        forward_window: RollingWindow::new(),
+                        open_request: None,
+                        is_standard: true,
+                        open_standard_msg: Some(open_msg_clone),
+                    },
+                );
             }
             Mining::SubmitSharesExtended(ref share) => {
                 let channel_id = share.channel_id;
@@ -343,17 +481,19 @@ impl ProxyCore {
                 mapping.shares_forwarded += 1;
                 mapping.forward_window.record(now);
 
-                // Forward upstream.
-                let frame: StandardSv2Frame<Message> =
-                    match Message::Mining(msg).try_into() {
-                        Ok(f) => f,
-                        Err(e) => {
-                            warn!(downstream_id = id, "Failed to encode share: {e:?}");
-                            return;
-                        }
-                    };
-                if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
-                    error!("Failed to forward share upstream: {e:?}");
+                // Only forward if upstream is connected.
+                if let Some(ref mut writer) = self.upstream_writer {
+                    let frame: StandardSv2Frame<Message> =
+                        match Message::Mining(msg).try_into() {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(downstream_id = id, "Failed to encode share: {e:?}");
+                                return;
+                            }
+                        };
+                    if let Err(e) = writer.write_frame(frame.into()).await {
+                        error!("Failed to forward share upstream: {e:?}");
+                    }
                 }
             }
             Mining::SubmitSharesStandard(ref share) => {
@@ -399,16 +539,19 @@ impl ProxyCore {
                 mapping.shares_forwarded += 1;
                 mapping.forward_window.record(now);
 
-                let frame: StandardSv2Frame<Message> =
-                    match Message::Mining(msg).try_into() {
-                        Ok(f) => f,
-                        Err(e) => {
-                            warn!(downstream_id = id, "Failed to encode standard share: {e:?}");
-                            return;
-                        }
-                    };
-                if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
-                    error!("Failed to forward standard share upstream: {e:?}");
+                // Only forward if upstream is connected.
+                if let Some(ref mut writer) = self.upstream_writer {
+                    let frame: StandardSv2Frame<Message> =
+                        match Message::Mining(msg).try_into() {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!(downstream_id = id, "Failed to encode standard share: {e:?}");
+                                return;
+                            }
+                        };
+                    if let Err(e) = writer.write_frame(frame.into()).await {
+                        error!("Failed to forward standard share upstream: {e:?}");
+                    }
                 }
             }
             other => {
@@ -420,8 +563,12 @@ impl ProxyCore {
                         return;
                     }
                 };
-                if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
-                    error!("Failed to forward message upstream: {e:?}");
+                if let Some(ref mut writer) = self.upstream_writer {
+                    if let Err(e) = writer.write_frame(frame.into()).await {
+                        error!("Failed to forward message upstream: {e:?}");
+                    }
+                } else {
+                    warn!(downstream_id = id, "Upstream not connected, dropping message");
                 }
             }
         }
@@ -456,6 +603,25 @@ impl ProxyCore {
             },
         );
 
+        // Pre-create the channel mapping so we have the open_request stored for reconnect.
+        self.channels.insert(
+            ds_channel_id,
+            ChannelMapping {
+                downstream_channel_id: ds_channel_id,
+                upstream_channel_id: None,
+                downstream_id,
+                gate: ShareGate::new(RateProfile::default()),
+                floor_active: false,
+                shares_forwarded: 0,
+                shares_gated: 0,
+                supply_window: RollingWindow::new(),
+                forward_window: RollingWindow::new(),
+                open_request: Some(open_req.clone()),
+                is_standard: false,
+                open_standard_msg: None,
+            },
+        );
+
         // Forward the open request upstream verbatim.
         let frame: StandardSv2Frame<Message> =
             match Message::Mining(Mining::OpenExtendedMiningChannel(open_req)).try_into() {
@@ -465,8 +631,12 @@ impl ProxyCore {
                     return;
                 }
             };
-        if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
-            error!("Failed to send OpenExtendedMiningChannel upstream: {e:?}");
+        if let Some(ref mut writer) = self.upstream_writer {
+            if let Err(e) = writer.write_frame(frame.into()).await {
+                error!("Failed to send OpenExtendedMiningChannel upstream: {e:?}");
+            }
+        } else {
+            warn!(downstream_id, "Upstream not connected, channel open queued for reconnect");
         }
     }
 
@@ -513,22 +683,30 @@ impl ProxyCore {
                         "Channel opened successfully"
                     );
 
-                    // Store the channel mapping with a share gate.
-                    let gate = ShareGate::new(RateProfile::default());
-                    self.channels.insert(
-                        pending.downstream_channel_id,
-                        ChannelMapping {
-                            downstream_channel_id: pending.downstream_channel_id,
-                            upstream_channel_id: Some(upstream_channel_id),
-                            downstream_id: pending.downstream_id,
-                            gate,
-                            floor_active: false,
-                            shares_forwarded: 0,
-                            shares_gated: 0,
-                            supply_window: RollingWindow::new(),
-                            forward_window: RollingWindow::new(),
-                        },
-                    );
+                    // Update the existing channel mapping with the upstream channel ID.
+                    if let Some(mapping) = self.channels.get_mut(&pending.downstream_channel_id) {
+                        mapping.upstream_channel_id = Some(upstream_channel_id);
+                    } else {
+                        // Shouldn't happen, but create mapping if missing.
+                        let gate = ShareGate::new(RateProfile::default());
+                        self.channels.insert(
+                            pending.downstream_channel_id,
+                            ChannelMapping {
+                                downstream_channel_id: pending.downstream_channel_id,
+                                upstream_channel_id: Some(upstream_channel_id),
+                                downstream_id: pending.downstream_id,
+                                gate,
+                                floor_active: false,
+                                shares_forwarded: 0,
+                                shares_gated: 0,
+                                supply_window: RollingWindow::new(),
+                                forward_window: RollingWindow::new(),
+                                open_request: None,
+                                is_standard: false,
+                                open_standard_msg: None,
+                            },
+                        );
+                    }
 
                     // Forward the success response to the downstream miner.
                     self.send_to_downstream(pending.downstream_id, Message::Mining(msg))
@@ -556,21 +734,26 @@ impl ProxyCore {
                         "Standard channel opened successfully"
                     );
 
-                    let gate = ShareGate::new(RateProfile::default());
-                    self.channels.insert(
-                        effective_ds_channel_id,
-                        ChannelMapping {
+                    // Remove the pre-created mapping (keyed by our internal ds_channel_id)
+                    // and re-insert keyed by the effective (upstream) channel_id.
+                    let mut mapping = self.channels.remove(&pending.downstream_channel_id)
+                        .unwrap_or_else(|| ChannelMapping {
                             downstream_channel_id: effective_ds_channel_id,
                             upstream_channel_id: Some(upstream_channel_id),
                             downstream_id: pending.downstream_id,
-                            gate,
+                            gate: ShareGate::new(RateProfile::default()),
                             floor_active: false,
                             shares_forwarded: 0,
                             shares_gated: 0,
                             supply_window: RollingWindow::new(),
                             forward_window: RollingWindow::new(),
-                        },
-                    );
+                            open_request: None,
+                            is_standard: true,
+                            open_standard_msg: None,
+                        });
+                    mapping.downstream_channel_id = effective_ds_channel_id;
+                    mapping.upstream_channel_id = Some(upstream_channel_id);
+                    self.channels.insert(effective_ds_channel_id, mapping);
 
                     self.send_to_downstream(pending.downstream_id, Message::Mining(msg))
                         .await;
@@ -590,6 +773,8 @@ impl ProxyCore {
                         "Channel open rejected by pool: {}",
                         err.error_code.as_utf8_or_hex()
                     );
+                    // Remove the pre-created channel mapping.
+                    self.channels.remove(&pending.downstream_channel_id);
                     self.send_to_downstream(pending.downstream_id, Message::Mining(msg))
                         .await;
                 } else {
@@ -632,7 +817,7 @@ impl ProxyCore {
                     .await;
             }
             Mining::SubmitSharesSuccess(ref s) => {
-                // Pool acked our forwarded shares. Log only — miner was already acked.
+                // Pool acked our forwarded shares. Log only -- miner was already acked.
                 debug!(
                     channel_id = s.channel_id,
                     last_seq = s.last_sequence_number,
@@ -657,17 +842,15 @@ impl ProxyCore {
 
     /// Send a message to a specific downstream connection.
     /// Route an upstream message to the downstream that owns the given upstream channel.
-    /// For extended channels, the message is forwarded WITHOUT rewriting channel_id —
+    /// For extended channels, the message is forwarded WITHOUT rewriting channel_id --
     /// Apply the difficulty floor to a SetTarget message.
     /// If the pool's target is easier than the floor (higher U256 value),
     /// substitute the floor target. Only forward if the effective target changed.
     async fn handle_set_target_with_floor(
         &mut self,
         upstream_channel_id: u32,
-        mut set_target: stratum_apps::stratum_core::mining_sv2::SetTarget<'static>,
+        set_target: stratum_apps::stratum_core::mining_sv2::SetTarget<'static>,
     ) {
-        use stratum_apps::stratum_core::mining_sv2::SetTarget;
-
         let pair = self
             .channels
             .values_mut()
@@ -683,22 +866,12 @@ impl ProxyCore {
         // Pool's target is in set_target.maximum_target (le bytes).
         let floor_difficulty = self.config.min_downstream_difficulty;
 
-        // Compute floor target as bytes. We use a simplified approach:
-        // target_bytes ≈ (2^256 / floor_difficulty) represented as 32 LE bytes.
-        // For typical difficulties (1000-1000000), this gives a target with
-        // leading zeros that's easy to compare.
-        let floor_target_f64 = (2.0_f64).powi(256) / floor_difficulty;
-        let pool_target_bytes: &[u8] = set_target.maximum_target.inner_as_ref();
-
         // Compare: is pool's target easier (larger) than the floor target?
-        // Simple heuristic: check leading non-zero byte position.
-        // A proper comparison would use U256 arithmetic, but for the floor
-        // we just need to know if the pool's difficulty is below our minimum.
-        // difficulty ≈ 2^256 / target, so we compute pool difficulty from target.
+        let pool_target_bytes: &[u8] = set_target.maximum_target.inner_as_ref();
         let pool_target_difficulty = target_to_difficulty(pool_target_bytes);
 
         if pool_target_difficulty < floor_difficulty {
-            // Pool's difficulty is below floor — override with floor.
+            // Pool's difficulty is below floor -- override with floor.
             pair.floor_active = true;
             debug!(
                 upstream_channel_id,
@@ -706,9 +879,9 @@ impl ProxyCore {
                 floor_diff = floor_difficulty,
                 "Floor active: pool difficulty below floor, not forwarding SetTarget"
             );
-            // Don't forward — miner keeps its current (harder) target.
+            // Don't forward -- miner keeps its current (harder) target.
         } else {
-            // Pool's difficulty is at or above floor — forward normally.
+            // Pool's difficulty is at or above floor -- forward normally.
             pair.floor_active = false;
             let ds_id = pair.downstream_id;
             self.send_to_downstream(ds_id, Message::Mining(Mining::SetTarget(set_target)))
@@ -730,20 +903,21 @@ impl ProxyCore {
             .find(|m| m.upstream_channel_id == Some(upstream_channel_id));
 
         let Some(pair) = pair else {
-            // No pair found — might be for a phantom or not-yet-mapped channel.
+            // No pair found -- might be for a phantom or not-yet-mapped channel.
             debug!(upstream_channel_id, "No downstream mapping for upstream channel");
             return;
         };
 
         let ds_id = pair.downstream_id;
 
-        // Forward verbatim — don't rewrite channel_id. The downstream received the
+        // Forward verbatim -- don't rewrite channel_id. The downstream received the
         // pool's channel_id in the OpenExtendedMiningChannelSuccess and expects
         // all subsequent messages to use it.
         self.send_to_downstream(ds_id, Message::Mining(msg)).await;
     }
 
     /// Rewrite the channel_id field in a Mining message.
+    #[allow(dead_code)]
     fn rewrite_channel_id(msg: Mining<'static>, new_channel_id: u32) -> Mining<'static> {
         match msg {
             Mining::NewExtendedMiningJob(mut job) => {
@@ -789,7 +963,7 @@ impl ProxyCore {
 }
 
 /// Convert a 32-byte LE target to an approximate scalar difficulty.
-/// difficulty ≈ 2^256 / target
+/// difficulty ~ 2^256 / target
 fn target_to_difficulty(target_le: &[u8]) -> f64 {
     // Find the most significant non-zero byte to get a rough magnitude.
     // Then compute difficulty from the top 8 bytes for precision.
@@ -798,7 +972,7 @@ fn target_to_difficulty(target_le: &[u8]) -> f64 {
         msb_index -= 1;
     }
     if target_le[msb_index] == 0 {
-        return f64::MAX; // target is zero → infinite difficulty
+        return f64::MAX; // target is zero -> infinite difficulty
     }
 
     // Build a f64 from the top bytes of the target

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub upstream_address: String,
     pub upstream_authority_pubkey: Option<String>,
