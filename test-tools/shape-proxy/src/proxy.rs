@@ -249,6 +249,36 @@ impl ProxyCore {
             Mining::OpenExtendedMiningChannel(open_req) => {
                 self.handle_open_channel(id, open_req).await;
             }
+            Mining::OpenStandardMiningChannel(ref m) => {
+                // Mirror standard channel opens upstream verbatim.
+                let request_id = m.get_request_id_as_u32();
+                let ds_channel_id = self.next_channel_id;
+                self.next_channel_id += 1;
+                info!(
+                    downstream_id = id,
+                    ds_channel_id,
+                    request_id,
+                    "Mirroring OpenStandardMiningChannel to upstream"
+                );
+                self.pending_opens.insert(
+                    request_id,
+                    PendingChannelOpen {
+                        original_request_id: request_id,
+                        downstream_channel_id: ds_channel_id,
+                        downstream_id: id,
+                    },
+                );
+                let frame: StandardSv2Frame<Message> = match Message::Mining(msg).try_into() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to encode OpenStandardMiningChannel: {e:?}");
+                        return;
+                    }
+                };
+                if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
+                    error!("Failed to send OpenStandardMiningChannel upstream: {e:?}");
+                }
+            }
             Mining::SubmitSharesExtended(ref share) => {
                 let channel_id = share.channel_id;
                 let seq = share.sequence_number;
@@ -298,10 +328,13 @@ impl ProxyCore {
                 }
             }
             Mining::SubmitSharesStandard(ref share) => {
-                // Ack and ignore standard shares (we only support extended).
+                let channel_id = share.channel_id;
+                let seq = share.sequence_number;
+
+                // Always ack immediately.
                 let ack = SubmitSharesSuccess {
-                    channel_id: share.channel_id,
-                    last_sequence_number: share.sequence_number,
+                    channel_id,
+                    last_sequence_number: seq,
                     new_submits_accepted_count: 1,
                     new_shares_sum: 0,
                 };
@@ -310,6 +343,36 @@ impl ProxyCore {
                     Message::Mining(Mining::SubmitSharesSuccess(ack)),
                 )
                 .await;
+
+                // Gate check.
+                let mapping = self
+                    .channels
+                    .values_mut()
+                    .find(|m| m.downstream_id == id && m.downstream_channel_id == channel_id);
+
+                let Some(mapping) = mapping else {
+                    debug!(downstream_id = id, channel_id, "Standard share for unknown channel");
+                    return;
+                };
+
+                if !mapping.gate.should_forward() {
+                    mapping.shares_gated += 1;
+                    return;
+                }
+
+                mapping.shares_forwarded += 1;
+
+                let frame: StandardSv2Frame<Message> =
+                    match Message::Mining(msg).try_into() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!(downstream_id = id, "Failed to encode standard share: {e:?}");
+                            return;
+                        }
+                    };
+                if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
+                    error!("Failed to forward standard share upstream: {e:?}");
+                }
             }
             other => {
                 debug!(downstream_id = id, "Forwarding message upstream: {other}");
@@ -437,6 +500,40 @@ impl ProxyCore {
                     );
                 }
             }
+            Mining::OpenStandardMiningChannelSuccess(ref success) => {
+                let request_id = success.get_request_id_as_u32();
+                let upstream_channel_id = success.channel_id;
+
+                if let Some(pending) = self.pending_opens.remove(&request_id) {
+                    info!(
+                        downstream_id = pending.downstream_id,
+                        ds_channel_id = pending.downstream_channel_id,
+                        upstream_channel_id,
+                        "Standard channel opened successfully"
+                    );
+
+                    let gate = ShareGate::new(RateProfile::default());
+                    self.channels.insert(
+                        pending.downstream_channel_id,
+                        ChannelMapping {
+                            downstream_channel_id: pending.downstream_channel_id,
+                            upstream_channel_id: Some(upstream_channel_id),
+                            downstream_id: pending.downstream_id,
+                            gate,
+                            shares_forwarded: 0,
+                            shares_gated: 0,
+                        },
+                    );
+
+                    self.send_to_downstream(pending.downstream_id, Message::Mining(msg))
+                        .await;
+                } else {
+                    warn!(
+                        request_id,
+                        "Received OpenStandardMiningChannelSuccess for unknown request"
+                    );
+                }
+            }
             Mining::OpenMiningChannelError(ref err) => {
                 let request_id = err.request_id;
                 if let Some(pending) = self.pending_opens.remove(&request_id) {
@@ -456,6 +553,11 @@ impl ProxyCore {
                 }
             }
             Mining::NewExtendedMiningJob(ref job) => {
+                let upstream_ch = job.channel_id;
+                self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                    .await;
+            }
+            Mining::NewMiningJob(ref job) => {
                 let upstream_ch = job.channel_id;
                 self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
                     .await;
@@ -533,6 +635,10 @@ impl ProxyCore {
             Mining::NewExtendedMiningJob(mut job) => {
                 job.channel_id = new_channel_id;
                 Mining::NewExtendedMiningJob(job)
+            }
+            Mining::NewMiningJob(mut job) => {
+                job.channel_id = new_channel_id;
+                Mining::NewMiningJob(job)
             }
             Mining::SetNewPrevHash(mut prev) => {
                 prev.channel_id = new_channel_id;
