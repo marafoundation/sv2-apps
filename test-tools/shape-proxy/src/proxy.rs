@@ -5,7 +5,7 @@ use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     stratum_core::{
         codec_sv2::StandardSv2Frame,
-        mining_sv2::OpenExtendedMiningChannel,
+        mining_sv2::{OpenExtendedMiningChannel, SubmitSharesSuccess},
         parsers_sv2::Mining,
     },
 };
@@ -15,12 +15,12 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::Config,
     downstream::{accept_downstream, DownstreamEvent, DownstreamId},
+    profile::RateProfile,
+    share_gate::ShareGate,
     upstream::{Message, Reader, Writer},
 };
 
 /// Maps a downstream channel to its upstream counterpart.
-#[derive(Debug)]
-#[allow(dead_code)]
 struct ChannelMapping {
     /// The channel ID we assigned to the downstream miner.
     downstream_channel_id: u32,
@@ -28,6 +28,12 @@ struct ChannelMapping {
     upstream_channel_id: Option<u32>,
     /// Which downstream connection owns this channel.
     downstream_id: DownstreamId,
+    /// Share gate (token bucket driven by rate profile).
+    gate: ShareGate,
+    /// Shares forwarded upstream.
+    shares_forwarded: u64,
+    /// Shares dropped by the gate.
+    shares_gated: u64,
 }
 
 /// Tracks a pending channel open request we forwarded upstream.
@@ -178,18 +184,67 @@ impl ProxyCore {
             Mining::OpenExtendedMiningChannel(open_req) => {
                 self.handle_open_channel(id, open_req).await;
             }
-            Mining::SubmitSharesExtended(_) | Mining::SubmitSharesStandard(_) => {
-                // Forward shares upstream as-is for now.
-                let frame: StandardSv2Frame<Message> = match Message::Mining(msg).try_into() {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!(downstream_id = id, "Failed to encode share: {e:?}");
-                        return;
-                    }
+            Mining::SubmitSharesExtended(ref share) => {
+                let channel_id = share.channel_id;
+                let seq = share.sequence_number;
+
+                // Always ack the miner immediately (invariant 1).
+                let ack = SubmitSharesSuccess {
+                    channel_id,
+                    last_sequence_number: seq,
+                    new_submits_accepted_count: 1,
+                    new_shares_sum: 0,
                 };
+                self.send_to_downstream(
+                    id,
+                    Message::Mining(Mining::SubmitSharesSuccess(ack)),
+                )
+                .await;
+
+                // Find the channel mapping and check the gate.
+                let mapping = self
+                    .channels
+                    .values_mut()
+                    .find(|m| m.downstream_id == id && m.downstream_channel_id == channel_id);
+
+                let Some(mapping) = mapping else {
+                    debug!(downstream_id = id, channel_id, "Share for unknown channel");
+                    return;
+                };
+
+                if !mapping.gate.should_forward() {
+                    mapping.shares_gated += 1;
+                    return;
+                }
+
+                mapping.shares_forwarded += 1;
+
+                // Forward upstream.
+                let frame: StandardSv2Frame<Message> =
+                    match Message::Mining(msg).try_into() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!(downstream_id = id, "Failed to encode share: {e:?}");
+                            return;
+                        }
+                    };
                 if let Err(e) = self.upstream_writer.write_frame(frame.into()).await {
                     error!("Failed to forward share upstream: {e:?}");
                 }
+            }
+            Mining::SubmitSharesStandard(ref share) => {
+                // Ack and ignore standard shares (we only support extended).
+                let ack = SubmitSharesSuccess {
+                    channel_id: share.channel_id,
+                    last_sequence_number: share.sequence_number,
+                    new_submits_accepted_count: 1,
+                    new_shares_sum: 0,
+                };
+                self.send_to_downstream(
+                    id,
+                    Message::Mining(Mining::SubmitSharesSuccess(ack)),
+                )
+                .await;
             }
             other => {
                 debug!(downstream_id = id, "Forwarding message upstream: {other}");
@@ -293,13 +348,17 @@ impl ProxyCore {
                         "Channel opened successfully"
                     );
 
-                    // Store the channel mapping.
+                    // Store the channel mapping with a share gate.
+                    let gate = ShareGate::new(RateProfile::default());
                     self.channels.insert(
                         pending.downstream_channel_id,
                         ChannelMapping {
                             downstream_channel_id: pending.downstream_channel_id,
                             upstream_channel_id: Some(upstream_channel_id),
                             downstream_id: pending.downstream_id,
+                            gate,
+                            shares_forwarded: 0,
+                            shares_gated: 0,
                         },
                     );
 
@@ -344,15 +403,23 @@ impl ProxyCore {
                         .await;
                 }
             }
-            Mining::SubmitSharesSuccess(_) | Mining::SubmitSharesError(_) => {
-                // Forward share responses to all downstreams for now.
-                // TODO: route to the specific downstream that submitted the share.
-                let downstream_ids: Vec<DownstreamId> =
-                    self.downstreams.keys().copied().collect();
-                for ds_id in downstream_ids {
-                    self.send_to_downstream(ds_id, Message::Mining(msg.clone()))
-                        .await;
-                }
+            Mining::SubmitSharesSuccess(ref s) => {
+                // Pool acked our forwarded shares. Log only — miner was already acked.
+                debug!(
+                    channel_id = s.channel_id,
+                    last_seq = s.last_sequence_number,
+                    accepted = s.new_submits_accepted_count,
+                    "Pool acknowledged shares"
+                );
+            }
+            Mining::SubmitSharesError(ref e) => {
+                // Pool rejected a forwarded share (stale, difficulty race).
+                warn!(
+                    channel_id = e.channel_id,
+                    seq = e.sequence_number,
+                    error = %e.error_code.as_utf8_or_hex(),
+                    "Pool rejected share"
+                );
             }
             other => {
                 debug!("Upstream mining message (unhandled): {other}");

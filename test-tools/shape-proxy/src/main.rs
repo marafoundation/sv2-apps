@@ -1,6 +1,8 @@
 mod config;
 mod downstream;
+mod profile;
 mod proxy;
+mod share_gate;
 mod upstream;
 
 use std::path::PathBuf;
