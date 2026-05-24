@@ -300,7 +300,11 @@ impl ProxyCore {
                 let mapping = self
                     .channels
                     .values_mut()
-                    .find(|m| m.downstream_id == id && m.downstream_channel_id == channel_id);
+                    .find(|m| {
+                        m.downstream_id == id
+                            && (m.downstream_channel_id == channel_id
+                                || m.upstream_channel_id == Some(channel_id))
+                    });
 
                 let Some(mapping) = mapping else {
                     debug!(downstream_id = id, channel_id, "Share for unknown channel");
@@ -348,7 +352,11 @@ impl ProxyCore {
                 let mapping = self
                     .channels
                     .values_mut()
-                    .find(|m| m.downstream_id == id && m.downstream_channel_id == channel_id);
+                    .find(|m| {
+                        m.downstream_id == id
+                            && (m.downstream_channel_id == channel_id
+                                || m.upstream_channel_id == Some(channel_id))
+                    });
 
                 let Some(mapping) = mapping else {
                     debug!(downstream_id = id, channel_id, "Standard share for unknown channel");
