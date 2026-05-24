@@ -505,18 +505,22 @@ impl ProxyCore {
                 let upstream_channel_id = success.channel_id;
 
                 if let Some(pending) = self.pending_opens.remove(&request_id) {
+                    // For standard channels, the miner receives the pool's channel_id
+                    // directly (we forward verbatim), so use upstream_channel_id as the
+                    // downstream_channel_id for share routing.
+                    let effective_ds_channel_id = upstream_channel_id;
                     info!(
                         downstream_id = pending.downstream_id,
-                        ds_channel_id = pending.downstream_channel_id,
+                        effective_ds_channel_id,
                         upstream_channel_id,
                         "Standard channel opened successfully"
                     );
 
                     let gate = ShareGate::new(RateProfile::default());
                     self.channels.insert(
-                        pending.downstream_channel_id,
+                        effective_ds_channel_id,
                         ChannelMapping {
-                            downstream_channel_id: pending.downstream_channel_id,
+                            downstream_channel_id: effective_ds_channel_id,
                             upstream_channel_id: Some(upstream_channel_id),
                             downstream_id: pending.downstream_id,
                             gate,
