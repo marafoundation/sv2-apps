@@ -6,7 +6,7 @@ use stratum_apps::{
         TCP_CONNECT_TIMEOUT,
     },
     stratum_core::{
-        codec_sv2::{StandardEitherFrame, StandardSv2Frame},
+        codec_sv2::StandardSv2Frame,
         common_messages_sv2::{Protocol, SetupConnection},
         parsers_sv2::{AnyMessage, CommonMessages},
     },

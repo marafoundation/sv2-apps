@@ -1,4 +1,6 @@
 mod config;
+mod downstream;
+mod proxy;
 mod upstream;
 
 use std::path::PathBuf;
@@ -49,12 +51,20 @@ async fn main() {
         std::process::exit(1);
     }
 
-    info!("Upstream connection established. Shape proxy ready.");
+    info!("Upstream connection established");
 
-    // TODO: Step 2 — downstream listener + channel open
-    // TODO: Step 3 — message passthrough
-    // TODO: Step 4 — share gate + floor
-    // For now, just hold the connection open
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutting down");
+    let proxy = match proxy::ProxyCore::new(cfg, reader, writer) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to initialize proxy: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    info!("Shape proxy running");
+
+    if let Err(e) = proxy.run().await {
+        error!("Proxy exited with error: {e}");
+        std::process::exit(1);
+    }
 }
