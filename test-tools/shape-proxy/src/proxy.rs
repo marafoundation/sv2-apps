@@ -218,10 +218,15 @@ impl ProxyCore {
                 let forwarded_spm = m.forward_window.rate_spm(now);
                 let target_spm = m.gate.current_target_spm();
                 let headroom = HeadroomStatus::from_ratio(supply_spm, target_spm);
+                let profile = m.gate.current_profile();
+                let profile_duration = profile.active_duration_secs();
+                let profile_elapsed = m.gate.elapsed_secs();
                 ChannelStatus {
                     id: m.downstream_channel_id,
                     miner_connected: self.downstreams.contains_key(&m.downstream_id),
-                    profile: ProfileInfo::from_profile(m.gate.current_profile()),
+                    profile: ProfileInfo::from_profile(profile),
+                    profile_elapsed_secs: profile_elapsed,
+                    profile_duration_secs: profile_duration,
                     target_spm,
                     forwarded_spm,
                     supply_spm,

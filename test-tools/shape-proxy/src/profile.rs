@@ -101,6 +101,22 @@ impl RateProfile {
     }
 }
 
+impl RateProfile {
+    /// How long the profile's active/transitioning phase lasts (seconds).
+    /// After this, the profile holds at its terminal rate.
+    /// Returns None for profiles that never settle (oscillate, hold).
+    pub fn active_duration_secs(&self) -> Option<f64> {
+        match self {
+            Self::Hold { .. } => None,
+            Self::Step { at_secs, .. } => Some(*at_secs),
+            Self::Ramp { duration_secs, .. } => Some(*duration_secs),
+            Self::Stall { at_secs, duration_secs, .. } => Some(at_secs + duration_secs),
+            Self::Burst { at_secs, duration_secs, .. } => Some(at_secs + duration_secs),
+            Self::Oscillate { .. } => None,
+        }
+    }
+}
+
 impl Default for RateProfile {
     fn default() -> Self {
         Self::Hold { rate: 15.0 }

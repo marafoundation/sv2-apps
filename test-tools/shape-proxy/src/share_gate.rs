@@ -39,6 +39,10 @@ impl ShareGate {
         self.profile.rate_at(elapsed)
     }
 
+    pub fn elapsed_secs(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64()
+    }
+
     pub fn current_profile(&self) -> &RateProfile {
         &self.profile
     }

@@ -36,6 +36,8 @@ pub struct ChannelStatus {
     pub id: u32,
     pub miner_connected: bool,
     pub profile: ProfileInfo,
+    pub profile_elapsed_secs: f64,
+    pub profile_duration_secs: Option<f64>,
     pub target_spm: f64,
     pub forwarded_spm: f64,
     pub supply_spm: f64,
