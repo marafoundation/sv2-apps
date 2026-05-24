@@ -49,10 +49,7 @@ pub struct ChannelStatus {
 pub struct ProfileInfo {
     #[serde(rename = "type")]
     pub profile_type: String,
-    pub rate: Option<f64>,
-    pub before: Option<f64>,
-    pub after: Option<f64>,
-    pub at_secs: Option<f64>,
+    pub description: String,
 }
 
 impl ProfileInfo {
@@ -60,21 +57,27 @@ impl ProfileInfo {
         match p {
             RateProfile::Hold { rate } => ProfileInfo {
                 profile_type: "hold".into(),
-                rate: Some(*rate),
-                before: None,
-                after: None,
-                at_secs: None,
+                description: format!("{:.1} spm", rate),
             },
-            RateProfile::Step {
-                before,
-                after,
-                at_secs,
-            } => ProfileInfo {
+            RateProfile::Step { before, after, at_secs } => ProfileInfo {
                 profile_type: "step".into(),
-                rate: None,
-                before: Some(*before),
-                after: Some(*after),
-                at_secs: Some(*at_secs),
+                description: format!("{:.1} → {:.1} spm @ {:.0}s", before, after, at_secs),
+            },
+            RateProfile::Ramp { from, to, duration_secs } => ProfileInfo {
+                profile_type: "ramp".into(),
+                description: format!("{:.1} → {:.1} spm over {:.0}s", from, to, duration_secs),
+            },
+            RateProfile::Stall { rate, at_secs, duration_secs } => ProfileInfo {
+                profile_type: "stall".into(),
+                description: format!("{:.1} spm, zero @ {:.0}s for {:.0}s", rate, at_secs, duration_secs),
+            },
+            RateProfile::Burst { base, peak, at_secs, duration_secs } => ProfileInfo {
+                profile_type: "burst".into(),
+                description: format!("{:.1} → {:.1} spm @ {:.0}s for {:.0}s", base, peak, at_secs, duration_secs),
+            },
+            RateProfile::Oscillate { base, amp, period_secs } => ProfileInfo {
+                profile_type: "oscillate".into(),
+                description: format!("{:.1}±{:.1} spm, period {:.0}s", base, amp, period_secs),
             },
         }
     }
