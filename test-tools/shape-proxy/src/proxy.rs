@@ -13,6 +13,7 @@ use tokio::{net::TcpListener, select, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    api::{self, ApiCommand, ChannelStatus, ProfileInfo, ProxyStatus},
     config::Config,
     downstream::{accept_downstream, DownstreamEvent, DownstreamId},
     profile::RateProfile,
@@ -113,7 +114,25 @@ impl ProxyCore {
 
         let (ds_event_tx, mut ds_event_rx) = mpsc::unbounded_channel::<DownstreamEvent>();
 
+        // API channels
+        let (api_cmd_tx, mut api_cmd_rx) = mpsc::unbounded_channel::<ApiCommand>();
+        let (status_tx, status_rx) = tokio::sync::watch::channel(ProxyStatus::default());
+
+        // Spawn HTTP API server
+        let api_listen = self.config.api_listen;
+        let router = api::create_router(status_rx, api_cmd_tx);
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(api_listen)
+                .await
+                .expect("Failed to bind API listener");
+            info!("HTTP API listening on {}", api_listen);
+            axum::serve(listener, router).await.ok();
+        });
+
         loop {
+            // Publish status snapshot for the API
+            let _ = status_tx.send(self.build_status());
+
             select! {
                 // Accept new downstream connections.
                 accept_result = listener.accept() => {
@@ -154,7 +173,53 @@ impl ProxyCore {
                         }
                     }
                 }
+
+                // Handle API commands.
+                Some(cmd) = api_cmd_rx.recv() => {
+                    self.handle_api_command(cmd);
+                }
             }
+        }
+    }
+
+    fn handle_api_command(&mut self, cmd: ApiCommand) {
+        match cmd {
+            ApiCommand::SetProfile { channel_id, profile } => {
+                if let Some(mapping) = self.channels.get_mut(&channel_id) {
+                    info!(channel_id, "Setting profile: {:?}", profile);
+                    mapping.gate.set_profile(profile);
+                } else {
+                    warn!(channel_id, "SetProfile for unknown channel");
+                }
+            }
+            ApiCommand::SetAllProfiles { profile } => {
+                info!("Broadcasting profile to all channels: {:?}", profile);
+                for mapping in self.channels.values_mut() {
+                    mapping.gate.set_profile(profile.clone());
+                }
+            }
+        }
+    }
+
+    fn build_status(&self) -> ProxyStatus {
+        let channels = self
+            .channels
+            .values()
+            .map(|m| ChannelStatus {
+                id: m.downstream_channel_id,
+                miner_connected: self.downstreams.contains_key(&m.downstream_id),
+                profile: ProfileInfo::from_profile(m.gate.current_profile()),
+                target_spm: m.gate.current_target_spm(),
+                forwarded_spm: 0.0, // TODO: rolling window
+                supply_spm: 0.0,    // TODO: rolling window
+                shares_forwarded: m.shares_forwarded,
+                shares_gated: m.shares_gated,
+            })
+            .collect();
+
+        ProxyStatus {
+            upstream_connected: true,
+            channels,
         }
     }
 

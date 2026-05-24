@@ -39,6 +39,10 @@ impl ShareGate {
         self.profile.rate_at(elapsed)
     }
 
+    pub fn current_profile(&self) -> &RateProfile {
+        &self.profile
+    }
+
     pub fn set_profile(&mut self, profile: RateProfile) {
         let initial_rate = profile.rate_at(0.0);
         self.profile = profile;
