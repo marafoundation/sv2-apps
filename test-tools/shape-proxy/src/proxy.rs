@@ -16,6 +16,7 @@ use crate::{
     api::{self, ApiCommand, ChannelStatus, ProfileInfo, ProxyStatus},
     config::Config,
     downstream::{accept_downstream, DownstreamEvent, DownstreamId},
+    metrics::{HeadroomStatus, RollingWindow},
     profile::RateProfile,
     share_gate::ShareGate,
     upstream::{Message, Reader, Writer},
@@ -35,6 +36,10 @@ struct ChannelMapping {
     shares_forwarded: u64,
     /// Shares dropped by the gate.
     shares_gated: u64,
+    /// Rolling window: all shares arriving from downstream (supply).
+    supply_window: RollingWindow,
+    /// Rolling window: shares forwarded upstream.
+    forward_window: RollingWindow,
 }
 
 /// Tracks a pending channel open request we forwarded upstream.
@@ -202,18 +207,26 @@ impl ProxyCore {
     }
 
     fn build_status(&self) -> ProxyStatus {
+        let now = std::time::Instant::now();
         let channels = self
             .channels
             .values()
-            .map(|m| ChannelStatus {
-                id: m.downstream_channel_id,
-                miner_connected: self.downstreams.contains_key(&m.downstream_id),
-                profile: ProfileInfo::from_profile(m.gate.current_profile()),
-                target_spm: m.gate.current_target_spm(),
-                forwarded_spm: 0.0, // TODO: rolling window
-                supply_spm: 0.0,    // TODO: rolling window
-                shares_forwarded: m.shares_forwarded,
-                shares_gated: m.shares_gated,
+            .map(|m| {
+                let supply_spm = m.supply_window.rate_spm(now);
+                let forwarded_spm = m.forward_window.rate_spm(now);
+                let target_spm = m.gate.current_target_spm();
+                let headroom = HeadroomStatus::from_ratio(supply_spm, target_spm);
+                ChannelStatus {
+                    id: m.downstream_channel_id,
+                    miner_connected: self.downstreams.contains_key(&m.downstream_id),
+                    profile: ProfileInfo::from_profile(m.gate.current_profile()),
+                    target_spm,
+                    forwarded_spm,
+                    supply_spm,
+                    headroom: headroom.as_str().to_string(),
+                    shares_forwarded: m.shares_forwarded,
+                    shares_gated: m.shares_gated,
+                }
             })
             .collect();
 
@@ -311,12 +324,16 @@ impl ProxyCore {
                     return;
                 };
 
+                let now = std::time::Instant::now();
+                mapping.supply_window.record(now);
+
                 if !mapping.gate.should_forward() {
                     mapping.shares_gated += 1;
                     return;
                 }
 
                 mapping.shares_forwarded += 1;
+                mapping.forward_window.record(now);
 
                 // Forward upstream.
                 let frame: StandardSv2Frame<Message> =
@@ -363,12 +380,16 @@ impl ProxyCore {
                     return;
                 };
 
+                let now = std::time::Instant::now();
+                mapping.supply_window.record(now);
+
                 if !mapping.gate.should_forward() {
                     mapping.shares_gated += 1;
                     return;
                 }
 
                 mapping.shares_forwarded += 1;
+                mapping.forward_window.record(now);
 
                 let frame: StandardSv2Frame<Message> =
                     match Message::Mining(msg).try_into() {
@@ -495,6 +516,8 @@ impl ProxyCore {
                             gate,
                             shares_forwarded: 0,
                             shares_gated: 0,
+                            supply_window: RollingWindow::new(),
+                            forward_window: RollingWindow::new(),
                         },
                     );
 
@@ -534,6 +557,8 @@ impl ProxyCore {
                             gate,
                             shares_forwarded: 0,
                             shares_gated: 0,
+                            supply_window: RollingWindow::new(),
+                            forward_window: RollingWindow::new(),
                         },
                     );
 

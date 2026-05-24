@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod downstream;
+mod metrics;
 mod profile;
 mod proxy;
 mod share_gate;

@@ -39,6 +39,7 @@ pub struct ChannelStatus {
     pub target_spm: f64,
     pub forwarded_spm: f64,
     pub supply_spm: f64,
+    pub headroom: String,
     pub shares_forwarded: u64,
     pub shares_gated: u64,
 }
