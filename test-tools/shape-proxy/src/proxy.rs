@@ -455,18 +455,25 @@ impl ProxyCore {
                     );
                 }
             }
-            Mining::NewExtendedMiningJob(_)
-            | Mining::SetNewPrevHash(_)
-            | Mining::SetTarget(_)
-            | Mining::SetExtranoncePrefix(_) => {
-                // Broadcast to all connected downstreams.
-                debug!("Broadcasting upstream message to all downstreams: {msg}");
-                let downstream_ids: Vec<DownstreamId> =
-                    self.downstreams.keys().copied().collect();
-                for ds_id in downstream_ids {
-                    self.send_to_downstream(ds_id, Message::Mining(msg.clone()))
-                        .await;
-                }
+            Mining::NewExtendedMiningJob(ref job) => {
+                let upstream_ch = job.channel_id;
+                self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                    .await;
+            }
+            Mining::SetNewPrevHash(ref prev) => {
+                let upstream_ch = prev.channel_id;
+                self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                    .await;
+            }
+            Mining::SetTarget(ref target) => {
+                let upstream_ch = target.channel_id;
+                self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                    .await;
+            }
+            Mining::SetExtranoncePrefix(ref prefix) => {
+                let upstream_ch = prefix.channel_id;
+                self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                    .await;
             }
             Mining::SubmitSharesSuccess(ref s) => {
                 // Pool acked our forwarded shares. Log only — miner was already acked.
@@ -493,6 +500,56 @@ impl ProxyCore {
     }
 
     /// Send a message to a specific downstream connection.
+    /// Route an upstream message to the downstream that owns the given upstream channel.
+    /// The message's channel_id is rewritten from upstream to downstream before sending.
+    async fn forward_to_downstream_by_upstream_channel(
+        &mut self,
+        upstream_channel_id: u32,
+        msg: Mining<'static>,
+    ) {
+        // Find the channel pair that has this upstream_channel_id.
+        let pair = self
+            .channels
+            .values()
+            .find(|m| m.upstream_channel_id == Some(upstream_channel_id));
+
+        let Some(pair) = pair else {
+            // No pair found — might be for a phantom or not-yet-mapped channel.
+            debug!(upstream_channel_id, "No downstream mapping for upstream channel");
+            return;
+        };
+
+        let ds_id = pair.downstream_id;
+        let ds_channel_id = pair.downstream_channel_id;
+
+        // Rewrite channel_id in the message from upstream to downstream.
+        let rewritten = Self::rewrite_channel_id(msg, ds_channel_id);
+        self.send_to_downstream(ds_id, Message::Mining(rewritten)).await;
+    }
+
+    /// Rewrite the channel_id field in a Mining message.
+    fn rewrite_channel_id(msg: Mining<'static>, new_channel_id: u32) -> Mining<'static> {
+        match msg {
+            Mining::NewExtendedMiningJob(mut job) => {
+                job.channel_id = new_channel_id;
+                Mining::NewExtendedMiningJob(job)
+            }
+            Mining::SetNewPrevHash(mut prev) => {
+                prev.channel_id = new_channel_id;
+                Mining::SetNewPrevHash(prev)
+            }
+            Mining::SetTarget(mut target) => {
+                target.channel_id = new_channel_id;
+                Mining::SetTarget(target)
+            }
+            Mining::SetExtranoncePrefix(mut prefix) => {
+                prefix.channel_id = new_channel_id;
+                Mining::SetExtranoncePrefix(prefix)
+            }
+            other => other,
+        }
+    }
+
     async fn send_to_downstream(&mut self, id: DownstreamId, msg: Message) {
         let frame: StandardSv2Frame<Message> = match msg.try_into() {
             Ok(f) => f,
