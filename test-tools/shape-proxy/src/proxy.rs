@@ -607,7 +607,9 @@ impl ProxyCore {
 
     /// Send a message to a specific downstream connection.
     /// Route an upstream message to the downstream that owns the given upstream channel.
-    /// The message's channel_id is rewritten from upstream to downstream before sending.
+    /// For extended channels, the message is forwarded WITHOUT rewriting channel_id —
+    /// the downstream received the pool's channel_id in OpenExtendedMiningChannelSuccess
+    /// and expects subsequent messages on that same ID.
     async fn forward_to_downstream_by_upstream_channel(
         &mut self,
         upstream_channel_id: u32,
@@ -626,11 +628,11 @@ impl ProxyCore {
         };
 
         let ds_id = pair.downstream_id;
-        let ds_channel_id = pair.downstream_channel_id;
 
-        // Rewrite channel_id in the message from upstream to downstream.
-        let rewritten = Self::rewrite_channel_id(msg, ds_channel_id);
-        self.send_to_downstream(ds_id, Message::Mining(rewritten)).await;
+        // Forward verbatim — don't rewrite channel_id. The downstream received the
+        // pool's channel_id in the OpenExtendedMiningChannelSuccess and expects
+        // all subsequent messages to use it.
+        self.send_to_downstream(ds_id, Message::Mining(msg)).await;
     }
 
     /// Rewrite the channel_id field in a Mining message.
