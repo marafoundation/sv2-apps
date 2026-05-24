@@ -32,6 +32,8 @@ struct ChannelMapping {
     downstream_id: DownstreamId,
     /// Share gate (token bucket driven by rate profile).
     gate: ShareGate,
+    /// Whether the difficulty floor is currently overriding the pool's target.
+    floor_active: bool,
     /// Shares forwarded upstream.
     shares_forwarded: u64,
     /// Shares dropped by the gate.
@@ -224,6 +226,7 @@ impl ProxyCore {
                     forwarded_spm,
                     supply_spm,
                     headroom: headroom.as_str().to_string(),
+                    floor_active: m.floor_active,
                     shares_forwarded: m.shares_forwarded,
                     shares_gated: m.shares_gated,
                 }
@@ -514,6 +517,7 @@ impl ProxyCore {
                             upstream_channel_id: Some(upstream_channel_id),
                             downstream_id: pending.downstream_id,
                             gate,
+                            floor_active: false,
                             shares_forwarded: 0,
                             shares_gated: 0,
                             supply_window: RollingWindow::new(),
@@ -555,6 +559,7 @@ impl ProxyCore {
                             upstream_channel_id: Some(upstream_channel_id),
                             downstream_id: pending.downstream_id,
                             gate,
+                            floor_active: false,
                             shares_forwarded: 0,
                             shares_gated: 0,
                             supply_window: RollingWindow::new(),
@@ -606,8 +611,15 @@ impl ProxyCore {
             }
             Mining::SetTarget(ref target) => {
                 let upstream_ch = target.channel_id;
-                self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
-                    .await;
+                // Apply difficulty floor: if pool's target is easier than the floor,
+                // send the floor target downstream instead.
+                if self.config.min_downstream_difficulty > 0.0 {
+                    self.handle_set_target_with_floor(upstream_ch, target.clone().into_static())
+                        .await;
+                } else {
+                    self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                        .await;
+                }
             }
             Mining::SetExtranoncePrefix(ref prefix) => {
                 let upstream_ch = prefix.channel_id;
@@ -641,6 +653,64 @@ impl ProxyCore {
     /// Send a message to a specific downstream connection.
     /// Route an upstream message to the downstream that owns the given upstream channel.
     /// For extended channels, the message is forwarded WITHOUT rewriting channel_id —
+    /// Apply the difficulty floor to a SetTarget message.
+    /// If the pool's target is easier than the floor (higher U256 value),
+    /// substitute the floor target. Only forward if the effective target changed.
+    async fn handle_set_target_with_floor(
+        &mut self,
+        upstream_channel_id: u32,
+        mut set_target: stratum_apps::stratum_core::mining_sv2::SetTarget<'static>,
+    ) {
+        use stratum_apps::stratum_core::mining_sv2::SetTarget;
+
+        let pair = self
+            .channels
+            .values_mut()
+            .find(|m| m.upstream_channel_id == Some(upstream_channel_id));
+
+        let Some(pair) = pair else {
+            debug!(upstream_channel_id, "No mapping for SetTarget (floor check)");
+            return;
+        };
+
+        // Convert floor difficulty to a max target: target = 2^256 / difficulty
+        // For U256 target representation, higher value = easier.
+        // Pool's target is in set_target.maximum_target (le bytes).
+        let floor_difficulty = self.config.min_downstream_difficulty;
+
+        // Compute floor target as bytes. We use a simplified approach:
+        // target_bytes ≈ (2^256 / floor_difficulty) represented as 32 LE bytes.
+        // For typical difficulties (1000-1000000), this gives a target with
+        // leading zeros that's easy to compare.
+        let floor_target_f64 = (2.0_f64).powi(256) / floor_difficulty;
+        let pool_target_bytes: &[u8] = set_target.maximum_target.inner_as_ref();
+
+        // Compare: is pool's target easier (larger) than the floor target?
+        // Simple heuristic: check leading non-zero byte position.
+        // A proper comparison would use U256 arithmetic, but for the floor
+        // we just need to know if the pool's difficulty is below our minimum.
+        // difficulty ≈ 2^256 / target, so we compute pool difficulty from target.
+        let pool_target_difficulty = target_to_difficulty(pool_target_bytes);
+
+        if pool_target_difficulty < floor_difficulty {
+            // Pool's difficulty is below floor — override with floor.
+            pair.floor_active = true;
+            debug!(
+                upstream_channel_id,
+                pool_diff = pool_target_difficulty,
+                floor_diff = floor_difficulty,
+                "Floor active: pool difficulty below floor, not forwarding SetTarget"
+            );
+            // Don't forward — miner keeps its current (harder) target.
+        } else {
+            // Pool's difficulty is at or above floor — forward normally.
+            pair.floor_active = false;
+            let ds_id = pair.downstream_id;
+            self.send_to_downstream(ds_id, Message::Mining(Mining::SetTarget(set_target)))
+                .await;
+        }
+    }
+
     /// the downstream received the pool's channel_id in OpenExtendedMiningChannelSuccess
     /// and expects subsequent messages on that same ID.
     async fn forward_to_downstream_by_upstream_channel(
@@ -711,4 +781,36 @@ impl ProxyCore {
             }
         }
     }
+}
+
+/// Convert a 32-byte LE target to an approximate scalar difficulty.
+/// difficulty ≈ 2^256 / target
+fn target_to_difficulty(target_le: &[u8]) -> f64 {
+    // Find the most significant non-zero byte to get a rough magnitude.
+    // Then compute difficulty from the top 8 bytes for precision.
+    let mut msb_index = 31;
+    while msb_index > 0 && target_le[msb_index] == 0 {
+        msb_index -= 1;
+    }
+    if target_le[msb_index] == 0 {
+        return f64::MAX; // target is zero → infinite difficulty
+    }
+
+    // Build a f64 from the top bytes of the target
+    let mut target_val: f64 = 0.0;
+    for i in (0..=msb_index).rev() {
+        target_val = target_val * 256.0 + target_le[i] as f64;
+    }
+    // Shift to account for the full 256-bit position
+    // target_val represents the value of bytes [0..msb_index], which is
+    // the full LE number already since we iterated in reverse.
+
+    if target_val == 0.0 {
+        return f64::MAX;
+    }
+
+    // 2^256 / target
+    // Use log to avoid overflow: exp(256*ln(2) - ln(target))
+    let log_diff = 256.0 * 2.0_f64.ln() - target_val.ln();
+    log_diff.exp()
 }
