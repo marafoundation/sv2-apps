@@ -801,14 +801,17 @@ impl ProxyCore {
             }
             Mining::SetTarget(ref target) => {
                 let upstream_ch = target.channel_id;
-                // Apply difficulty floor: if pool's target is easier than the floor,
-                // send the floor target downstream instead.
-                if self.config.min_downstream_difficulty > 0.0 {
-                    self.handle_set_target_with_floor(upstream_ch, target.clone().into_static())
-                        .await;
-                } else {
-                    self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
-                        .await;
+                // Store the pool's target for share validity checks, but do NOT
+                // forward to the miner. The miner works at a fixed difficulty
+                // (set at channel-open time from the floor config) and never changes.
+                // This guarantees constant supply regardless of pool vardiff behavior.
+                let pair = self
+                    .channels
+                    .values_mut()
+                    .find(|m| m.upstream_channel_id == Some(upstream_ch));
+                if let Some(pair) = pair {
+                    pair.floor_active = true;
+                    debug!(upstream_ch, "SetTarget absorbed (miner keeps fixed difficulty)");
                 }
             }
             Mining::SetExtranoncePrefix(ref prefix) => {
