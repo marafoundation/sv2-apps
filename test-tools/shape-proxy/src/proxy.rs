@@ -905,18 +905,19 @@ impl ProxyCore {
             .values()
             .find(|m| m.upstream_channel_id == Some(upstream_channel_id));
 
-        let Some(pair) = pair else {
-            // No pair found -- might be for a phantom or not-yet-mapped channel.
-            debug!(upstream_channel_id, "No downstream mapping for upstream channel");
-            return;
-        };
-
-        let ds_id = pair.downstream_id;
-
-        // Forward verbatim -- don't rewrite channel_id. The downstream received the
-        // pool's channel_id in the OpenExtendedMiningChannelSuccess and expects
-        // all subsequent messages to use it.
-        self.send_to_downstream(ds_id, Message::Mining(msg)).await;
+        if let Some(pair) = pair {
+            let ds_id = pair.downstream_id;
+            // Forward verbatim -- don't rewrite channel_id.
+            self.send_to_downstream(ds_id, Message::Mining(msg)).await;
+        } else {
+            // No exact match — this is likely a group-channel message.
+            // Broadcast to all connected downstreams.
+            let downstream_ids: Vec<_> = self.downstreams.keys().copied().collect();
+            for ds_id in downstream_ids {
+                self.send_to_downstream(ds_id, Message::Mining(msg.clone()))
+                    .await;
+            }
+        }
     }
 
     /// Rewrite the channel_id field in a Mining message.
