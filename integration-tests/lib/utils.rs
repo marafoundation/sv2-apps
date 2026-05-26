@@ -411,9 +411,20 @@ pub mod http {
     /// Unlike `make_get_request`, this does NOT panic on non-2xx status codes (e.g. 404),
     /// making it suitable for testing API error responses.
     /// Only retries on 5xx errors or connection failures.
-    pub fn make_get_request_with_status(url: &str, retries: usize) -> (i32, Vec<u8>) {
+    ///
+    /// `request_timeout` is the per-request timeout applied to each attempt; `None`
+    /// leaves the underlying client default (which is effectively unbounded).
+    pub fn make_get_request_with_status(
+        url: &str,
+        retries: usize,
+        request_timeout: Option<std::time::Duration>,
+    ) -> (i32, Vec<u8>) {
         for attempt in 1..=retries {
-            let response = minreq::get(url).send();
+            let mut req = minreq::get(url);
+            if let Some(t) = request_timeout {
+                req = req.with_timeout(t.as_secs().max(1));
+            }
+            let response = req.send();
             match response {
                 Ok(res) => {
                     let status_code = res.status_code;

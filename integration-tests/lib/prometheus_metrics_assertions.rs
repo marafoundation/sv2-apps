@@ -1,306 +1,247 @@
 //! Helpers for querying and asserting on Prometheus metrics and JSON API endpoints
 //! exposed by SV2 components during integration tests.
+//!
+//! All network-touching helpers (`fetch_*`, `poll_*`) live on [`MonitoringApi`],
+//! a thin typed wrapper around the `SocketAddr` of a component's monitoring
+//! server. Pure parsing / assertion helpers on raw metrics text remain as free
+//! functions below.
 
 use std::{collections::HashMap, fmt, net::SocketAddr, time::Duration};
-use stratum_apps::monitoring::{
-    routes, GlobalInfo, ServerChannelsResponse, ServerResponse, Sv1ClientsResponse,
-    Sv2ClientsResponse,
-};
+use stratum_apps::monitoring::routes;
 
-// Every monitoring HTTP endpoint has a typed production struct in
-// `stratum_apps::monitoring` (`GlobalInfo`, `HealthResponse`, `RootResponse`,
-// `ServerResponse`, `ServerChannelsResponse`, `Sv2ClientsResponse`, ...).
-// Tests deserialize directly into those types via `fetch_api_typed` /
-// `fetch_api_with_status_typed` rather than indexing into untyped JSON.
-//
-// Note on async: `minreq` is a synchronous HTTP client with no async variant,
-// so all fetch helpers wrap it in `spawn_blocking` to avoid stalling the
-// tokio runtime.
+// `minreq` is a synchronous HTTP client with no async variant, so all fetch
+// helpers wrap it in `spawn_blocking` to avoid stalling the tokio runtime.
 
-/// Fetch the raw Prometheus text-format metrics from a component's `/metrics` endpoint.
-/// Uses `spawn_blocking` because `minreq` has no async variant.
-/// Path is taken from `stratum_apps::monitoring::routes::METRICS`.
-pub async fn fetch_metrics(monitoring_addr: SocketAddr) -> String {
-    let url = format!("http://{}{}", monitoring_addr, routes::METRICS);
-    tokio::task::spawn_blocking(move || {
-        let bytes = crate::utils::http::make_get_request(&url, 5);
-        String::from_utf8(bytes).expect("metrics response should be valid UTF-8")
-    })
-    .await
-    .expect("spawn_blocking for fetch_metrics panicked")
-}
-
-/// Fetch the JSON body from a component's API endpoint (e.g. `/api/v1/health`).
-/// Uses `spawn_blocking` to avoid blocking the tokio runtime with synchronous HTTP calls.
-pub async fn fetch_api(monitoring_addr: SocketAddr, path: &str) -> String {
-    let url = format!("http://{}{}", monitoring_addr, path);
-    tokio::task::spawn_blocking(move || {
-        let bytes = crate::utils::http::make_get_request(&url, 5);
-        String::from_utf8(bytes).expect("api response should be valid UTF-8")
-    })
-    .await
-    .expect("spawn_blocking for fetch_api panicked")
-}
-
-/// Fetch a JSON API endpoint and parse the response into a typed struct.
-pub async fn fetch_api_typed<T: serde::de::DeserializeOwned>(
-    monitoring_addr: SocketAddr,
-    path: &str,
-) -> T {
-    let body = fetch_api(monitoring_addr, path).await;
-    serde_json::from_str(&body).unwrap_or_else(|e| {
-        panic!(
-            "Failed to parse JSON from {} into {}: {}\nBody: {}",
-            path,
-            std::any::type_name::<T>(),
-            e,
-            body
-        )
-    })
-}
-
-/// Fetch a JSON API endpoint returning both the HTTP status code and the parsed body
-/// deserialized into the caller-specified type `T`.
+/// Typed client for the monitoring HTTP API of a single SV2 component.
 ///
-/// Unlike `fetch_api_typed`, this does **not** panic on non-2xx responses, so it can be
-/// used to test error endpoints. For 404/error bodies, parametrize `T` with the
-/// production `ErrorResponse` type to keep the assertion fully typed.
-pub async fn fetch_api_with_status_typed<T: serde::de::DeserializeOwned + Send + 'static>(
-    monitoring_addr: SocketAddr,
-    path: &str,
-) -> (i32, T) {
-    let url = format!("http://{}{}", monitoring_addr, path);
-    let type_name = std::any::type_name::<T>();
-    tokio::task::spawn_blocking(move || {
-        let (status, bytes) = crate::utils::http::make_get_request_with_status(&url, 5);
+/// Wraps a `SocketAddr` plus the request policy (retry count, per-request
+/// timeout) used for every fetch. Construct via [`MonitoringApi::builder`].
+#[derive(Debug, Clone, Copy)]
+pub struct MonitoringApi {
+    addr: SocketAddr,
+    retries: usize,
+    request_timeout: Duration,
+}
+
+/// Default per-request HTTP timeout. Bounds individual attempts so a hung
+/// monitoring server cannot stall a test run all the way to its outer
+/// deadline; the retry-on-5xx-or-connection-error loop then takes over.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default retry count for each request.
+const DEFAULT_RETRIES: usize = 5;
+
+/// Builder for [`MonitoringApi`]. Created via [`MonitoringApi::builder`].
+///
+/// Unset knobs fall back to the module-level defaults
+/// ([`DEFAULT_RETRIES`], [`DEFAULT_REQUEST_TIMEOUT`]).
+#[derive(Debug, Clone, Copy)]
+pub struct MonitoringApiBuilder {
+    addr: SocketAddr,
+    retries: usize,
+    request_timeout: Duration,
+}
+
+impl MonitoringApiBuilder {
+    fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            retries: DEFAULT_RETRIES,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+
+    /// Override the retry count. Use `1` in negative-path tests to fail fast.
+    pub fn retries(mut self, retries: usize) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    /// Override the per-request timeout applied to each individual attempt.
+    pub fn request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Consume the builder and produce an immutable [`MonitoringApi`].
+    pub fn build(self) -> MonitoringApi {
+        MonitoringApi {
+            addr: self.addr,
+            retries: self.retries,
+            request_timeout: self.request_timeout,
+        }
+    }
+}
+
+impl MonitoringApi {
+    /// Start a builder for a client at `addr`. Knobs default to
+    /// [`DEFAULT_RETRIES`] retries and [`DEFAULT_REQUEST_TIMEOUT`] per request;
+    /// see [`MonitoringApiBuilder`] for overrides.
+    pub fn builder(addr: SocketAddr) -> MonitoringApiBuilder {
+        MonitoringApiBuilder::new(addr)
+    }
+
+    /// Underlying socket address (useful for diagnostics or constructing raw URLs).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    // ── Internal HTTP helper ───────────────────────────────────────
+
+    /// Issue a GET against `path` and return the HTTP status + raw bytes.
+    /// Centralises URL construction, `spawn_blocking`, the per-request
+    /// timeout, and the retry-on-5xx loop for every public fetcher/poller.
+    async fn http_get_with_status(&self, path: &str) -> (i32, Vec<u8>) {
+        let url = format!("http://{}{}", self.addr, path);
+        let retries = self.retries;
+        let timeout = self.request_timeout;
+        tokio::task::spawn_blocking(move || {
+            crate::utils::http::make_get_request_with_status(&url, retries, Some(timeout))
+        })
+        .await
+        .expect("spawn_blocking for http_get_with_status panicked")
+    }
+
+    // ── Raw fetches ────────────────────────────────────────────────
+
+    /// Fetch the raw Prometheus text-format metrics from `/metrics`.
+    /// Panics on any non-2xx status — `/metrics` should always succeed.
+    pub async fn fetch_metrics(&self) -> String {
+        let (status, bytes) = self.http_get_with_status(routes::METRICS).await;
+        assert!(
+            (200..300).contains(&status),
+            "GET {} returned non-2xx status {}",
+            routes::METRICS,
+            status
+        );
+        String::from_utf8(bytes).expect("metrics response should be valid UTF-8")
+    }
+
+    /// Fetch the JSON body from an API endpoint (e.g. `/api/v1/health`).
+    /// Panics on any non-2xx status — use [`Self::fetch_with_status`] for error endpoints.
+    pub async fn fetch(&self, path: &str) -> String {
+        let (status, bytes) = self.http_get_with_status(path).await;
+        assert!(
+            (200..300).contains(&status),
+            "GET {} returned non-2xx status {}",
+            path,
+            status
+        );
+        String::from_utf8(bytes).expect("api response should be valid UTF-8")
+    }
+
+    /// Fetch a JSON API endpoint and parse the response into a typed struct.
+    pub async fn fetch_typed<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
+        let body = self.fetch(path).await;
+        serde_json::from_str(&body).unwrap_or_else(|e| {
+            panic!(
+                "Failed to parse JSON from {} into {}: {}\nBody: {}",
+                path,
+                std::any::type_name::<T>(),
+                e,
+                body
+            )
+        })
+    }
+
+    /// Fetch a JSON API endpoint returning both the HTTP status code and the parsed body
+    /// deserialized into the caller-specified type `T`.
+    ///
+    /// Unlike `fetch_typed`, this does **not** panic on non-2xx responses, so it can be
+    /// used to test error endpoints. For 404/error bodies, parametrize `T` with the
+    /// production `ErrorResponse` type to keep the assertion fully typed.
+    pub async fn fetch_with_status<T: serde::de::DeserializeOwned>(&self, path: &str) -> (i32, T) {
+        let (status, bytes) = self.http_get_with_status(path).await;
         let body = String::from_utf8(bytes).expect("api response should be valid UTF-8");
         let value: T = serde_json::from_str(&body).unwrap_or_else(|e| {
             panic!(
                 "Failed to parse JSON from {} (status {}) into {}: {}\nBody: {}",
-                url, status, type_name, e, body
+                path,
+                status,
+                std::any::type_name::<T>(),
+                e,
+                body
             )
         });
         (status, value)
-    })
-    .await
-    .expect("spawn_blocking for fetch_api_with_status_typed panicked")
-}
+    }
 
-/// Poll a JSON API endpoint until a numeric field at `json_pointer` (RFC 6901, e.g.
-/// `"/sv2_clients/total_clients"`) reaches `>= min`. Returns the full JSON value once
-/// satisfied. Panics if the condition is not met within `timeout`.
-///
-/// This is the JSON equivalent of `poll_until_metric_gte` — use it for endpoints whose
-/// data only appears after the monitoring snapshot cache has refreshed.
-pub async fn poll_until_api_field_gte(
-    monitoring_addr: SocketAddr,
-    path: &str,
-    json_pointer: &str,
-    min: f64,
-    timeout: Duration,
-) -> serde_json::Value {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        // Fetch via `_typed::<serde_json::Value>` so that transient non-2xx responses
-        // (e.g. 404 before the snapshot cache has populated) are retried instead of
-        // panicking. The pointer-based polling here is intentionally untyped because
-        // it polls many different endpoints by JSON path; typed pollers are provided
-        // for the common cases below.
-        let (status, json) =
-            fetch_api_with_status_typed::<serde_json::Value>(monitoring_addr, path).await;
-        if (200..300).contains(&status) {
-            if let Some(val) = json.pointer(json_pointer) {
-                let num = val.as_f64().unwrap_or(0.0);
-                if num >= min {
-                    return json;
+    // ── Polling helpers ────────────────────────────────────────────
+
+    /// Poll `path` until the response deserialises into `T` and `predicate` returns true.
+    ///
+    /// Retries every 500 ms until `timeout`. Non-2xx responses and
+    /// deserialisation failures are tolerated (the endpoint may not be ready
+    /// yet — for example a `/api/v1/clients/{id}` route returns 404 until the
+    /// snapshot cache first populates). On timeout, the panic message includes
+    /// the path, target type, last status, and last body so CI failures are
+    /// debuggable without re-running with extra logging.
+    pub async fn poll_until<T, F>(&self, path: &'static str, timeout: Duration, predicate: F) -> T
+    where
+        T: serde::de::DeserializeOwned,
+        F: Fn(&T) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Accumulators read only on the timeout path so failures are debuggable.
+        #[allow(unused_assignments)]
+        let mut last_status: i32 = 0;
+        #[allow(unused_assignments)]
+        let mut last_body = String::new();
+        loop {
+            let (status, body) = self.http_get_with_status(path).await;
+            last_status = status;
+            last_body = String::from_utf8_lossy(&body).into_owned();
+            if (200..300).contains(&status) {
+                if let Ok(resp) = serde_json::from_str::<T>(&last_body) {
+                    if predicate(&resp) {
+                        return resp;
+                    }
                 }
             }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "poll_until: predicate on {} (-> {}) never satisfied within {:?}. \
+                     Last status: {}. Last body:\n{}",
+                    path,
+                    std::any::type_name::<T>(),
+                    timeout,
+                    last_status,
+                    last_body,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "JSON field '{}' at {} never reached >= {} within {:?}. Last status: {}. Last response:\n{}",
-                json_pointer,
-                path,
-                min,
-                timeout,
-                status,
-                serde_json::to_string_pretty(&json).unwrap_or_default()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-}
 
-/// Internal: poll `path` until `condition` is met, returning the parsed `T`.
-/// Retries on non-2xx responses (endpoint may not be ready yet).
-async fn poll_until<T, F>(
-    monitoring_addr: SocketAddr,
-    path: &'static str,
-    timeout: Duration,
-    condition: F,
-    timeout_msg: &'static str,
-) -> T
-where
-    T: serde::de::DeserializeOwned,
-    F: Fn(&T) -> bool,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let (status, body) = {
-            let url = format!("http://{}{}", monitoring_addr, path);
-            tokio::task::spawn_blocking(move || {
-                crate::utils::http::make_get_request_with_status(&url, 5)
-            })
-            .await
-            .expect("spawn_blocking panicked")
-        };
-        if (200..300).contains(&status) {
-            let body_str = String::from_utf8(body).expect("response should be valid UTF-8");
-            if let Ok(resp) = serde_json::from_str::<T>(&body_str) {
-                if condition(&resp) {
-                    return resp;
+    /// Poll `/metrics` until a line matching `metric` has value >= `min`, or panic
+    /// after `timeout`. Polls every 100ms to react quickly while tolerating cache
+    /// refresh jitter.
+    ///
+    /// Returns the full metrics text from the successful scrape so callers can make
+    /// additional assertions without a second fetch.
+    pub async fn poll_metric_gte<'a, M: Into<Metric<'a>>>(
+        &self,
+        metric: M,
+        min: f64,
+        timeout: Duration,
+    ) -> String {
+        let metric = metric.into();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let metrics = self.fetch_metrics().await;
+            if let Some(v) = parse_metric_value(&metrics, metric) {
+                if v >= min {
+                    return metrics;
                 }
             }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "Metric '{}' never reached >= {} within {:?}. Last /metrics response:\n{}",
+                    metric, min, timeout, metrics
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("{} within {:?}", timeout_msg, timeout);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
     }
-}
-
-/// Poll `/api/v1/global` until `sv2_clients.total_clients >= min`.
-/// Returns the parsed `GlobalInfo` once satisfied.
-pub async fn poll_until_global_sv2_clients_gte(
-    monitoring_addr: SocketAddr,
-    min: usize,
-    timeout: Duration,
-) -> GlobalInfo {
-    poll_until(
-        monitoring_addr,
-        routes::GLOBAL,
-        timeout,
-        move |r: &GlobalInfo| {
-            r.sv2_clients
-                .as_ref()
-                .is_some_and(|c| c.total_clients >= min)
-        },
-        "GlobalInfo sv2_clients.total_clients never reached >= expected",
-    )
-    .await
-}
-
-/// Poll `/api/v1/global` until `sv1_clients.total_clients >= min`.
-/// Returns the parsed `GlobalInfo` once satisfied.
-pub async fn poll_until_global_sv1_clients_gte(
-    monitoring_addr: SocketAddr,
-    min: usize,
-    timeout: Duration,
-) -> GlobalInfo {
-    poll_until(
-        monitoring_addr,
-        routes::GLOBAL,
-        timeout,
-        move |r: &GlobalInfo| {
-            r.sv1_clients
-                .as_ref()
-                .is_some_and(|c| c.total_clients >= min)
-        },
-        "GlobalInfo sv1_clients.total_clients never reached >= expected",
-    )
-    .await
-}
-
-/// Poll `/api/v1/clients` until `total >= min`.
-/// Returns the parsed `Sv2ClientsResponse` once satisfied.
-pub async fn poll_until_clients_total_gte(
-    monitoring_addr: SocketAddr,
-    min: usize,
-    timeout: Duration,
-) -> Sv2ClientsResponse {
-    poll_until(
-        monitoring_addr,
-        routes::CLIENTS,
-        timeout,
-        move |r: &Sv2ClientsResponse| r.total >= min,
-        "Sv2ClientsResponse total never reached >= expected",
-    )
-    .await
-}
-
-/// Poll `/api/v1/sv1/clients` until `total >= min`.
-/// Returns the parsed `Sv1ClientsResponse` once satisfied.
-pub async fn poll_until_sv1_clients_total_gte(
-    monitoring_addr: SocketAddr,
-    min: usize,
-    timeout: Duration,
-) -> Sv1ClientsResponse {
-    poll_until(
-        monitoring_addr,
-        routes::SV1_CLIENTS,
-        timeout,
-        move |r: &Sv1ClientsResponse| r.total >= min,
-        "Sv1ClientsResponse total never reached >= expected",
-    )
-    .await
-}
-
-/// Poll `/api/v1/server` until `extended_channels_count >= min`.
-/// Returns the parsed `ServerResponse` once satisfied.
-pub async fn poll_until_server_channels_gte(
-    monitoring_addr: SocketAddr,
-    min: usize,
-    timeout: Duration,
-) -> ServerResponse {
-    poll_until(
-        monitoring_addr,
-        routes::SERVER,
-        timeout,
-        move |r: &ServerResponse| r.extended_channels_count >= min,
-        "ServerResponse extended_channels_count never reached >= expected",
-    )
-    .await
-}
-
-/// Poll `/api/v1/server/channels` until `total_extended >= min`.
-/// Returns the parsed `ServerChannelsResponse` once satisfied.
-pub async fn poll_until_server_channels_extended_gte(
-    monitoring_addr: SocketAddr,
-    min: usize,
-    timeout: Duration,
-) -> ServerChannelsResponse {
-    poll_until(
-        monitoring_addr,
-        routes::SERVER_CHANNELS,
-        timeout,
-        move |r: &ServerChannelsResponse| r.total_extended >= min,
-        "ServerChannelsResponse total_extended never reached >= expected",
-    )
-    .await
-}
-
-/// Poll `/api/v1/server/channels` until the first extended channel has
-/// `shares_acknowledged >= shares_min`. This is stricter than
-/// `poll_until_server_channels_extended_gte`: a channel can exist in the
-/// snapshot before any shares have been processed by the monitoring cache.
-/// Returns the parsed `ServerChannelsResponse` once satisfied.
-pub async fn poll_until_server_channel_shares_gte(
-    monitoring_addr: SocketAddr,
-    shares_min: u32,
-    timeout: Duration,
-) -> ServerChannelsResponse {
-    poll_until(
-        monitoring_addr,
-        routes::SERVER_CHANNELS,
-        timeout,
-        move |r: &ServerChannelsResponse| {
-            r.extended_channels
-                .first()
-                .is_some_and(|ch| ch.shares_acknowledged >= shares_min)
-        },
-        "ServerChannelsResponse first extended channel shares_acknowledged never reached >= expected",
-    )
-    .await
 }
 
 /// A Prometheus metric selector: a metric name plus an optional set of label matchers.
@@ -511,36 +452,6 @@ pub fn assert_metric_present<'a, M: Into<Metric<'a>>>(metrics_text: &str, metric
         "Metric '{}' was expected to be present but was not found in metrics output",
         metric
     );
-}
-
-/// Poll `/metrics` until a line matching `metric` has value >= `min`, or panic after
-/// `timeout`. Polls every 100ms to react quickly while tolerating cache refresh jitter.
-///
-/// Returns the full metrics text from the successful scrape so callers can make additional
-/// assertions without a second fetch.
-pub async fn poll_until_metric_gte<'a, M: Into<Metric<'a>>>(
-    monitoring_addr: SocketAddr,
-    metric: M,
-    min: f64,
-    timeout: Duration,
-) -> String {
-    let metric = metric.into();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let metrics = fetch_metrics(monitoring_addr).await;
-        if let Some(v) = parse_metric_value(&metrics, metric) {
-            if v >= min {
-                return metrics;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "Metric '{}' never reached >= {} within {:?}. Last /metrics response:\n{}",
-                metric, min, timeout, metrics
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 #[cfg(test)]
