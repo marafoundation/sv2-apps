@@ -51,7 +51,12 @@ impl ShareGate {
         let (value, is_relative) = self.profile.rate_at(elapsed);
 
         if is_relative {
-            value * self.current_supply_spm
+            if self.current_supply_spm == 0.0 {
+                // Bootstrap: show 0 in API until we have measurements
+                0.0
+            } else {
+                value * self.current_supply_spm
+            }
         } else {
             value
         }
@@ -92,7 +97,15 @@ impl ShareGate {
         let (value, is_relative) = self.profile.rate_at(elapsed);
 
         let target_spm = if is_relative {
-            value * self.current_supply_spm
+            // For relative profiles, use measured supply.
+            // Bootstrap case: if supply is still 0, forward everything (factor × ∞ = ∞).
+            // Once supply arrives, target = factor × supply.
+            if self.current_supply_spm == 0.0 {
+                // No measurement yet - forward everything (infinite target)
+                1000.0 // High enough to never gate during bootstrap
+            } else {
+                value * self.current_supply_spm
+            }
         } else {
             value
         };
