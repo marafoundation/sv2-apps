@@ -56,30 +56,56 @@ pub struct ProfileInfo {
 
 impl ProfileInfo {
     pub fn from_profile(p: &RateProfile) -> Self {
+        let relative_suffix = if p.is_relative() { " (relative)" } else { "" };
+
         match p {
             RateProfile::Hold { rate } => ProfileInfo {
                 profile_type: "hold".into(),
-                description: format!("{:.1} spm", rate),
+                description: format!("{:.1} spm{}", rate, relative_suffix),
             },
-            RateProfile::Step { before, after, at_secs } => ProfileInfo {
+            RateProfile::Track { factor } => ProfileInfo {
+                profile_type: "track".into(),
+                description: format!("{:.1}× supply", factor),
+            },
+            RateProfile::Step { before, after, at_secs, relative } => ProfileInfo {
                 profile_type: "step".into(),
-                description: format!("{:.1} → {:.1} spm @ {:.0}s", before, after, at_secs),
+                description: if *relative {
+                    format!("{:.1}× → {:.1}× @ {:.0}s", before, after, at_secs)
+                } else {
+                    format!("{:.1} → {:.1} spm @ {:.0}s", before, after, at_secs)
+                },
             },
-            RateProfile::Ramp { from, to, duration_secs } => ProfileInfo {
+            RateProfile::Ramp { from, to, duration_secs, relative } => ProfileInfo {
                 profile_type: "ramp".into(),
-                description: format!("{:.1} → {:.1} spm over {:.0}s", from, to, duration_secs),
+                description: if *relative {
+                    format!("{:.1}× → {:.1}× over {:.0}s", from, to, duration_secs)
+                } else {
+                    format!("{:.1} → {:.1} spm over {:.0}s", from, to, duration_secs)
+                },
             },
-            RateProfile::Stall { rate, at_secs, duration_secs } => ProfileInfo {
+            RateProfile::Stall { rate, at_secs, duration_secs, relative } => ProfileInfo {
                 profile_type: "stall".into(),
-                description: format!("{:.1} spm, zero @ {:.0}s for {:.0}s", rate, at_secs, duration_secs),
+                description: if *relative {
+                    format!("{:.1}×, zero @ {:.0}s for {:.0}s", rate, at_secs, duration_secs)
+                } else {
+                    format!("{:.1} spm, zero @ {:.0}s for {:.0}s", rate, at_secs, duration_secs)
+                },
             },
-            RateProfile::Burst { base, peak, at_secs, duration_secs } => ProfileInfo {
+            RateProfile::Burst { base, peak, at_secs, duration_secs, relative } => ProfileInfo {
                 profile_type: "burst".into(),
-                description: format!("{:.1} → {:.1} spm @ {:.0}s for {:.0}s", base, peak, at_secs, duration_secs),
+                description: if *relative {
+                    format!("{:.1}× → {:.1}× @ {:.0}s for {:.0}s", base, peak, at_secs, duration_secs)
+                } else {
+                    format!("{:.1} → {:.1} spm @ {:.0}s for {:.0}s", base, peak, at_secs, duration_secs)
+                },
             },
-            RateProfile::Oscillate { base, amp, period_secs } => ProfileInfo {
+            RateProfile::Oscillate { base, amp, period_secs, relative } => ProfileInfo {
                 profile_type: "oscillate".into(),
-                description: format!("{:.1}±{:.1} spm, period {:.0}s", base, amp, period_secs),
+                description: if *relative {
+                    format!("{:.1}±{:.1}×, period {:.0}s", base, amp, period_secs)
+                } else {
+                    format!("{:.1}±{:.1} spm, period {:.0}s", base, amp, period_secs)
+                },
             },
         }
     }

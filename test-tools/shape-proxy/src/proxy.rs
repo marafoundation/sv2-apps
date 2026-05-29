@@ -38,8 +38,6 @@ struct ChannelMapping {
     shares_forwarded: u64,
     /// Shares dropped by the gate.
     shares_gated: u64,
-    /// Rolling window: all shares arriving from downstream (supply).
-    supply_window: RollingWindow,
     /// Rolling window: shares forwarded upstream.
     forward_window: RollingWindow,
     /// The original OpenExtendedMiningChannel request for re-opening on reconnect.
@@ -324,7 +322,7 @@ impl ProxyCore {
             .channels
             .values()
             .map(|m| {
-                let supply_spm = m.supply_window.rate_spm(now);
+                let supply_spm = m.gate.current_supply_spm();
                 let forwarded_spm = m.forward_window.rate_spm(now);
                 let target_spm = m.gate.current_target_spm();
                 let headroom = HeadroomStatus::from_ratio(supply_spm, target_spm);
@@ -430,7 +428,6 @@ impl ProxyCore {
                         floor_active: false,
                         shares_forwarded: 0,
                         shares_gated: 0,
-                        supply_window: RollingWindow::new(),
                         forward_window: RollingWindow::new(),
                         open_request: None,
                         is_standard: true,
@@ -471,7 +468,7 @@ impl ProxyCore {
                 };
 
                 let now = std::time::Instant::now();
-                mapping.supply_window.record(now);
+                mapping.gate.record_share_arrived(now);
 
                 if !mapping.gate.should_forward() {
                     mapping.shares_gated += 1;
@@ -529,7 +526,7 @@ impl ProxyCore {
                 };
 
                 let now = std::time::Instant::now();
-                mapping.supply_window.record(now);
+                mapping.gate.record_share_arrived(now);
 
                 if !mapping.gate.should_forward() {
                     mapping.shares_gated += 1;
@@ -614,7 +611,6 @@ impl ProxyCore {
                 floor_active: false,
                 shares_forwarded: 0,
                 shares_gated: 0,
-                supply_window: RollingWindow::new(),
                 forward_window: RollingWindow::new(),
                 open_request: Some(open_req.clone()),
                 is_standard: false,
@@ -699,7 +695,6 @@ impl ProxyCore {
                                 floor_active: false,
                                 shares_forwarded: 0,
                                 shares_gated: 0,
-                                supply_window: RollingWindow::new(),
                                 forward_window: RollingWindow::new(),
                                 open_request: None,
                                 is_standard: false,
@@ -745,7 +740,6 @@ impl ProxyCore {
                             floor_active: false,
                             shares_forwarded: 0,
                             shares_gated: 0,
-                            supply_window: RollingWindow::new(),
                             forward_window: RollingWindow::new(),
                             open_request: None,
                             is_standard: true,

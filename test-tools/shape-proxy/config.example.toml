@@ -13,6 +13,46 @@ authority_secret = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7LfzDJmwMcjdYj"
 # Set based on miner hashrate and desired max supply (~120 spm for 200 TH/s)
 min_downstream_difficulty = 23000.0
 
+# ============================================================================
+# Rate profiles control how shares are gated/forwarded to the pool.
+# Profiles are set dynamically via the HTTP API (default port 8080):
+#
+#   POST /profile               - set profile for all channels
+#   POST /channels/{id}/profile - set profile for specific channel
+#
+# Profile types:
+#
+# 1. Track (supply-relative, default)
+#    {"type": "track", "factor": 1.0}
+#    Forwards factor × supply_spm. Use factor < 1.0 to reduce noise.
+#    Example: factor=0.5 forwards 50% of smoothed supply.
+#
+# 2. Hold (absolute rate)
+#    {"type": "hold", "rate": 60.0}
+#    Forwards exactly 60 spm regardless of supply.
+#
+# 3. Step (absolute or relative)
+#    {"type": "step", "before": 1.0, "after": 0.5, "at_secs": 300, "relative": true}
+#    Steps from 100% to 50% of supply at 5 minutes.
+#    Omit "relative" or set false for absolute rates in spm.
+#
+# 4. Ramp (absolute or relative)
+#    {"type": "ramp", "from": 0.5, "to": 1.0, "duration_secs": 600, "relative": true}
+#    Ramps from 50% to 100% of supply over 10 minutes.
+#
+# 5. Stall (absolute or relative)
+#    {"type": "stall", "rate": 1.0, "at_secs": 120, "duration_secs": 60, "relative": true}
+#    Forwards 100% of supply, drops to 0 at 2min for 1min, then resumes.
+#
+# 6. Burst (absolute or relative)
+#    {"type": "burst", "base": 0.8, "peak": 1.5, "at_secs": 180, "duration_secs": 60, "relative": true}
+#    Forwards 80% of supply, spikes to 150% at 3min for 1min, then back to 80%.
+#
+# 7. Oscillate (absolute or relative)
+#    {"type": "oscillate", "base": 0.9, "amp": 0.1, "period_secs": 300, "relative": true}
+#    Oscillates between 80%-100% of supply with 5min period.
+# ============================================================================
+
 # Phantom channels for scale testing (0 = none)
 phantom_channels = 0
 
