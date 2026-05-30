@@ -34,10 +34,14 @@ struct ChannelMapping {
     gate: ShareGate,
     /// Whether the difficulty floor is currently overriding the pool's target.
     floor_active: bool,
+    /// The pool's current difficulty (for metrics/debugging).
+    pool_difficulty: Option<f64>,
     /// Shares forwarded upstream.
     shares_forwarded: u64,
     /// Shares dropped by the gate.
     shares_gated: u64,
+    /// Shares rejected (didn't meet pool difficulty).
+    shares_rejected_difficulty: u64,
     /// Rolling window: shares forwarded upstream.
     forward_window: RollingWindow,
     /// The original OpenExtendedMiningChannel request for re-opening on reconnect.
@@ -340,8 +344,10 @@ impl ProxyCore {
                     supply_spm,
                     headroom: headroom.as_str().to_string(),
                     floor_active: m.floor_active,
+                    pool_difficulty: m.pool_difficulty,
                     shares_forwarded: m.shares_forwarded,
                     shares_gated: m.shares_gated,
+                    shares_rejected_difficulty: m.shares_rejected_difficulty,
                 }
             })
             .collect();
@@ -426,8 +432,10 @@ impl ProxyCore {
                         downstream_id: id,
                         gate: ShareGate::new(RateProfile::default()),
                         floor_active: false,
+                        pool_difficulty: None,
                         shares_forwarded: 0,
                         shares_gated: 0,
+                        shares_rejected_difficulty: 0,
                         forward_window: RollingWindow::new(),
                         open_request: None,
                         is_standard: true,
@@ -609,8 +617,10 @@ impl ProxyCore {
                 downstream_id,
                 gate: ShareGate::new(RateProfile::default()),
                 floor_active: false,
+                pool_difficulty: None,
                 shares_forwarded: 0,
                 shares_gated: 0,
+                shares_rejected_difficulty: 0,
                 forward_window: RollingWindow::new(),
                 open_request: Some(open_req.clone()),
                 is_standard: false,
@@ -693,8 +703,10 @@ impl ProxyCore {
                                 downstream_id: pending.downstream_id,
                                 gate,
                                 floor_active: false,
+                                pool_difficulty: None,
                                 shares_forwarded: 0,
                                 shares_gated: 0,
+                                shares_rejected_difficulty: 0,
                                 forward_window: RollingWindow::new(),
                                 open_request: None,
                                 is_standard: false,
@@ -738,8 +750,10 @@ impl ProxyCore {
                             downstream_id: pending.downstream_id,
                             gate: ShareGate::new(RateProfile::default()),
                             floor_active: false,
+                            pool_difficulty: None,
                             shares_forwarded: 0,
                             shares_gated: 0,
+                            shares_rejected_difficulty: 0,
                             forward_window: RollingWindow::new(),
                             open_request: None,
                             is_standard: true,
@@ -795,17 +809,37 @@ impl ProxyCore {
             }
             Mining::SetTarget(ref target) => {
                 let upstream_ch = target.channel_id;
-                // Store the pool's target for share validity checks, but do NOT
-                // forward to the miner. The miner works at a fixed difficulty
-                // (set at channel-open time from the floor config) and never changes.
-                // This guarantees constant supply regardless of pool vardiff behavior.
+                // Forward SetTarget to the miner so it produces shares that meet the pool's
+                // current difficulty. Store the difficulty for metrics/debugging.
+                //
+                // Note: This means supply (shares/min from miner) will vary with pool vardiff.
+                // For now, we accept this tradeoff to avoid share rejections. A future fix
+                // should track difficulty-weighted supply (hashrate) instead of raw share count.
+
+                let target_bytes: &[u8] = target.maximum_target.inner_as_ref();
+                let difficulty = target_to_difficulty(target_bytes);
+
                 let pair = self
                     .channels
                     .values_mut()
                     .find(|m| m.upstream_channel_id == Some(upstream_ch));
                 if let Some(pair) = pair {
-                    pair.floor_active = true;
-                    debug!(upstream_ch, "SetTarget absorbed (miner keeps fixed difficulty)");
+                    // Store the pool's current difficulty for metrics.
+                    pair.pool_difficulty = Some(difficulty);
+                    debug!(
+                        upstream_ch,
+                        difficulty,
+                        "SetTarget: forwarding to miner (pool difficulty update)"
+                    );
+                }
+
+                // Apply difficulty floor if configured, otherwise forward verbatim.
+                if self.config.min_downstream_difficulty > 0.0 {
+                    self.handle_set_target_with_floor(upstream_ch, target.clone().into_static())
+                        .await;
+                } else {
+                    self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
+                        .await;
                 }
             }
             Mining::SetExtranoncePrefix(ref prefix) => {
