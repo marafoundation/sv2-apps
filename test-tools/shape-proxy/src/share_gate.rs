@@ -11,6 +11,8 @@ pub struct ShareGate {
     last_refill: Instant,
     supply_window: RollingWindow,
     current_supply_spm: f64,
+    /// Current miner difficulty, used to convert between difficulty-weighted and effective shares
+    miner_difficulty: f64,
 }
 
 impl ShareGate {
@@ -25,6 +27,7 @@ impl ShareGate {
             last_refill: Instant::now(),
             supply_window: RollingWindow::new(),
             current_supply_spm: 0.0,
+            miner_difficulty: 1.0,
         }
     }
 
@@ -33,6 +36,7 @@ impl ShareGate {
     pub fn record_share_arrived(&mut self, now: Instant, difficulty: f64) {
         self.supply_window.record_weighted(now, difficulty);
         self.current_supply_spm = self.supply_window.rate_spm(now);
+        self.miner_difficulty = difficulty;
     }
 
     pub fn should_forward(&mut self) -> bool {
@@ -77,8 +81,13 @@ impl ShareGate {
 
     pub fn set_profile(&mut self, profile: RateProfile) {
         let (initial_value, is_relative) = profile.rate_at(0.0);
-        let initial_rate = if is_relative {
-            initial_value * self.current_supply_spm
+        let initial_rate_effective = if is_relative {
+            if self.current_supply_spm == 0.0 || self.miner_difficulty == 0.0 {
+                1000.0 // Bootstrap
+            } else {
+                let effective_supply = self.current_supply_spm / self.miner_difficulty;
+                initial_value * effective_supply
+            }
         } else {
             initial_value
         };
@@ -86,7 +95,7 @@ impl ShareGate {
         self.profile = profile;
         self.started_at = Instant::now();
         self.last_refill = Instant::now();
-        self.capacity = Self::compute_capacity(initial_rate);
+        self.capacity = Self::compute_capacity(initial_rate_effective);
         self.bucket = self.bucket.min(self.capacity);
     }
 
@@ -97,22 +106,27 @@ impl ShareGate {
         let elapsed = now.duration_since(self.started_at).as_secs_f64();
         let (value, is_relative) = self.profile.rate_at(elapsed);
 
-        let target_spm = if is_relative {
-            // For relative profiles, use measured supply.
-            // Bootstrap case: if supply is still 0, forward everything (factor × ∞ = ∞).
-            // Once supply arrives, target = factor × supply.
-            if self.current_supply_spm == 0.0 {
-                // No measurement yet - forward everything (infinite target)
-                1000.0 // High enough to never gate during bootstrap
+        // Compute target in effective shares/min (not difficulty-weighted).
+        // The token bucket operates on raw share counts: each should_forward() consumes 1.0 token.
+        let target_spm_effective = if is_relative {
+            // For relative profiles:
+            // - current_supply_spm is difficulty-weighted (e.g., 6.47e16)
+            // - Convert to effective supply: supply_weighted / difficulty
+            // - Apply factor: target = factor × effective_supply
+            if self.current_supply_spm == 0.0 || self.miner_difficulty == 0.0 {
+                // Bootstrap: forward everything until we have measurements
+                1000.0
             } else {
-                value * self.current_supply_spm
+                let effective_supply_spm = self.current_supply_spm / self.miner_difficulty;
+                value * effective_supply_spm
             }
         } else {
+            // For absolute profiles, value is already in effective shares/min
             value
         };
 
-        self.capacity = Self::compute_capacity(target_spm);
-        let tokens_earned = (target_spm / 60.0) * dt;
+        self.capacity = Self::compute_capacity(target_spm_effective);
+        let tokens_earned = (target_spm_effective / 60.0) * dt;
         self.bucket = (self.bucket + tokens_earned).min(self.capacity);
     }
 
