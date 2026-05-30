@@ -28,9 +28,10 @@ impl ShareGate {
         }
     }
 
-    /// Record a share arriving from the downstream miner
-    pub fn record_share_arrived(&mut self, now: Instant) {
-        self.supply_window.record(now);
+    /// Record a share arriving from the downstream miner, weighted by difficulty.
+    /// This tracks true hashrate instead of raw share count.
+    pub fn record_share_arrived(&mut self, now: Instant, difficulty: f64) {
+        self.supply_window.record_weighted(now, difficulty);
         self.current_supply_spm = self.supply_window.rate_spm(now);
     }
 
@@ -124,7 +125,6 @@ impl ShareGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
     use std::time::Duration;
 
     #[test]
@@ -183,9 +183,9 @@ mod tests {
         let mut gate = ShareGate::new(RateProfile::Track { factor: 0.5 });
         let now = Instant::now();
 
-        // Simulate 60 spm supply (1 share/sec)
+        // Simulate 60 spm supply (1 share/sec at difficulty 1.0)
         for i in 0..60 {
-            gate.record_share_arrived(now + Duration::from_secs(i));
+            gate.record_share_arrived(now + Duration::from_secs(i), 1.0);
         }
 
         // After recording supply, target should be ~30 spm (50% of 60)

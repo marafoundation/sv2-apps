@@ -36,6 +36,8 @@ struct ChannelMapping {
     floor_active: bool,
     /// The pool's current difficulty (for metrics/debugging).
     pool_difficulty: Option<f64>,
+    /// The miner's current difficulty (what we forwarded via SetTarget).
+    miner_difficulty: f64,
     /// Shares forwarded upstream.
     shares_forwarded: u64,
     /// Shares dropped by the gate.
@@ -345,6 +347,7 @@ impl ProxyCore {
                     headroom: headroom.as_str().to_string(),
                     floor_active: m.floor_active,
                     pool_difficulty: m.pool_difficulty,
+                    miner_difficulty: m.miner_difficulty,
                     shares_forwarded: m.shares_forwarded,
                     shares_gated: m.shares_gated,
                     shares_rejected_difficulty: m.shares_rejected_difficulty,
@@ -433,6 +436,7 @@ impl ProxyCore {
                         gate: ShareGate::new(RateProfile::default()),
                         floor_active: false,
                         pool_difficulty: None,
+                        miner_difficulty: 1.0,
                         shares_forwarded: 0,
                         shares_gated: 0,
                         shares_rejected_difficulty: 0,
@@ -476,7 +480,8 @@ impl ProxyCore {
                 };
 
                 let now = std::time::Instant::now();
-                mapping.gate.record_share_arrived(now);
+                let difficulty = mapping.miner_difficulty;
+                mapping.gate.record_share_arrived(now, difficulty);
 
                 if !mapping.gate.should_forward() {
                     mapping.shares_gated += 1;
@@ -534,7 +539,8 @@ impl ProxyCore {
                 };
 
                 let now = std::time::Instant::now();
-                mapping.gate.record_share_arrived(now);
+                let difficulty = mapping.miner_difficulty;
+                mapping.gate.record_share_arrived(now, difficulty);
 
                 if !mapping.gate.should_forward() {
                     mapping.shares_gated += 1;
@@ -618,6 +624,7 @@ impl ProxyCore {
                 gate: ShareGate::new(RateProfile::default()),
                 floor_active: false,
                 pool_difficulty: None,
+                miner_difficulty: 1.0,
                 shares_forwarded: 0,
                 shares_gated: 0,
                 shares_rejected_difficulty: 0,
@@ -681,17 +688,24 @@ impl ProxyCore {
                 let request_id = success.request_id;
                 let upstream_channel_id = success.channel_id;
 
+                // Extract initial target/difficulty from success message.
+                let initial_target_bytes: &[u8] = success.target.inner_as_ref();
+                let initial_difficulty = target_to_difficulty(initial_target_bytes);
+
                 if let Some(pending) = self.pending_opens.remove(&request_id) {
                     info!(
                         downstream_id = pending.downstream_id,
                         ds_channel_id = pending.downstream_channel_id,
                         upstream_channel_id,
+                        initial_difficulty,
                         "Channel opened successfully"
                     );
 
-                    // Update the existing channel mapping with the upstream channel ID.
+                    // Update the existing channel mapping with the upstream channel ID and initial difficulty.
                     if let Some(mapping) = self.channels.get_mut(&pending.downstream_channel_id) {
                         mapping.upstream_channel_id = Some(upstream_channel_id);
+                        mapping.miner_difficulty = initial_difficulty;
+                        mapping.pool_difficulty = Some(initial_difficulty);
                     } else {
                         // Shouldn't happen, but create mapping if missing.
                         let gate = ShareGate::new(RateProfile::default());
@@ -703,7 +717,8 @@ impl ProxyCore {
                                 downstream_id: pending.downstream_id,
                                 gate,
                                 floor_active: false,
-                                pool_difficulty: None,
+                                pool_difficulty: Some(initial_difficulty),
+                                miner_difficulty: initial_difficulty,
                                 shares_forwarded: 0,
                                 shares_gated: 0,
                                 shares_rejected_difficulty: 0,
@@ -729,6 +744,10 @@ impl ProxyCore {
                 let request_id = success.get_request_id_as_u32();
                 let upstream_channel_id = success.channel_id;
 
+                // Extract initial target/difficulty.
+                let initial_target_bytes: &[u8] = success.target.inner_as_ref();
+                let initial_difficulty = target_to_difficulty(initial_target_bytes);
+
                 if let Some(pending) = self.pending_opens.remove(&request_id) {
                     // For standard channels, the miner receives the pool's channel_id
                     // directly (we forward verbatim), so use upstream_channel_id as the
@@ -738,6 +757,7 @@ impl ProxyCore {
                         downstream_id = pending.downstream_id,
                         effective_ds_channel_id,
                         upstream_channel_id,
+                        initial_difficulty,
                         "Standard channel opened successfully"
                     );
 
@@ -750,7 +770,8 @@ impl ProxyCore {
                             downstream_id: pending.downstream_id,
                             gate: ShareGate::new(RateProfile::default()),
                             floor_active: false,
-                            pool_difficulty: None,
+                            pool_difficulty: Some(initial_difficulty),
+                            miner_difficulty: initial_difficulty,
                             shares_forwarded: 0,
                             shares_gated: 0,
                             shares_rejected_difficulty: 0,
@@ -761,6 +782,8 @@ impl ProxyCore {
                         });
                     mapping.downstream_channel_id = effective_ds_channel_id;
                     mapping.upstream_channel_id = Some(upstream_channel_id);
+                    mapping.miner_difficulty = initial_difficulty;
+                    mapping.pool_difficulty = Some(initial_difficulty);
                     self.channels.insert(effective_ds_channel_id, mapping);
 
                     self.send_to_downstream(pending.downstream_id, Message::Mining(msg))
@@ -810,34 +833,32 @@ impl ProxyCore {
             Mining::SetTarget(ref target) => {
                 let upstream_ch = target.channel_id;
                 // Forward SetTarget to the miner so it produces shares that meet the pool's
-                // current difficulty. Store the difficulty for metrics/debugging.
-                //
-                // Note: This means supply (shares/min from miner) will vary with pool vardiff.
-                // For now, we accept this tradeoff to avoid share rejections. A future fix
-                // should track difficulty-weighted supply (hashrate) instead of raw share count.
+                // current difficulty. Track the miner's difficulty for difficulty-weighted
+                // supply measurement (true hashrate).
 
                 let target_bytes: &[u8] = target.maximum_target.inner_as_ref();
-                let difficulty = target_to_difficulty(target_bytes);
+                let pool_difficulty = target_to_difficulty(target_bytes);
 
-                let pair = self
-                    .channels
-                    .values_mut()
-                    .find(|m| m.upstream_channel_id == Some(upstream_ch));
-                if let Some(pair) = pair {
-                    // Store the pool's current difficulty for metrics.
-                    pair.pool_difficulty = Some(difficulty);
-                    debug!(
-                        upstream_ch,
-                        difficulty,
-                        "SetTarget: forwarding to miner (pool difficulty update)"
-                    );
+                // Store pool difficulty for metrics.
+                if let Some(pair) = self.channels.values_mut().find(|m| m.upstream_channel_id == Some(upstream_ch)) {
+                    pair.pool_difficulty = Some(pool_difficulty);
                 }
 
                 // Apply difficulty floor if configured, otherwise forward verbatim.
+                // This also updates miner_difficulty to match what was sent.
                 if self.config.min_downstream_difficulty > 0.0 {
                     self.handle_set_target_with_floor(upstream_ch, target.clone().into_static())
                         .await;
                 } else {
+                    // No floor - forward pool's target and track miner difficulty.
+                    if let Some(pair) = self.channels.values_mut().find(|m| m.upstream_channel_id == Some(upstream_ch)) {
+                        pair.miner_difficulty = pool_difficulty;
+                        debug!(
+                            upstream_ch,
+                            difficulty = pool_difficulty,
+                            "SetTarget: forwarding to miner"
+                        );
+                    }
                     self.forward_to_downstream_by_upstream_channel(upstream_ch, msg)
                         .await;
                 }
@@ -911,9 +932,16 @@ impl ProxyCore {
                 "Floor active: pool difficulty below floor, not forwarding SetTarget"
             );
             // Don't forward -- miner keeps its current (harder) target.
+            // miner_difficulty stays unchanged.
         } else {
             // Pool's difficulty is at or above floor -- forward normally.
             pair.floor_active = false;
+            pair.miner_difficulty = pool_target_difficulty;
+            debug!(
+                upstream_channel_id,
+                difficulty = pool_target_difficulty,
+                "SetTarget: forwarding to miner (via floor handler)"
+            );
             let ds_id = pair.downstream_id;
             self.send_to_downstream(ds_id, Message::Mining(Mining::SetTarget(set_target)))
                 .await;

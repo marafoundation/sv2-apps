@@ -44,6 +44,7 @@ pub struct ChannelStatus {
     pub headroom: String,
     pub floor_active: bool,
     pub pool_difficulty: Option<f64>,
+    pub miner_difficulty: f64,
     pub shares_forwarded: u64,
     pub shares_gated: u64,
     pub shares_rejected_difficulty: u64,

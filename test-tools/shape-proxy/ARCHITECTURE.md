@@ -135,9 +135,16 @@ The miner must work at the pool's current difficulty target. If the proxy absorb
 
 **Solution**: Forward SetTarget to the miner so it produces shares that meet the pool's current difficulty target.
 
-**Trade-off**: Supply measurement (shares/min from miner) now varies with pool vardiff changes. For supply-relative profiles (Track, Step-relative, etc.), this means the proxy's output rate will track difficulty changes. This is acceptable for now to prevent share rejections.
+**Difficulty-Weighted Supply Tracking**
 
-**Future enhancement**: Measure difficulty-weighted supply (i.e., hashrate) instead of raw share count, making supply stable regardless of difficulty changes.
+The proxy tracks **difficulty-weighted supply** (true hashrate) instead of raw share count:
+
+- Each share is weighted by the miner's current difficulty when recording supply
+- Supply measurement becomes stable regardless of pool vardiff changes
+- For example: If pool doubles difficulty, miner produces half as many shares, but each counts 2× → supply stays constant
+- Supply-relative profiles (Track, Step-relative) now work correctly with pool vardiff
+
+This makes the gate's behavior independent of pool difficulty adjustments while still preventing share rejections.
 
 ---
 
@@ -311,11 +318,11 @@ By ACKing instantly, the proxy decouples the miner from the pool's share validat
 
 If the proxy absorbs SetTarget, the miner's difficulty becomes stale relative to the pool's expectation, causing share rejections. Forwarding SetTarget ensures shares from the miner meet the pool's current difficulty target.
 
-**Trade-off**: Supply measurement (shares/min) varies with difficulty. For now, this is acceptable. A future fix should track difficulty-weighted supply (hashrate) to make supply stable.
+The proxy tracks difficulty-weighted supply (hashrate) so supply measurement stays stable even when pool vardiff changes the miner's difficulty.
 
-### Why measure supply over 60 seconds?
+### Why measure supply over 15 seconds?
 
-Shorter windows (e.g., 1 second) are too noisy; longer windows (e.g., 5 minutes) are too slow to respond to real changes. 60 seconds balances smoothness and responsiveness.
+The rolling window uses a 15-second window. Shorter windows (e.g., 1 second) are too noisy; longer windows (e.g., 5 minutes) are too slow to respond to real changes. 15 seconds balances smoothness and responsiveness for the gate's refill calculations.
 
 ### Why 12-second bucket capacity?
 
@@ -325,15 +332,13 @@ This allows brief bursts (up to 12 seconds of "credit") without runaway accumula
 
 ## Known Limitations
 
-1. **Supply measurement varies with difficulty changes**: When pool vardiff adjusts difficulty, supply (shares/min) changes even if hashrate is constant. Supply-relative profiles (Track, Step-relative) will reflect this change. Fix: track difficulty-weighted supply (hashrate).
+1. **No share validation**: The proxy does not re-hash shares to check if they meet the pool's target. It relies on the miner to produce valid shares at the forwarded difficulty. If the miner is buggy or malicious, invalid shares may be forwarded.
 
-2. **No share validation**: The proxy does not re-hash shares to check if they meet the pool's target. It relies on the miner to produce valid shares at the forwarded difficulty. If the miner is buggy or malicious, invalid shares may be forwarded.
+2. **Single upstream**: The proxy connects to one pool. It does not support failover or load-balancing across multiple pools.
 
-3. **Single upstream**: The proxy connects to one pool. It does not support failover or load-balancing across multiple pools.
+3. **Channel ID collision risk**: The proxy reuses the miner's `request_id` when forwarding to the pool (assumes no collision). In a multi-miner setup with many simultaneous channel opens, there's a small risk of collision if miners use the same request_id concurrently.
 
-4. **Channel ID collision risk**: The proxy reuses the miner's `request_id` when forwarding to the pool (assumes no collision). In a multi-miner setup with many simultaneous channel opens, there's a small risk of collision if miners use the same request_id concurrently.
-
-5. **No persistence**: State is in-memory only. On restart, all channels are closed and miners must reconnect.
+4. **No persistence**: State is in-memory only. On restart, all channels are closed and miners must reconnect.
 
 ---
 
@@ -353,16 +358,14 @@ See [PROFILES.md](PROFILES.md) for detailed examples of using profiles to test p
 
 ## Future Enhancements
 
-1. **Difficulty-weighted supply**: Measure hashrate (difficulty × shares/min) instead of raw share count, making supply stable across difficulty changes.
+1. **Share validation**: Check if shares meet the pool's current target before forwarding, increment `shares_rejected_difficulty` when they don't.
 
-2. **Share validation**: Check if shares meet the pool's current target before forwarding, increment `shares_rejected_difficulty` when they don't.
+2. **Multi-pool failover**: Connect to multiple pools, automatically switch on disconnect.
 
-3. **Multi-pool failover**: Connect to multiple pools, automatically switch on disconnect.
+3. **Persistence**: Save channel state to disk, restore on restart.
 
-4. **Persistence**: Save channel state to disk, restore on restart.
+4. **Profile scheduling**: Time-based profile switching (e.g., "run profile A for 10 minutes, then switch to profile B").
 
-5. **Profile scheduling**: Time-based profile switching (e.g., "run profile A for 10 minutes, then switch to profile B").
+5. **Per-channel floor**: Allow different difficulty floors for different channels.
 
-6. **Per-channel floor**: Allow different difficulty floors for different channels.
-
-7. **Metrics export**: Prometheus endpoint for monitoring integration.
+6. **Metrics export**: Prometheus endpoint for monitoring integration.

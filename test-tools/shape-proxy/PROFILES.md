@@ -266,9 +266,9 @@ curl http://localhost:8080/status | jq '.channels[] | {
 
 ## Notes
 
-- **Supply tracking**: Uses a 60-second rolling window. Short bursts (<60s) are smoothed out.
+- **Supply tracking**: Uses a 15-second rolling window for difficulty-weighted shares (true hashrate). This makes supply stable even when pool vardiff changes difficulty.
 - **Token bucket**: Capacity is 12 seconds worth of tokens. Allows brief bursts but prevents runaway.
-- **Relative profiles scale with supply**: If your hashrate drops 50%, a relative profile's output also drops 50% (exposing the change to the pool).
-- **Absolute profiles ignore supply**: Fixed rate regardless of what the miner produces.
+- **Relative profiles scale with supply**: Supply is measured as difficulty-weighted shares (hashrate), so profiles track true hashrate regardless of pool vardiff. If your hashrate drops 50%, a relative profile's output also drops 50% (exposing the change to the pool).
+- **Absolute profiles ignore supply**: Fixed rate regardless of what the miner produces or pool vardiff.
 - **Default profile**: `Track {factor: 1.0}` (forward 100% of smoothed supply).
-- **Difficulty tracking**: The proxy forwards `SetTarget` messages from the pool to the miner, so the miner's difficulty tracks the pool's vardiff adjustments. This ensures shares from the miner meet the pool's current difficulty target (preventing `diff-too-low` rejections). As a side effect, supply (shares/min) varies with difficulty changes even if hashrate is constant. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
+- **Difficulty tracking**: The proxy forwards `SetTarget` messages from the pool to the miner, ensuring shares meet the pool's current difficulty target (preventing `diff-too-low` rejections). Supply is tracked as difficulty-weighted shares, so relative profiles work correctly even as pool vardiff adjusts difficulty. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
