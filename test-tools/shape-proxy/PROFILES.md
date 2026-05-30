@@ -271,3 +271,4 @@ curl http://localhost:8080/status | jq '.channels[] | {
 - **Relative profiles scale with supply**: If your hashrate drops 50%, a relative profile's output also drops 50% (exposing the change to the pool).
 - **Absolute profiles ignore supply**: Fixed rate regardless of what the miner produces.
 - **Default profile**: `Track {factor: 1.0}` (forward 100% of smoothed supply).
+- **Difficulty tracking**: The proxy forwards `SetTarget` messages from the pool to the miner, so the miner's difficulty tracks the pool's vardiff adjustments. This ensures shares from the miner meet the pool's current difficulty target (preventing `diff-too-low` rejections). As a side effect, supply (shares/min) varies with difficulty changes even if hashrate is constant. See [ARCHITECTURE.md](ARCHITECTURE.md) for details.
