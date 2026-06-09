@@ -455,7 +455,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
             // remove the channel from any group channels that contain it
             for mut group_channel in self.group_channels.iter_mut() {
-                if group_channel.get_channel_ids().contains(&m.channel_id) {
+                if group_channel.get_channel_ids().any(|id| *id == m.channel_id) {
                     group_channel.remove_channel_id(m.channel_id);
                 }
             }
@@ -1043,7 +1043,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 group_channel.remove_channel_id(channel_id);
             }
 
-            if group_channel.get_channel_ids().is_empty() {
+            if group_channel.get_channel_ids().next().is_none() {
                 group_channels_to_remove.push(group_channel_id);
             }
         }
@@ -1057,7 +1057,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         match self.group_channels.get_mut(&m.group_channel_id) {
             // if yes, clean up any channels that are no longer in the new group channel
             Some(mut group_channel) => {
-                let current_channel_ids = group_channel.get_channel_ids().clone();
+                let current_channel_ids: Vec<u32> = group_channel.get_channel_ids().copied().collect();
                 let new_channel_ids = m.channel_ids.clone().into_inner();
 
                 // Remove channels that are no longer in the new list

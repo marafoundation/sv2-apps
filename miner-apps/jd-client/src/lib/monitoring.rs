@@ -24,14 +24,14 @@ impl ServerMonitoring for ChannelManager {
                     let channel_id = upstream_channel.get_channel_id();
                     let target = upstream_channel.get_target();
                     let extranonce_prefix = upstream_channel.get_extranonce_prefix();
-                    let user_identity = upstream_channel.get_user_identity();
+                    let user_identity = upstream_channel.get_user_identity().to_string();
                     let share_accounting = upstream_channel.get_share_accounting();
-                    let shares_rejected_by_reason = share_accounting.get_rejected_shares().clone();
-                    let shares_rejected = shares_rejected_by_reason.values().copied().sum();
+                    let shares_rejected_by_reason: std::collections::HashMap<String, u32> = share_accounting.get_rejected_shares().map(|(k, v)| (k.to_string(), v)).collect();
+                    let shares_rejected: u32 = shares_rejected_by_reason.values().copied().sum();
 
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
-                        user_identity: user_identity.clone(),
+                        user_identity,
                         nominal_hashrate: Some(upstream_channel.get_nominal_hashrate()),
                         target_hex: hex::encode(target.to_be_bytes()),
                         extranonce_prefix_hex: hex::encode(extranonce_prefix),
@@ -74,12 +74,12 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let channel_id = extended_channel.get_channel_id();
                 let target = extended_channel.get_target();
                 let requested_max_target = extended_channel.get_requested_max_target();
-                let user_identity = extended_channel.get_user_identity();
+                let user_identity = extended_channel.get_user_identity().to_string();
                 let share_accounting = extended_channel.get_share_accounting();
 
                 extended_channels.push(ExtendedChannelInfo {
                     channel_id,
-                    user_identity: user_identity.clone(),
+                    user_identity,
                     nominal_hashrate: extended_channel.get_nominal_hashrate(),
                     stable_hashrate: extended_channel.get_stable_hashrate(),
                     target_hex: hex::encode(target.to_be_bytes()),
@@ -89,8 +89,8 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     rollable_extranonce_size: extended_channel.get_rollable_extranonce_size(),
                     expected_shares_per_minute: extended_channel.get_shares_per_minute(),
                     shares_accepted: share_accounting.get_shares_accepted(),
-                    shares_rejected: share_accounting.get_rejected_shares_total(),
-                    shares_rejected_by_reason: share_accounting.get_rejected_shares().clone(),
+                    shares_rejected: share_accounting.get_rejected_shares_count(),
+                    shares_rejected_by_reason: share_accounting.get_rejected_shares().map(|(k, v)| (k.to_string(), v)).collect(),
                     share_work_sum: share_accounting.get_share_work_sum(),
                     last_share_sequence_number: share_accounting.get_last_share_sequence_number(),
                     best_diff: share_accounting.get_best_diff(),
@@ -105,12 +105,12 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                 let channel_id = standard_channel.get_channel_id();
                 let target = standard_channel.get_target();
                 let requested_max_target = standard_channel.get_requested_max_target();
-                let user_identity = standard_channel.get_user_identity();
+                let user_identity = standard_channel.get_user_identity().to_string();
                 let share_accounting = standard_channel.get_share_accounting();
 
                 standard_channels.push(StandardChannelInfo {
                     channel_id,
-                    user_identity: user_identity.clone(),
+                    user_identity,
                     nominal_hashrate: standard_channel.get_nominal_hashrate(),
                     stable_hashrate: standard_channel.get_stable_hashrate(),
                     target_hex: hex::encode(target.to_be_bytes()),
@@ -118,8 +118,8 @@ fn downstream_to_sv2_client_info(client: &Downstream) -> Option<Sv2ClientInfo> {
                     extranonce_prefix_hex: hex::encode(standard_channel.get_extranonce_prefix()),
                     expected_shares_per_minute: standard_channel.get_shares_per_minute(),
                     shares_accepted: share_accounting.get_shares_accepted(),
-                    shares_rejected: share_accounting.get_rejected_shares_total(),
-                    shares_rejected_by_reason: share_accounting.get_rejected_shares().clone(),
+                    shares_rejected: share_accounting.get_rejected_shares_count(),
+                    shares_rejected_by_reason: share_accounting.get_rejected_shares().map(|(k, v)| (k.to_string(), v)).collect(),
                     share_work_sum: share_accounting.get_share_work_sum(),
                     last_share_sequence_number: share_accounting.get_last_share_sequence_number(),
                     best_diff: share_accounting.get_best_diff(),

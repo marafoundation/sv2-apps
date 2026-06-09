@@ -83,7 +83,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                     // if REQUIRES_STANDARD_JOBS is not set and the group channel is not empty
                     // we need to send the NewExtendedMiningJob message to the group channel
                     let requires_standard_jobs = downstream.requires_standard_jobs.load(Ordering::SeqCst);
-                    let empty_group_channel = data.group_channel.get_channel_ids().is_empty();
+                    let empty_group_channel = data.group_channel.get_channel_ids().next().is_none();
                     if !requires_standard_jobs && !empty_group_channel {
                         messages.push((*downstream_id, Mining::NewExtendedMiningJob(group_channel_job.get_job_message().clone())).into());
                     }
@@ -197,7 +197,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                     // did SetupConnection have the REQUIRES_STANDARD_JOBS flag set?
                     // if no, and the group channel is not empty, we need to send the SetNewPrevHashMp to the group channel
                     let requires_standard_jobs = downstream.requires_standard_jobs.load(Ordering::SeqCst);
-                    let empty_group_channel = data.group_channel.get_channel_ids().is_empty();
+                    let empty_group_channel = data.group_channel.get_channel_ids().next().is_none();
                     if !requires_standard_jobs && !empty_group_channel {
                         let group_channel_id = data.group_channel.get_group_channel_id();
                         let activated_group_job_id = data.group_channel.get_active_job().expect("active job must exist").get_job_id();
