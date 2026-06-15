@@ -1,0 +1,90 @@
+services:
+  bitcoind:
+    image: fossatmara/bitcoind:v1
+    container_name: bitcoind
+    build:
+      context: .
+      dockerfile: bitcoind.Dockerfile
+    ports:
+      - "8332:8332"
+      - "8333:8333"
+      - "18332:18332"
+      - "18333:18333"
+    command:
+      - "-m"
+      - "node"
+      - "-datadir=/root/.bitcoin"
+      - "-printtoconsole"
+      - "-regtest"
+      - "-ipcbind=unix"
+    volumes:
+      - bitcoind_share:/root/.bitcoin
+
+  pool:
+    image: fossatmara/pool:v1
+    container_name: pool
+    build:
+      context: .
+      dockerfile: pool.Dockerfile
+    environment:
+      - POOL_COINBASE_REWARD_SCRIPT=addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)
+      - POOL_SIGNATURE=Stratum V2 SRI Pool
+      - POOL_SHARES_PER_MINUTE=6.0
+      - POOL_SHARE_BATCH_SIZE=10
+      - POOL_FEE_THRESHOLD=100
+      - POOL_MIN_INTERVAL=5
+    ports:
+      - "3333:3333"
+      - "3334:3334"
+      - "9090:9090" # Monitoring HTTP API & Prometheus metrics (localhost only)
+    volumes:
+      - bitcoind_share:/root/.bitcoin
+
+  tproxy:
+    image: fossatmara/tproxy:v1
+    container_name: tproxy
+    build:
+      context: .
+      dockerfile: tproxy.Dockerfile
+    environment:
+      - TPROXY_USER_IDENTITY=your_username_here
+      - TPROXY_AGGREGATE_CHANNELS=false
+      - TPROXY_MIN_INDIVIDUAL_MINER_HASHRATE=10_000_000_000_000.0
+      - TPROXY_SHARES_PER_MINUTE=6.0
+      - TPROXY_ENABLE_VARDIFF=true
+      - TPROXY_UPSTREAM_ADDRESS=jdc
+      - TPROXY_UPSTREAM_PORT=34265
+      - TPROXY_UPSTREAM_AUTHORITY_PUBKEY=9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72
+    ports:
+      - "34255:34255"
+      - "9092:9092" # Monitoring HTTP API & Prometheus metrics
+
+  jdc:
+    image: fossatmara/jdc:v1
+    container_name: jdc
+    build:
+      context: .
+      dockerfile: jdc.Dockerfile
+    environment:
+      - JDC_USER_IDENTITY=your_username_here
+      - JDC_SHARES_PER_MINUTE=6.0
+      - JDC_SHARE_BATCH_SIZE=10
+      - JDC_SIGNATURE=Sv2MinerSignature
+      - JDC_COINBASE_REWARD_SCRIPT=addr(tb1qr8xjkrx46yfsch7q2ts2g007haufq48n9pe6qc)
+      - JDC_FEE_THRESHOLD=100
+      - JDC_MIN_INTERVAL=5
+      - JDC_UPSTREAM_AUTHORITY_PUBKEY=9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72
+      - JDC_POOL_ADDRESS=pool
+      - JDC_POOL_PORT=3333
+      - JDC_UPSTREAM_JDS_ADDRESS=pool
+      - JDC_UPSTREAM_JDS_PORT=3334
+      - JDC_TP_HOSTPORT=pool:34255
+      - JDC_TP_AUTHORITY_PUBKEY=9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72
+    ports:
+      - "34265:34265"
+      - "9091:9091" # Monitoring HTTP API & Prometheus metrics
+
+volumes:
+  # used to share an ipc socket
+  bitcoind_share:
+    driver: local
