@@ -12,7 +12,7 @@ on:
   # Optional safety net in case dispatch integration fails.
   push:
     branches:
-      - main
+      - mara
 
 permissions:
   contents: write

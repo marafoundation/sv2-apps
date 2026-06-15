@@ -3,10 +3,10 @@ name: Lockfiles
 on:
   pull_request:
     branches:
-      - main
+      - mara
   push:
     branches:
-      - main
+      - mara
 
 jobs:
   build:

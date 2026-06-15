@@ -1,10 +1,10 @@
 on:
   push:
     branches:
-      - main
+      - mara
   pull_request:
     branches:
-      - main
+      - mara
 
 name: Integration Tests
 
@@ -40,4 +40,4 @@ jobs:
 
       - name: Integration Tests
         run: |
-         RUST_BACKTRACE=1 RUST_LOG=debug cargo nextest run --manifest-path=integration-tests/Cargo.toml --nocapture
+          RUST_BACKTRACE=1 RUST_LOG=debug cargo nextest run --manifest-path=integration-tests/Cargo.toml --nocapture
