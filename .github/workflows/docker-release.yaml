@@ -56,6 +56,26 @@ jobs:
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # Tagged releases publish under the git ref name (the version tag),
+            # and :latest is moved to follow the newest release.
+            {
+              echo "tags<<EOF"
+              echo "${IMAGE}:${{ github.ref_name }}"
+              echo "${IMAGE}:latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Branch pushes and manual dispatch publish under the commit SHA so
+            # devs can deploy a specific build without touching :latest.
+            echo "tags=${IMAGE}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push multi-arch images
         uses: docker/build-push-action@v6
         with:
@@ -63,5 +83,4 @@ jobs:
           push: true
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platforms }}
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ matrix.image }}:${{ github.ref_name }}
+          tags: ${{ steps.tags.outputs.tags }}
