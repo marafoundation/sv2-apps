@@ -4,9 +4,9 @@ on:
   push:
     branches:
       - mara
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
-  release:
-    types: [published]
   workflow_dispatch:
 
 env:
@@ -58,9 +58,9 @@ jobs:
         env:
           IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            # Tagged releases publish under the git ref name (the version tag),
-            # and :latest is moved to follow the newest release.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # Version-tag pushes publish under the git ref name (the version
+            # tag), and :latest is moved to follow it.
             {
               echo "tags<<EOF"
               echo "${IMAGE}:${{ github.ref_name }}"
