@@ -1,10 +1,10 @@
 on:
   pull_request:
     branches:
-      - main
+      - mara
   push:
     branches:
-      - main
+      - mara
 
 name: MSRV 1.85 Check
 

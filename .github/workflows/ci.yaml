@@ -3,10 +3,10 @@ name: CI
 on:
   pull_request:
     branches:
-      - main
+      - mara
   push:
     branches:
-      - main
+      - mara
 
 env:
   CARGO_TERM_COLOR: always

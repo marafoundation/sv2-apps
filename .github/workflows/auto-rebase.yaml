@@ -3,19 +3,18 @@ name: Auto Rebase
 on:
   push:
     branches:
-      - main
+      - mara
   workflow_dispatch:
 
 jobs:
   rebase-outdated-prs:
     runs-on: ubuntu-latest
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT }}
-          fetch-depth: 0  # Fetch full history to have the entire commit history
+          fetch-depth: 0 # Fetch full history to have the entire commit history
 
       - name: Fetch open pull requests with label
         run: |

@@ -3,10 +3,10 @@ name: Semver Check
 on:
   pull_request:
     branches:
-      - main
+      - mara
   push:
     branches:
-      - main
+      - mara
 
 jobs:
   semver-check:

@@ -3,7 +3,7 @@ name: Validate Docker Config Drift
 on:
   pull_request:
     branches:
-      - main
+      - mara
 
 jobs:
   validate-config:
@@ -16,4 +16,3 @@ jobs:
       - name: Validate config vs Docker templates
         run: |
           bash scripts/validate-docker-config.sh
-
