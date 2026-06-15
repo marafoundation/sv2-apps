@@ -15,14 +15,25 @@ jobs:
 
     strategy:
       matrix:
-        app: [pool_sv2, jd_client_sv2, translator_sv2]
+        include:
+          - image: pool
+            dockerfile: pool.Dockerfile
+            platforms: linux/amd64
+          - image: jdc
+            dockerfile: jdc.Dockerfile
+            platforms: linux/amd64
+          - image: tproxy
+            dockerfile: tproxy.Dockerfile
+            platforms: linux/amd64
+          # bitcoind compiles Bitcoin Core + capnproto from source; arm64 under
+          # QEMU emulation is prohibitively slow, so build amd64 only.
+          - image: bitcoind
+            dockerfile: bitcoind.Dockerfile
+            platforms: linux/amd64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -48,4 +59,3 @@ jobs:
 
           tags: |
             stratumv2/${{ matrix.app }}:${{ github.ref_name }}
-
