@@ -21,15 +21,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `rust: true` enables the cargo cache-mount persistence steps below.
           - image: pool
             dockerfile: pool.Dockerfile
             platforms: linux/amd64
+            rust: true
           - image: jdc
             dockerfile: jdc.Dockerfile
             platforms: linux/amd64
+            rust: true
           - image: tproxy
             dockerfile: tproxy.Dockerfile
             platforms: linux/amd64
+            rust: true
           # bitcoind compiles Bitcoin Core + capnproto from source; arm64 under
           # QEMU emulation is prohibitively slow, so build amd64 only.
           - image: bitcoind
@@ -41,6 +45,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Configure AWS credentials
@@ -73,6 +78,34 @@ jobs:
             echo "tags=${IMAGE}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Persist the cargo cache mounts (registry/git/compiled target dir) across
+      # runs so a source change recompiles only what changed. Keyed on the
+      # lockfiles: the cache is reused until a dependency version changes.
+      # actions/cache is declared before the dance so its save (a post step) runs
+      # after the dance extracts the mounts back out.
+      - name: Restore cargo cache
+        id: cargo-cache
+        if: matrix.rust
+        uses: actions/cache@v4
+        with:
+          path: cargo-cache
+          key: cargo-cache-${{ matrix.image }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-cache-${{ matrix.image }}-
+
+      - name: Inject cargo cache into Buildx
+        if: matrix.rust
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "cargo-cache/registry": { "target": "/usr/local/cargo/registry", "id": "cargo-registry" },
+              "cargo-cache/git": { "target": "/usr/local/cargo/git", "id": "cargo-git" },
+              "cargo-cache/target": { "target": "/app/target", "id": "cargo-target" }
+            }
+          skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
+
       - name: Build and push multi-arch images
         uses: docker/build-push-action@v6
         with:
@@ -81,3 +114,8 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platforms }}
           tags: ${{ steps.tags.outputs.tags }}
+          # Layer cache stored in ECR (no GHA 10GB cap; biggest win for bitcoind,
+          # which compiles Bitcoin Core + capnproto from source). ECR rejects the
+          # default cache manifest type, so push it as an OCI image manifest.
+          cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ matrix.image }}:buildcache
+          cache-to: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ matrix.image }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
