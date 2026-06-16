@@ -10,6 +10,7 @@
 //! - **SV1 clients**: Legacy SV1 connections (Translator only)
 
 pub mod client;
+pub mod health;
 pub mod http_server;
 pub mod prometheus_metrics;
 pub mod routes;
@@ -21,6 +22,7 @@ pub use client::{
     ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
     Sv2ClientsMonitoring, Sv2ClientsSummary,
 };
+pub use health::{HealthMonitoring, NodeHealth};
 pub use http_server::{
     ErrorResponse, HealthResponse, MonitoringServer, RootResponse, ServerChannelsResponse,
     ServerResponse, Sv1ClientsResponse, Sv2ClientChannelsResponse, Sv2ClientResponse,

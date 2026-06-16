@@ -5,6 +5,7 @@ use super::{
         ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
         Sv2ClientsMonitoring, Sv2ClientsSummary,
     },
+    health::HealthMonitoring,
     prometheus_metrics::PrometheusMetrics,
     routes,
     server::{
@@ -220,6 +221,30 @@ impl MonitoringServer {
         Ok(self)
     }
 
+    /// Add a bitcoin node / Template Provider health source (e.g. the Pool).
+    ///
+    /// When set, `/api/v1/health` returns `503 Service Unavailable` whenever the
+    /// node is unavailable — including before the first block template arrives
+    /// (initial block download). Must be called before `run()`.
+    pub fn with_health_monitoring(
+        mut self,
+        health_source: Arc<dyn HealthMonitoring + Send + Sync + 'static>,
+    ) -> Self {
+        // Reuse the existing cache (with its sources and metrics) and attach the
+        // health source, mirroring `with_sv1_monitoring`'s unwrap-or-clone dance.
+        let cache = Arc::new(
+            Arc::try_unwrap(self.state.cache)
+                .unwrap_or_else(|arc| (*arc).clone())
+                .with_health_source(health_source),
+        );
+
+        // Populate node health immediately so the first scrape isn't blank.
+        cache.refresh();
+
+        self.state.cache = cache;
+        self
+    }
+
     /// Run the monitoring server until the shutdown signal completes
     ///
     /// Starts an HTTP server that exposes monitoring data as JSON.
@@ -308,8 +333,13 @@ impl MonitoringServer {
 // in-crate unit tests and downstream integration tests).
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct HealthResponse {
+    /// `"ok"` when healthy, `"unavailable"` when the bitcoin node is unreachable
+    /// or has not yet produced a block template (e.g. initial block download).
     pub status: String,
     pub timestamp: u64,
+    /// Human-readable detail, present only when the service is unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
@@ -440,22 +470,48 @@ async fn handle_root() -> Json<RootResponse> {
 // accept `const` references. They must be kept in sync with `routes::*`.
 
 /// Health check endpoint
+///
+/// Reports `200 OK` when the service is healthy, or `503 Service Unavailable`
+/// when the upstream bitcoin node / Template Provider is unavailable for any
+/// reason — including while the node is still performing its initial block
+/// download and has therefore not produced a block template yet.
+///
+/// Apps with no bitcoin node (e.g. the Translator Proxy) always report `200`.
 #[utoipa::path(
     get,
     path = "/api/v1/health",
     tag = "health",
     responses(
-        (status = 200, description = "Service is healthy", body = HealthResponse)
+        (status = 200, description = "Service is healthy", body = HealthResponse),
+        (status = 503, description = "Bitcoin node unavailable (disconnected or syncing)", body = HealthResponse)
     )
 )]
-async fn handle_health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    })
+async fn handle_health(State(state): State<ServerState>) -> Response {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // A health source reporting an unavailable node is the only thing that
+    // makes us unhealthy. When no health source is wired in (`None`), or the
+    // node is healthy, we report `200 OK`.
+    match state.cache.get_snapshot().node_health {
+        Some(health) if !health.healthy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HealthResponse {
+                status: "unavailable".to_string(),
+                timestamp,
+                reason: Some(health.reason),
+            }),
+        )
+            .into_response(),
+        _ => Json(HealthResponse {
+            status: "ok".to_string(),
+            timestamp,
+            reason: None,
+        })
+        .into_response(),
+    }
 }
 
 /// Get global statistics
@@ -991,6 +1047,37 @@ mod tests {
         }
     }
 
+    use super::super::health::NodeHealth;
+
+    struct MockHealth(NodeHealth);
+    impl HealthMonitoring for MockHealth {
+        fn node_health(&self) -> NodeHealth {
+            self.0.clone()
+        }
+    }
+
+    /// Build a minimal app with only a health source wired in.
+    fn build_health_app(health: NodeHealth) -> Router {
+        let metrics = PrometheusMetrics::new(false, false, false).unwrap();
+        let cache = Arc::new(
+            SnapshotCache::new(Duration::from_secs(60), None, None)
+                .with_metrics(metrics.clone())
+                .with_health_source(Arc::new(MockHealth(health))),
+        );
+        cache.refresh();
+
+        let state = ServerState {
+            cache,
+            start_time: 0,
+            metrics,
+        };
+
+        let api_v1 = Router::new().route(routes::segments::HEALTH, get(handle_health));
+        Router::new()
+            .nest(routes::API_V1_PREFIX, api_v1)
+            .with_state(state)
+    }
+
     /// Build a full Router with mock data for integration testing.
     fn build_test_app(
         server: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
@@ -1159,6 +1246,35 @@ mod tests {
         let body = get_body(response).await;
         let resp: HealthResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(resp.status, "ok");
+        // No health source wired in → no reason emitted.
+        assert!(resp.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_ok_when_node_healthy() {
+        let app = build_health_app(NodeHealth::healthy("receiving templates"));
+        let response = app.oneshot(make_request(routes::HEALTH)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = get_body(response).await;
+        let resp: HealthResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "ok");
+        assert!(resp.reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_unavailable_when_node_down() {
+        let app = build_health_app(NodeHealth::unavailable("bitcoin node performing IBD"));
+        let response = app.oneshot(make_request(routes::HEALTH)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = get_body(response).await;
+        let resp: HealthResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.status, "unavailable");
+        assert_eq!(
+            resp.reason.as_deref(),
+            Some("bitcoin node performing IBD")
+        );
     }
 
     #[tokio::test]

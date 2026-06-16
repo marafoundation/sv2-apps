@@ -10,7 +10,7 @@ Endpoints returning lists support pagination via `?offset=N&limit=M` query param
 |----------|-------------|
 | `/swagger-ui` | Swagger UI (interactive API docs) |
 | `/api-docs/openapi.json` | OpenAPI specification |
-| `/api/v1/health` | Health check |
+| `/api/v1/health` | Health check (`503` when the bitcoin node is unavailable) |
 | `/api/v1/global` | Global statistics |
 | `/api/v1/server` | Server metadata |
 | `/api/v1/server/channels` | Server channels (paginated) |
@@ -30,6 +30,10 @@ Applications implement these traits on their data structures:
 - `ServerMonitoring` - For upstream connection info
 - `Sv2ClientsMonitoring` - For Sv2 downstream client info (Pool, JDC)
 - `Sv1ClientsMonitoring` - For Sv1 downstream client info (Translator Proxy only)
+- `HealthMonitoring` - For bitcoin node / Template Provider availability (Pool). When
+  wired in via `MonitoringServer::with_health_monitoring`, `/api/v1/health` returns
+  `503 Service Unavailable` whenever the node can't supply block templates — including
+  during initial block download. Apps without a source always report `200 OK`.
 
 ## Usage
 

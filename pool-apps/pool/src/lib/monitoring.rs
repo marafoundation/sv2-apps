@@ -1,13 +1,26 @@
 //! Monitoring integration for Pool
 //!
-//! This module implements the Sv2ClientsMonitoring trait on `ChannelManager`.
-//! Pool only has clients (miners connecting to it), no upstream server.
+//! This module implements the Sv2ClientsMonitoring and HealthMonitoring traits
+//! on `ChannelManager`. Pool only has clients (miners connecting to it), no
+//! upstream server.
 
-use stratum_apps::monitoring::client::{
-    ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientsMonitoring,
+use std::time::Duration;
+
+use stratum_apps::monitoring::{
+    client::{ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientsMonitoring},
+    health::{HealthMonitoring, NodeHealth},
 };
 
 use crate::{channel_manager::ChannelManager, downstream::Downstream};
+
+/// How long the pool may go without a fresh template or prev-hash from the
+/// bitcoin node / Template Provider before it is treated as unavailable.
+///
+/// During normal operation the Template Provider pushes a new template on every
+/// chain tip and whenever the mempool changes, so a healthy node updates far
+/// more frequently than this. A gap this long indicates the node is unreachable
+/// or stalled (e.g. a hung Template Provider whose TCP connection stays open).
+const NODE_TEMPLATE_STALENESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Helper to convert a Downstream to Sv2ClientInfo.
 /// Returns None if the lock cannot be acquired (graceful degradation for monitoring).
@@ -116,5 +129,37 @@ impl Sv2ClientsMonitoring for ChannelManager {
                     .and_then(downstream_to_sv2_client_info)
             })
             .unwrap_or(None)
+    }
+}
+
+impl HealthMonitoring for ChannelManager {
+    /// Report the pool unhealthy whenever the bitcoin node / Template Provider
+    /// is unavailable: before the first template arrives (the node is still
+    /// performing its initial block download, or hasn't connected yet) and if
+    /// templates stop arriving (the node went away or stalled).
+    fn node_health(&self) -> NodeHealth {
+        self.channel_manager_data
+            .safe_lock(|data| match data.last_node_update {
+                None => NodeHealth::unavailable(
+                    "no block template received yet — bitcoin node unavailable or \
+                     performing initial block download",
+                ),
+                Some(last) => {
+                    let elapsed = last.elapsed();
+                    if elapsed > NODE_TEMPLATE_STALENESS_TIMEOUT {
+                        NodeHealth::unavailable(format!(
+                            "no block template received for {}s — bitcoin node unavailable",
+                            elapsed.as_secs()
+                        ))
+                    } else {
+                        NodeHealth::healthy("receiving block templates from bitcoin node")
+                    }
+                }
+            })
+            // A poisoned lock means the channel manager panicked mid-update; we
+            // can no longer vouch for the node, so report unhealthy.
+            .unwrap_or_else(|_| {
+                NodeHealth::unavailable("unable to read channel manager state")
+            })
     }
 }

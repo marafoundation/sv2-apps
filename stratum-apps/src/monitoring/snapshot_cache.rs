@@ -52,6 +52,7 @@ use tracing::debug;
 
 use super::{
     client::{Sv2ClientInfo, Sv2ClientsMonitoring, Sv2ClientsSummary},
+    health::{HealthMonitoring, NodeHealth},
     prometheus_metrics::PrometheusMetrics,
     server::{ServerInfo, ServerMonitoring, ServerSummary},
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
@@ -102,6 +103,11 @@ pub struct MonitoringSnapshot {
     pub sv2_clients_summary: Option<Sv2ClientsSummary>,
     pub sv1_clients: Option<Vec<Sv1ClientInfo>>,
     pub sv1_clients_summary: Option<Sv1ClientsSummary>,
+    /// Availability of the upstream bitcoin node / Template Provider.
+    ///
+    /// `None` when the app has no health source wired in (e.g. tProxy/JDC),
+    /// in which case `/health` reports `200 OK` unconditionally.
+    pub node_health: Option<NodeHealth>,
 }
 
 /// A cache that holds monitoring snapshots and refreshes them periodically.
@@ -116,6 +122,7 @@ pub struct SnapshotCache {
     server_source: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
     sv2_clients_source: Option<Arc<dyn Sv2ClientsMonitoring + Send + Sync>>,
     sv1_clients_source: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync>>,
+    health_source: Option<Arc<dyn HealthMonitoring + Send + Sync>>,
     metrics: Option<PrometheusMetrics>,
     previous_metrics_labels: Mutex<PreviousPrometheusLabelSets>,
 }
@@ -142,6 +149,7 @@ impl Clone for SnapshotCache {
             server_source: self.server_source.clone(),
             sv2_clients_source: self.sv2_clients_source.clone(),
             sv1_clients_source: self.sv1_clients_source.clone(),
+            health_source: self.health_source.clone(),
             metrics: self.metrics.clone(),
             previous_metrics_labels: Mutex::new(PreviousPrometheusLabelSets {
                 server_channel_labels: previous_metrics_labels.server_channel_labels.clone(),
@@ -176,9 +184,23 @@ impl SnapshotCache {
             server_source,
             sv2_clients_source,
             sv1_clients_source: None,
+            health_source: None,
             metrics: None,
             previous_metrics_labels: Mutex::new(PreviousPrometheusLabelSets::default()),
         }
+    }
+
+    /// Add a bitcoin node / Template Provider health source.
+    ///
+    /// When present, `refresh()` records the node's availability in the snapshot
+    /// so the `/health` endpoint can return a non-`200` status when the node is
+    /// unavailable (including during initial block download).
+    pub fn with_health_source(
+        mut self,
+        health_source: Arc<dyn HealthMonitoring + Send + Sync>,
+    ) -> Self {
+        self.health_source = Some(health_source);
+        self
     }
 
     /// Add SV1 monitoring source (for Tproxy)
@@ -237,6 +259,11 @@ impl SnapshotCache {
         if let Some(ref source) = self.sv1_clients_source {
             new_snapshot.sv1_clients = Some(source.get_sv1_clients());
             new_snapshot.sv1_clients_summary = Some(source.get_sv1_clients_summary());
+        }
+
+        // Collect bitcoin node / Template Provider health
+        if let Some(ref source) = self.health_source {
+            new_snapshot.node_health = Some(source.node_health());
         }
 
         // Update Prometheus gauges from the new snapshot data

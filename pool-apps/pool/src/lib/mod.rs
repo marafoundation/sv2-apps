@@ -175,7 +175,11 @@ impl PoolSv2 {
                     self.config.monitoring_cache_refresh_secs().unwrap_or(15),
                 ),
             )
-            .expect("Failed to initialize monitoring server");
+            .expect("Failed to initialize monitoring server")
+            // Report `/health` as unavailable whenever the bitcoin node /
+            // Template Provider isn't supplying block templates (e.g. during
+            // initial block download).
+            .with_health_monitoring(Arc::new(channel_manager.clone()));
 
             let cancellation_token_clone = cancellation_token.clone();
             let shutdown_signal = async move {

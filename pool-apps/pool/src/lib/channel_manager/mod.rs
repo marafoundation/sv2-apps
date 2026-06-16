@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicU32, AtomicUsize},
         Arc,
     },
+    time::Instant,
 };
 
 use async_channel::{unbounded, Receiver, Sender};
@@ -87,6 +88,11 @@ pub struct ChannelManagerData {
     last_new_prev_hash: Option<SetNewPrevHash<'static>>,
     // Last future template
     last_future_template: Option<NewTemplate<'static>>,
+    // When we last received a template or prev-hash from the Template Provider
+    // (bitcoin node). `None` until the first one arrives — i.e. while the node
+    // is still syncing (initial block download) or otherwise unavailable. Used
+    // by the monitoring `/health` endpoint to report node availability.
+    pub(crate) last_node_update: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -194,6 +200,7 @@ impl ChannelManager {
             coinbase_outputs,
             last_future_template: None,
             last_new_prev_hash: None,
+            last_node_update: None,
         }));
 
         let channel_manager_io = ChannelManagerIo {

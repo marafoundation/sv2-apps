@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::{sync::atomic::Ordering, time::Instant};
 
 use stratum_apps::stratum_core::{
     bitcoin::Amount,
@@ -35,6 +35,10 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
 
         let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
+            // Record node activity: receiving a template means the bitcoin node /
+            // Template Provider is reachable and past initial block download.
+            channel_manager_data.last_node_update = Some(Instant::now());
+
             if msg.future_template {
                 channel_manager_data.last_future_template = Some(msg.clone().into_static());
             }
@@ -174,6 +178,8 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", msg);
 
         let messages = self.channel_manager_data.super_safe_lock(|data| {
+            // Record node activity (see `handle_new_template`).
+            data.last_node_update = Some(Instant::now());
             data.last_new_prev_hash = Some(msg.clone().into_static());
 
             let mut messages: Vec<RouteMessageTo> = vec![];
