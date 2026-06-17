@@ -1271,10 +1271,7 @@ mod tests {
         let body = get_body(response).await;
         let resp: HealthResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(resp.status, "unavailable");
-        assert_eq!(
-            resp.reason.as_deref(),
-            Some("bitcoin node performing IBD")
-        );
+        assert_eq!(resp.reason.as_deref(), Some("bitcoin node performing IBD"));
     }
 
     #[tokio::test]
