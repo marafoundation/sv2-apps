@@ -158,8 +158,6 @@ impl HealthMonitoring for ChannelManager {
             })
             // A poisoned lock means the channel manager panicked mid-update; we
             // can no longer vouch for the node, so report unhealthy.
-            .unwrap_or_else(|_| {
-                NodeHealth::unavailable("unable to read channel manager state")
-            })
+            .unwrap_or_else(|_| NodeHealth::unavailable("unable to read channel manager state"))
     }
 }
