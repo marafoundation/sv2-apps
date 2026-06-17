@@ -80,6 +80,50 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+        # ---- Vendored git Cargo.lock injection ----
+        # Crane's per-crate vendoring path (`downloadCargoPackageFromGit`) runs
+        # `cargo package --offline --exclude-lockfile -l` to enumerate each
+        # crate's files, then copies them into `$out/<name>-<version>/`. The
+        # upstream repo's tracked `Cargo.lock` is intentionally NOT copied (see
+        # ipetkov/crane#962, PR #975/#976). When the workspace's downstream
+        # `cargo build` consumes the vendored output, cargo's source-replacement
+        # contract requires every vendored git checkout to carry a Cargo.lock,
+        # so the build fails with "the source ... requires a lock file to be
+        # present first before it can be used against vendored source code".
+        #
+        # Workaround precedent: warpdotdev/warp, zed-industries/zed,
+        # lexe-app/lexe-public, unionlabs/union all hook
+        # `overrideVendorGitCheckout` to fix up the extracted-packages drv.
+        # Here we fetch the upstream repo's tracked `Cargo.lock` at the locked
+        # rev and drop it into each crate subdir post-install. The
+        # `.cargo-checksum.json` Crane writes is `{"files":{}, "package":null}`
+        # — empty, so adding files is safe.
+        #
+        # This override fires only for stratum-mining/stratum git sources;
+        # other git deps (none today, but future-proofing) pass through
+        # untouched.
+        stratumLockedRev = "083b217049cd1538712caf0d3085b3841307dc2b";
+        stratumCargoLock = pkgs.fetchurl {
+          url = "https://raw.githubusercontent.com/stratum-mining/stratum/${stratumLockedRev}/Cargo.lock";
+          # Regenerate by setting to all-A's, running `nix build`, and copying
+          # the "got" value from the hash-mismatch error.
+          hash = "sha256-S7j3hayg6gG+9Qd3iECIJ4uzN5d7H28kFtM9WIe+U7I=";
+        };
+        injectStratumLockfile = lockMetadata: drv:
+          let
+            isStratumDep = builtins.any
+              (p: pkgs.lib.hasInfix "stratum-mining/stratum" (p.source or ""))
+              lockMetadata;
+          in
+          if !isStratumDep then drv
+          else drv.overrideAttrs (old: {
+            postInstall = (old.postInstall or "") + ''
+              for crateDir in "$out"/*/; do
+                cp ${stratumCargoLock} "$crateDir/Cargo.lock"
+              done
+            '';
+          });
+
         # ---- Source filtering ----
         # Crane's default cleanCargoSource drops everything that isn't .rs/Cargo.{toml,lock}.
         # We need the full repo because pool-apps depends on bitcoin-core-sv2 and stratum-apps
@@ -118,10 +162,13 @@
           cargoExtraArgs = "--manifest-path pool-apps/Cargo.toml";
           # Crane auto-resolves git deps from the lockfile (Cargo.lock pins
           # stratum-core to a specific rev). No outputHashes entries needed
-          # for the stratum-core branch=main case.
+          # for the stratum-core branch=main case. `overrideVendorGitCheckout`
+          # re-injects the upstream stratum Cargo.lock that Crane's vendoring
+          # strips — see `injectStratumLockfile` above for context.
           cargoVendorDir = craneLib.vendorCargoDeps {
             src = ./.;
             cargoLock = ./pool-apps/Cargo.lock;
+            overrideVendorGitCheckout = injectStratumLockfile;
           };
         };
 
@@ -135,6 +182,7 @@
           cargoVendorDir = craneLib.vendorCargoDeps {
             src = ./.;
             cargoLock = ./miner-apps/Cargo.lock;
+            overrideVendorGitCheckout = injectStratumLockfile;
           };
         };
 
