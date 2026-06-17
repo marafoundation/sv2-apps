@@ -118,8 +118,10 @@
           if !isStratumDep then drv
           else drv.overrideAttrs (old: {
             postInstall = (old.postInstall or "") + ''
+              echo "[injectStratumLockfile] dropping Cargo.lock into vendored crates"
               for crateDir in "$out"/*/; do
                 cp ${stratumCargoLock} "$crateDir/Cargo.lock"
+                echo "[injectStratumLockfile]   wrote $crateDir/Cargo.lock"
               done
             '';
           });
