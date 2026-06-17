@@ -75,7 +75,7 @@
           # Hash for rust-toolchain.toml (channel = 1.85.0 + rustfmt/clippy/rust-analyzer).
           # Regenerate when rust-toolchain.toml changes by replacing with all-A's and
           # copying the "got" value from the resulting `nix build` error.
-          sha256 = "sha256-AJ6LX/Q/Er9kS15bn9iflkUwcgYqRQxiOIL2ToVAXaU=";
+          sha256 = "sha256-X/4ZBHO3iW0fOenQ3foEvscgAPJYl2abspaBThDOukI=";
         };
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
