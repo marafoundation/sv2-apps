@@ -1,63 +1,46 @@
-# flake.nix — reproducible OCI image builds for sv2-apps release binaries.
+# flake.nix — reproducible builds for sv2-apps release binaries.
 #
 # WHAT THIS PRODUCES
 #   packages.<system>.{pool_sv2, jd_client_sv2, translator_sv2}            -- release binaries
 #   packages.<system>.container.{pool_sv2, jd_client_sv2, translator_sv2}  -- OCI images (gzipped tarballs)
 #   devShells.<system>.default                                             -- dev env mirroring docker/Dockerfile
 #
-# RELATIONSHIP TO EXISTING DOCKER PIPELINE
-#   This flake lives ALONGSIDE docker/Dockerfile and .github/workflows/docker-release.yaml,
-#   not as a replacement. It is opt-in / experimental. The existing Buildx + QEMU pipeline
-#   continues to be the source of truth until reproducibility of this path is verified.
-#
 # DESIGN
-#   - Crane (https://crane.dev) for Rust builds; Fenix for toolchain pinning from rust-toolchain.toml.
-#   - dockerTools.buildLayeredImage produces OCI tarballs (no Docker daemon needed at build time).
-#   - Multi-arch is achieved at the CI level via native runners per arch (see ci-nix.yml),
-#     not via cross-compilation here. Each Nix system builds a single-arch image; CI stitches
-#     them with `docker manifest create`.
-#   - NO `runAsRoot` is used in image config — sidesteps nixpkgs#416467 on aarch64-linux.
-#   - The repo has TWO cargo workspaces (pool-apps/, miner-apps/) plus the stratum-apps
-#     "shim" crate. Each binary is built from its respective workspace lockfile.
-#
-# CONTEXT
-#   See docker/REPRODUCIBILITY.md and the wiki article at
-#   ~/wiki/topics/nixos-reproducible-builds-bitcoin/wiki/topics/sv2-apps-oci-reproducibility-feasibility.md
-#
-# FIRST-BUILD TODOs
-# NOTE
-#   The toolchain hash below pins channel = "1.85.0" + rustfmt/clippy/rust-analyzer
-#   (matches rust-toolchain.toml). If rust-toolchain.toml changes, replace the sha256
-#   with all-A's, run `nix build`, and copy the "got" value from the resulting error.
-#
-#   The stratum-core git dependency (branch=main, currently rev 083b217...) is
-#   resolved automatically by Crane from each workspace's Cargo.lock — no manual
-#   outputHashes entries are required. If a future Cargo.lock pins a NEW git source
-#   that Crane cannot auto-resolve (rare), Crane will print the expected
-#   `outputHashes` entry; paste it into the corresponding `vendorCargoDeps` block.
+#   - `rustPlatform.buildRustPackage` from nixpkgs (NOT Crane) for Rust builds.
+#     Crane's per-crate `cargo package --exclude-lockfile` vendoring path
+#     fails for our case: stratum-mining/stratum is a transitive git
+#     dependency that's itself a workspace, and cargo's source-replacement
+#     consumer rejects vendored git checkouts whose `SourceId.precise`
+#     isn't populated correctly. `buildRustPackage` invokes cargo's own
+#     `cargo vendor`, which preserves lockfiles and emits config in cargo's
+#     native format. See the deleted Crane block in git history (commit
+#     4b0d7df5 and parents) for the failed approach + research notes.
+#   - Fenix pins the Rust toolchain from `rust-toolchain.toml` and is
+#     plumbed into `buildRustPackage` via `makeRustPlatform`.
+#   - `cargoLock.allowBuiltinFetchGit = true` lets nix's eval-time
+#     `builtins.fetchGit` resolve the rev-pinned stratum git source from
+#     each workspace's Cargo.lock without manually maintaining
+#     `outputHashes` entries (would be 18 entries for stratum's workspace
+#     members). Trade-off: eval-time network access — fine on CI runners
+#     and operator workstations, not for fully-pure offline builds.
+#   - `dockerTools.buildLayeredImage` produces OCI tarballs (no Docker
+#     daemon needed at build time). NO `runAsRoot` — sidesteps nixpkgs#416467.
+#   - The repo has TWO cargo workspaces (pool-apps/, miner-apps/). Each
+#     binary is built from its respective workspace lockfile.
 
 {
   description = "Stratum V2 sv2-apps reproducible OCI image builds";
 
   inputs = {
-    # Pinned to nixos-25.11 (Crane requires nixpkgs >= 25.11 as of v0.21).
-    # Bump deliberately when you want newer toolchains or dockerTools fixes.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-
     flake-utils.url = "github:numtide/flake-utils";
-
-    crane = {
-      url = "github:ipetkov/crane";
-      # Crane no longer requires `inputs.nixpkgs.follows` since v0.18; it reads pkgs from the caller.
-    };
-
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, crane, fenix }:
+  outputs = { self, nixpkgs, flake-utils, fenix }:
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
@@ -69,78 +52,22 @@
         pkgs = import nixpkgs { inherit system; };
         isLinux = pkgs.stdenv.hostPlatform.isLinux;
 
-        # ---- Rust toolchain pinned via rust-toolchain.toml ----
+        # Rust toolchain pinned via rust-toolchain.toml. Hash regenerated
+        # whenever rust-toolchain.toml changes (set to all-A's, run
+        # `nix build`, paste the "got" value from the error).
         rustToolchain = fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
-          # Hash for rust-toolchain.toml (channel = 1.85.0 + rustfmt/clippy/rust-analyzer).
-          # Regenerate when rust-toolchain.toml changes by replacing with all-A's and
-          # copying the "got" value from the resulting `nix build` error.
           sha256 = "sha256-mvUGEOHYJpn3ikC5hckneuGixaC+yGrkMM/liDIDgoU=";
         };
 
-        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-
-        # ---- Vendored git Cargo.lock injection ----
-        # Crane's per-crate vendoring path (`downloadCargoPackageFromGit`) runs
-        # `cargo package --offline --exclude-lockfile -l` to enumerate each
-        # crate's files, then copies them into `$out/<name>-<version>/`. The
-        # upstream repo's tracked `Cargo.lock` is intentionally NOT copied (see
-        # ipetkov/crane#962, PR #975/#976). When the workspace's downstream
-        # `cargo build` consumes the vendored output, cargo's source-replacement
-        # contract requires every vendored git checkout to carry a Cargo.lock,
-        # so the build fails with "the source ... requires a lock file to be
-        # present first before it can be used against vendored source code".
-        #
-        # Workaround precedent: warpdotdev/warp, zed-industries/zed,
-        # lexe-app/lexe-public, unionlabs/union all hook
-        # `overrideVendorGitCheckout` to fix up the extracted-packages drv.
-        # Here we fetch the upstream repo's tracked `Cargo.lock` at the locked
-        # rev and drop it into each crate subdir post-install. The
-        # `.cargo-checksum.json` Crane writes is `{"files":{}, "package":null}`
-        # — empty, so adding files is safe.
-        #
-        # This override fires only for stratum-mining/stratum git sources;
-        # other git deps (none today, but future-proofing) pass through
-        # untouched.
-        stratumLockedRev = "083b217049cd1538712caf0d3085b3841307dc2b";
-        stratumCargoLock = pkgs.fetchurl {
-          url = "https://raw.githubusercontent.com/stratum-mining/stratum/${stratumLockedRev}/Cargo.lock";
-          # Regenerate by setting to all-A's, running `nix build`, and copying
-          # the "got" value from the hash-mismatch error.
-          hash = "sha256-S7j3hayg6gG+9Qd3iECIJ4uzN5d7H28kFtM9WIe+U7I=";
-        };
-        injectStratumLockfile = lockMetadata: drv:
-          let
-            isStratumDep = builtins.any
-              (p: pkgs.lib.hasInfix "stratum-mining/stratum" (p.source or ""))
-              lockMetadata;
-          in
-          if !isStratumDep then drv
-          else drv.overrideAttrs (old: {
-            postInstall = (old.postInstall or "") + ''
-              echo "[injectStratumLockfile] dropping Cargo.lock into vendored crates"
-              for crateDir in "$out"/*/; do
-                cp ${stratumCargoLock} "$crateDir/Cargo.lock"
-                echo "[injectStratumLockfile]   wrote $crateDir/Cargo.lock"
-              done
-            '';
-          });
-
-        # ---- Source filtering ----
-        # Crane's default cleanCargoSource drops everything that isn't .rs/Cargo.{toml,lock}.
-        # We need the full repo because pool-apps depends on bitcoin-core-sv2 and stratum-apps
-        # via path. Use a permissive filter that keeps Rust + workspace metadata.
-        src = pkgs.lib.cleanSourceWith {
-          src = ./.;
-          filter = path: type:
-            (craneLib.filterCargoSources path type)
-            # Keep config-examples + READMEs referenced by Cargo.toml `readme` keys.
-            || (builtins.match ".*/README\\.md$" path != null)
-            || (builtins.match ".*/config-examples/.*" path != null);
-          name = "sv2-apps-source";
+        # Splice the fenix toolchain into a rustPlatform so
+        # buildRustPackage uses our pinned cargo + rustc instead of
+        # nixpkgs defaults.
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rustToolchain;
+          rustc = rustToolchain;
         };
 
-        # ---- Common build inputs ----
         nativeBuildInputs = with pkgs; [
           pkg-config
           capnproto      # build-time, matches Dockerfile builder stage
@@ -151,82 +78,71 @@
           # Add openssl/zlib here if a transitive dep complains on first build.
         ];
 
-        # ---- Per-workspace common args ----
-        # Each binary lives in its own workspace; we build deps once per workspace.
+        # Each binary's `src` is the whole repo (path deps cross workspace
+        # boundaries: pool-apps depends on bitcoin-core-sv2 and stratum-apps).
+        src = ./.;
 
-        commonArgsPool = {
-          inherit src nativeBuildInputs buildInputs;
-          pname = "sv2-pool-apps-deps";
-          version = "0.4.0";
-          cargoLock = ./pool-apps/Cargo.lock;
-          cargoToml = ./pool-apps/Cargo.toml;
-          # Build from the workspace root.
-          cargoExtraArgs = "--manifest-path pool-apps/Cargo.toml";
-          # Crane auto-resolves git deps from the lockfile (Cargo.lock pins
-          # stratum-core to a specific rev). No outputHashes entries needed
-          # for the stratum-core branch=main case. `overrideVendorGitCheckout`
-          # re-injects the upstream stratum Cargo.lock that Crane's vendoring
-          # strips — see `injectStratumLockfile` above for context.
-          cargoVendorDir = craneLib.vendorCargoDeps {
-            src = ./.;
-            cargoLock = ./pool-apps/Cargo.lock;
-            overrideVendorGitCheckout = injectStratumLockfile;
+        mkSv2Bin = { pname, version, workspace, lockFile }:
+          rustPlatform.buildRustPackage {
+            inherit pname version src nativeBuildInputs buildInputs;
+
+            # `cargoRoot` is the directory (relative to src) containing
+            # the Cargo.lock for this binary's workspace. The cargo-setup
+            # hook reads `<src>/<cargoRoot>/Cargo.lock` for the
+            # consistency check against the vendored deps lockfile.
+            cargoRoot = workspace;
+            # `buildAndTestSubdir` tells the build/check phase where to
+            # run cargo from. Aligned with cargoRoot for our two-workspace
+            # layout (pool-apps/, miner-apps/).
+            buildAndTestSubdir = workspace;
+
+            cargoLock = {
+              inherit lockFile;
+              # Use builtins.fetchGit for git deps in Cargo.lock so we
+              # don't have to maintain 18 outputHashes entries for
+              # stratum-mining/stratum's workspace members. The rev is
+              # pinned in the lockfile so reproducibility is preserved.
+              allowBuiltinFetchGit = true;
+            };
+
+            # Limit cargo to the requested binary; matches the original
+            # Dockerfile per-stage build.
+            cargoBuildFlags = [ "--bin" pname ];
+            cargoTestFlags = [ "--bin" pname ];
+
+            # CI runs the test suite separately; this build only produces
+            # the release binary for closure deployment.
+            doCheck = false;
           };
-        };
 
-        commonArgsMiner = {
-          inherit src nativeBuildInputs buildInputs;
-          pname = "sv2-miner-apps-deps";
-          version = "0.3.0";
-          cargoLock = ./miner-apps/Cargo.lock;
-          cargoToml = ./miner-apps/Cargo.toml;
-          cargoExtraArgs = "--manifest-path miner-apps/Cargo.toml";
-          cargoVendorDir = craneLib.vendorCargoDeps {
-            src = ./.;
-            cargoLock = ./miner-apps/Cargo.lock;
-            overrideVendorGitCheckout = injectStratumLockfile;
-          };
-        };
-
-        # ---- Dependency-only builds (cached separately per workspace) ----
-        cargoArtifactsPool = craneLib.buildDepsOnly commonArgsPool;
-        cargoArtifactsMiner = craneLib.buildDepsOnly commonArgsMiner;
-
-        # ---- Per-binary release builds ----
-        pool_sv2 = craneLib.buildPackage (commonArgsPool // {
+        pool_sv2 = mkSv2Bin {
           pname = "pool_sv2";
           version = "0.4.0";
-          cargoArtifacts = cargoArtifactsPool;
-          cargoExtraArgs = "--manifest-path pool-apps/Cargo.toml -p pool_sv2 --bin pool_sv2";
-          # Skip workspace-wide tests at image-build time; CI runs them separately.
-          doCheck = false;
-        });
+          workspace = "pool-apps";
+          lockFile = ./pool-apps/Cargo.lock;
+        };
 
-        jd_client_sv2 = craneLib.buildPackage (commonArgsMiner // {
+        jd_client_sv2 = mkSv2Bin {
           pname = "jd_client_sv2";
           version = "0.3.0";
-          cargoArtifacts = cargoArtifactsMiner;
-          cargoExtraArgs = "--manifest-path miner-apps/Cargo.toml -p jd_client_sv2 --bin jd_client_sv2";
-          doCheck = false;
-        });
+          workspace = "miner-apps";
+          lockFile = ./miner-apps/Cargo.lock;
+        };
 
-        translator_sv2 = craneLib.buildPackage (commonArgsMiner // {
+        translator_sv2 = mkSv2Bin {
           pname = "translator_sv2";
           version = "0.3.0";
-          cargoArtifacts = cargoArtifactsMiner;
-          cargoExtraArgs = "--manifest-path miner-apps/Cargo.toml -p translator_sv2 --bin translator_sv2";
-          doCheck = false;
-        });
+          workspace = "miner-apps";
+          lockFile = ./miner-apps/Cargo.lock;
+        };
 
-        # ---- OCI image builder ----
-        # Single-arch per system. CI stitches with `docker manifest create`.
-        # NO runAsRoot — sidesteps nixpkgs#416467 on aarch64-linux GitHub runners.
+        # Single-arch per system. CI stitches multi-arch with
+        # `docker manifest create`.
         mkContainer = { name, pkg, binName }:
           pkgs.dockerTools.buildLayeredImage {
             inherit name;
             tag = "latest";  # CI retags with ${github.ref_name}-${arch}.
-            # Epoch+1 timestamp (the +1 sidesteps a historical dockerTools quirk that
-            # would otherwise treat 0 as "unset" and fall back to build time).
+            # +1 sidesteps a historical dockerTools quirk that treats 0 as unset.
             created = "1970-01-01T00:00:01Z";
 
             architecture =
@@ -236,21 +152,13 @@
 
             contents = [
               pkg
-              # gettext provides envsubst — kept for parity with the existing Dockerfile's
-              # runtime stage, which installs gettext-base for config templating.
-              pkgs.gettext
-              # bash + coreutils so an entrypoint sh -c wrapper works (the Dockerfile uses
-              # ENTRYPOINT ["/bin/sh", "-c", ...]); also handy for `docker exec` debugging.
+              pkgs.gettext       # envsubst — runtime parity with Dockerfile
               pkgs.bash
               pkgs.coreutils
-              # CA bundle for any TLS calls the binaries make.
               pkgs.cacert
             ];
 
             config = {
-              # Direct binary invocation. If you need the existing Dockerfile's
-              # `sh -c "/app/${APP}"` envsubst-on-args behavior, swap to:
-              #   Entrypoint = [ "${pkgs.bash}/bin/sh" "-c" "${pkg}/bin/${binName} \"$@\"" "--" ];
               Cmd = [ "${pkg}/bin/${binName}" ];
               Env = [
                 "PATH=/bin:/usr/bin"
@@ -270,46 +178,30 @@
 
           # Containers only build on linux; on darwin these attrs are absent.
           container = pkgs.lib.optionalAttrs isLinux {
-            pool_sv2 = mkContainer {
-              name = "stratumv2/pool_sv2";
-              pkg = pool_sv2;
-              binName = "pool_sv2";
-            };
-            jd_client_sv2 = mkContainer {
-              name = "stratumv2/jd_client_sv2";
-              pkg = jd_client_sv2;
-              binName = "jd_client_sv2";
-            };
-            translator_sv2 = mkContainer {
-              name = "stratumv2/translator_sv2";
-              pkg = translator_sv2;
-              binName = "translator_sv2";
-            };
+            pool_sv2       = mkContainer { name = "stratumv2/pool_sv2";       pkg = pool_sv2;       binName = "pool_sv2"; };
+            jd_client_sv2  = mkContainer { name = "stratumv2/jd_client_sv2";  pkg = jd_client_sv2;  binName = "jd_client_sv2"; };
+            translator_sv2 = mkContainer { name = "stratumv2/translator_sv2"; pkg = translator_sv2; binName = "translator_sv2"; };
           };
 
           default = pool_sv2;
         };
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = pkgs.lib.optionals isLinux [
-            # Pull in build inputs from one of the binaries on linux for full parity;
-            # on darwin we just want toolchain + tools.
-            pool_sv2
-          ];
+          inputsFrom = pkgs.lib.optionals isLinux [ pool_sv2 ];
           packages = with pkgs; [
             rustToolchain
             capnproto
             pkg-config
             clang
-            gettext        # envsubst — runtime parity with Dockerfile
+            gettext
             cargo-watch
             cargo-nextest
           ];
-          # Helpful for rust-analyzer integration.
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         };
 
-        # `nix flake check` runs this; keep cheap so CI's `nix flake check --no-build` works.
+        # `nix flake check` runs this; keep cheap so CI's
+        # `nix flake check --no-build` works.
         checks = pkgs.lib.optionalAttrs isLinux {
           inherit pool_sv2 jd_client_sv2 translator_sv2;
         };
