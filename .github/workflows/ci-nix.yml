@@ -1,0 +1,243 @@
+# Nix-driven reproducible OCI image build pipeline.
+#
+# Runs alongside .github/workflows/docker-release.yaml — does NOT replace it.
+# Status: experimental / opt-in. Do not gate releases on this until reproducibility
+# is verified end-to-end (see docker/REPRODUCIBILITY.md).
+#
+# Pattern (modeled on Fedimint's ci-nix.yml + reproducibility verification):
+#   - Native runners per arch: ubuntu-latest (amd64) + ubuntu-24.04-arm (arm64).
+#     No QEMU emulation. ubuntu-24.04-arm has been free for public repos since 2025-08 GA.
+#   - For each (arch, app) cell, TWO independent builders ("a" and "b") build the
+#     OCI image on separate runner instances. Each uploads its tarball as an artifact.
+#   - `verify-reproducible` downloads both artifacts per (arch, app), compares
+#     sha256sums, and fails the workflow if any pair diverges. This catches
+#     in-build nondeterminism + machine-specific drift within an arch.
+#     (Cross-arch comparison is intentionally not done — different archs produce
+#     different machine code, so different digests by definition.)
+#   - `push-per-arch` runs ONLY after verify passes; uses builder "a"'s tarball
+#     and pushes a per-arch tag.
+#   - `manifest` stitches the two per-arch tags into a multi-arch manifest list.
+#
+# COST: ~2x the runner-minutes of a single-build pipeline. Free on public repos.
+
+name: Nix CI / Reproducible OCI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/ci-nix.yml"
+      - "rust-toolchain.toml"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/src/**"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Only one run per ref at a time; cancel superseded ones on PRs.
+concurrency:
+  group: ci-nix-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build: 2 runner archs × 3 apps × 2 independent instances = 12 parallel cells.
+  # Each cell builds a single-arch OCI tarball with Nix and uploads it.
+  # ---------------------------------------------------------------------------
+  build-image:
+    name: Build ${{ matrix.app }} (${{ matrix.oci_arch }} / ${{ matrix.instance }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    oci_arch: amd64, nix_system: x86_64-linux }
+          - { runner: ubuntu-24.04-arm, oci_arch: arm64, nix_system: aarch64-linux }
+        app: [pool_sv2, jd_client_sv2, translator_sv2]
+        # Two independent build instances per (arch, app). Compared in `verify-reproducible`.
+        instance: [a, b]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            max-jobs = auto
+
+      # Optional: binary cache. Uncomment + configure once you've decided on a host.
+      # Note: a binary cache shortcuts the second instance to a near-zero rebuild,
+      # which weakens reproducibility verification. Keep at most ONE instance pulling
+      # from cache, or skip the cache entirely on instance `b` to retain signal.
+      # - name: Configure Cachix
+      #   if: matrix.instance == 'a'
+      #   uses: cachix/cachix-action@v15
+      #   with:
+      #     name: stratumv2
+      #     authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build OCI image
+        # `-L` streams build logs to stdout; useful when debugging in CI.
+        run: nix build .#container.${{ matrix.app }} -L
+
+      - name: Record image digest
+        id: digest
+        run: |
+          set -euo pipefail
+          # `result` is a symlink to the gzipped tarball in /nix/store.
+          # Hash the dereferenced file content (the tarball itself), not the symlink.
+          digest=$(sha256sum -L ./result | cut -d' ' -f1)
+          echo "result_sha256=${digest}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=OCI digest::${{ matrix.app }}/${{ matrix.oci_arch }}/${{ matrix.instance }} = ${digest}"
+
+      - name: Stage tarball for upload
+        run: |
+          set -euo pipefail
+          mkdir -p ./upload
+          # Copy (not move) so the symlink target stays alive; rename to a stable filename.
+          cp -L ./result ./upload/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz
+
+      - name: Upload image tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-${{ matrix.app }}-${{ matrix.oci_arch }}-${{ matrix.instance }}
+          path: ./upload/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Verify: download both instances' tarballs per (arch, app), compare sha256.
+  # No cross-arch comparison — different archs are different artifacts by definition.
+  # ---------------------------------------------------------------------------
+  verify-reproducible:
+    name: Verify reproducible (${{ matrix.app }} / ${{ matrix.oci_arch }})
+    needs: build-image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [pool_sv2, jd_client_sv2, translator_sv2]
+        oci_arch: [amd64, arm64]
+    steps:
+      - name: Download instance A
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-${{ matrix.app }}-${{ matrix.oci_arch }}-a
+          path: ./a
+
+      - name: Download instance B
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-${{ matrix.app }}-${{ matrix.oci_arch }}-b
+          path: ./b
+
+      - name: Compare sha256
+        id: compare
+        run: |
+          set -euo pipefail
+          a_hash=$(sha256sum ./a/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz | cut -d' ' -f1)
+          b_hash=$(sha256sum ./b/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz | cut -d' ' -f1)
+          echo "a_hash=${a_hash}"
+          echo "b_hash=${b_hash}"
+          if [ "${a_hash}" = "${b_hash}" ]; then
+            echo "::notice title=Reproducible::${{ matrix.app }}/${{ matrix.oci_arch }} sha256=${a_hash}"
+            echo "reproducible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=Not reproducible::${{ matrix.app }}/${{ matrix.oci_arch }} a=${a_hash} b=${b_hash}"
+            echo "reproducible=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # On mismatch, run diffoscope inside Nix for a structured diff. Only runs
+      # if the previous step failed (we only get here on the diagnostic path).
+      - name: Diagnose mismatch with diffoscope
+        if: failure() && steps.compare.outputs.reproducible == 'false'
+        run: |
+          set -euo pipefail
+          nix run nixpkgs#diffoscope -- \
+            ./a/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz \
+            ./b/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz \
+            > diffoscope.txt 2>&1 || true
+          echo "::group::diffoscope output"
+          tail -c 65000 diffoscope.txt || true
+          echo "::endgroup::"
+
+      - name: Upload diffoscope report on mismatch
+        if: failure() && steps.compare.outputs.reproducible == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffoscope-${{ matrix.app }}-${{ matrix.oci_arch }}
+          path: diffoscope.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Push: only after verification passes. Uses instance "a"'s tarball.
+  # Per-arch tag like stratumv2/pool_sv2:v0.4.0-amd64.
+  # ---------------------------------------------------------------------------
+  push-per-arch:
+    name: Push ${{ matrix.app }} (${{ matrix.oci_arch }})
+    needs: verify-reproducible
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [pool_sv2, jd_client_sv2, translator_sv2]
+        oci_arch: [amd64, arm64]
+    steps:
+      - name: Download instance A tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-${{ matrix.app }}-${{ matrix.oci_arch }}-a
+          path: ./oci
+
+      - name: Load image into local docker
+        run: |
+          set -euo pipefail
+          docker load < ./oci/${{ matrix.app }}-${{ matrix.oci_arch }}.tar.gz
+          docker images stratumv2/${{ matrix.app }}
+
+      - name: Login and push per-arch tag
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}-${{ matrix.oci_arch }}"
+          docker tag stratumv2/${{ matrix.app }}:latest \
+            stratumv2/${{ matrix.app }}:"${tag}"
+          echo "${DOCKERHUB_TOKEN}" | docker login -u stratumv2 --password-stdin
+          docker push stratumv2/${{ matrix.app }}:"${tag}"
+
+  # ---------------------------------------------------------------------------
+  # Manifest: stitch per-arch tags into a multi-arch manifest list.
+  # ---------------------------------------------------------------------------
+  manifest:
+    name: Multi-arch manifest (${{ matrix.app }})
+    needs: push-per-arch
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [pool_sv2, jd_client_sv2, translator_sv2]
+    steps:
+      - name: Login to Docker Hub
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: echo "${DOCKERHUB_TOKEN}" | docker login -u stratumv2 --password-stdin
+
+      - name: Create and push multi-arch manifest
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME}"
+          docker manifest create stratumv2/${{ matrix.app }}:"${ref}" \
+            stratumv2/${{ matrix.app }}:"${ref}-amd64" \
+            stratumv2/${{ matrix.app }}:"${ref}-arm64"
+          docker manifest push stratumv2/${{ matrix.app }}:"${ref}"
