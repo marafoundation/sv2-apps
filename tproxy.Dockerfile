@@ -24,13 +24,11 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gettext-base && \
-    rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 COPY --from=builder /app/translator_sv2 /app/translator_sv2
-COPY config/translator-proxy-config.toml.template /app/translator-proxy-config.toml.template
+# Baked default config. Values can be overridden at runtime with TPROXY__* env vars
+# (the binary layers environment variables on top of this file).
+COPY config/translator-config.toml /app/translator-config.toml
 
-ENTRYPOINT ["/bin/sh", "-c", "envsubst < /app/translator-proxy-config.toml.template > /app/translator-config.toml && exec /app/translator_sv2"]
+ENTRYPOINT ["/app/translator_sv2"]

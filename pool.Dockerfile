@@ -24,15 +24,13 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gettext-base && \
-    rm -rf /var/lib/apt/lists/*
-
 ENV IPC_DIR=/root/.bitcoin/
 
 WORKDIR /app
 
 COPY --from=builder /app/pool_sv2 /app/pool_sv2
-COPY config/pool-jds-config.toml.template /app/pool-jds-config.toml.template
+# Baked default config. Values can be overridden at runtime with POOL__* env vars
+# (the binary layers environment variables on top of this file).
+COPY config/pool-config.toml /app/pool-config.toml
 # check if the IPC file exists on a loop and wait until it does before starting the pool_sv2
-ENTRYPOINT ["/bin/sh", "-c", "envsubst < /app/pool-jds-config.toml.template > /app/pool-config.toml && while [ ! -S \"$IPC_DIR/node.sock\" ]; do sleep 1; echo waiting for IPC file...; done && exec /app/pool_sv2"]
+ENTRYPOINT ["/bin/sh", "-c", "while [ ! -S \"$IPC_DIR/node.sock\" ]; do sleep 1; echo waiting for IPC file...; done && exec /app/pool_sv2"]

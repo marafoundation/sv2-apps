@@ -1,3 +1,14 @@
+# SRI Translator (tProxy) config
+#
+# This is the default configuration baked into the tProxy Docker image. Any value
+# below can be overridden at runtime with an environment variable named
+# `TPROXY__<FIELD>` (double underscore separates nesting). Environment variables
+# take precedence over this file.
+#
+# NOTE: the `[[upstreams]]` list holds structured values that cannot be expressed
+# as environment variables, so it is configured here directly. The address below
+# points at the `jdc` service defined in docker-compose.yml.
+
 # Local Mining Device Downstream Connection
 downstream_address = "0.0.0.0"
 downstream_port = 34255
@@ -17,10 +28,12 @@ downstream_extranonce2_size = 4
 # Keep false for standard pool mining, including pools that use a Bitcoin address as the username.
 # Enable for solo/donation identities: sri/solo/<address>/<worker>,
 # sri/donate/<percentage>/<address>/<worker>, or legacy <address>[.worker].
-verify_payout = ${TPROXY_VERIFY_PAYOUT}
+# Override with TPROXY__VERIFY_PAYOUT.
+verify_payout = false
 
-# Aggregate channels: if true, all miners share one upstream channel; if false, each miner gets its own channel
-aggregate_channels = ${TPROXY_AGGREGATE_CHANNELS}
+# Aggregate channels: if true, all miners share one upstream channel; if false, each miner gets its own channel.
+# Override with TPROXY__AGGREGATE_CHANNELS.
+aggregate_channels = false
 
 # Enable this option to set a predefined log file path.
 # When enabled, logs will always be written to this file.
@@ -38,20 +51,21 @@ supported_extensions = [
 monitoring_address = "0.0.0.0:9092"
 monitoring_cache_refresh_secs = 15
 
-# Difficulty params
+# Difficulty params. These are a plain (non-enum) nested table, so they can be
+# overridden with TPROXY__DOWNSTREAM_DIFFICULTY_CONFIG__<FIELD>.
 [downstream_difficulty_config]
 # hashes/s of the weakest miner that will be connecting (e.g.: 10 Th/s = 10_000_000_000_000.0)
-min_individual_miner_hashrate= ${TPROXY_MIN_INDIVIDUAL_MINER_HASHRATE}
+min_individual_miner_hashrate = 10_000_000_000_000.0
 # target number of shares per minute the miner should be sending
-shares_per_minute = ${TPROXY_SHARES_PER_MINUTE}
+shares_per_minute = 6.0
 # disable variable difficulty adjustment when using with JDC (JDC handles vardiff)
-enable_vardiff = ${TPROXY_ENABLE_VARDIFF}
+enable_vardiff = true
 # Interval in seconds for sending keepalive jobs to prevent miner timeout during low upstream activity (set to 0 to disable)
 job_keepalive_interval_secs = 60
 
-
+# Upstream (JDC) connection. Points at the `jdc` service in docker-compose.yml.
 [[upstreams]]
-address = "${TPROXY_UPSTREAM_ADDRESS}"
-port = ${TPROXY_UPSTREAM_PORT}
-authority_pubkey = "${TPROXY_UPSTREAM_AUTHORITY_PUBKEY}"
-user_identity = "${TPROXY_USER_IDENTITY}"
+address = "jdc"
+port = 34265
+authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+user_identity = "your_username_here"

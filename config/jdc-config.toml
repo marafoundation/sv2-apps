@@ -1,4 +1,13 @@
 # SRI JDC config
+#
+# This is the default configuration baked into the JDC Docker image. Any value
+# below can be overridden at runtime with an environment variable named
+# `JDC__<FIELD>` (double underscore separates nesting). Environment variables
+# take precedence over this file.
+#
+# NOTE: the `[[upstreams]]` list and the `[template_provider_type.*]` block hold
+# structured values that cannot be expressed as environment variables, so they
+# are configured here directly.
 listening_address = "0.0.0.0:34265"
 
 # Version support
@@ -10,19 +19,20 @@ authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
 authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
 cert_validity_sec = 3600
 
-# How many shares we expect to receive in a minute (determines difficulty targets)
-shares_per_minute = ${JDC_SHARES_PER_MINUTE}
+# How many shares we expect to receive in a minute (determines difficulty targets).
+# Override with JDC__SHARES_PER_MINUTE.
+shares_per_minute = 6.0
 
-# How many shares do we want to acknowledge in a batch
-share_batch_size = ${JDC_SHARE_BATCH_SIZE}
+# How many shares do we want to acknowledge in a batch. Override with JDC__SHARE_BATCH_SIZE.
+share_batch_size = 10
 
 # JDC supports two modes:
 # "FULLTEMPLATE"  - full template mining
 # "COINBASEONLY" - coinbase-only mining
 mode = "FULLTEMPLATE"
 
-# string to be added into the Coinbase scriptSig
-jdc_signature = "${JDC_SIGNATURE}"
+# string to be added into the Coinbase scriptSig. Override with JDC__JDC_SIGNATURE.
+jdc_signature = "Sv2MinerSignature"
 
 # Solo Mining config
 # Coinbase output used to build the coinbase tx in case of Solo Mining (as last-resort solution of the pools fallback system)
@@ -31,7 +41,8 @@ jdc_signature = "${JDC_SIGNATURE}"
 #     https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki#appendix-b-index-of-script-expressions
 # Although the `musig` descriptor is not yet supported and the legacy `combo` descriptor never
 # will be. If you have an address, embed it in a descriptor like `addr(<address here>)`.
-coinbase_reward_script = "${JDC_COINBASE_REWARD_SCRIPT}"
+# Override with JDC__COINBASE_REWARD_SCRIPT.
+coinbase_reward_script = "addr(tb1qr8xjkrx46yfsch7q2ts2g007haufq48n9pe6qc)"
 
 # Enable this option to set a predefined log file path.
 # When enabled, logs will always be written to this file.
@@ -49,18 +60,21 @@ supported_extensions = [
 monitoring_address = "0.0.0.0:9091"
 monitoring_cache_refresh_secs = 15
 
-# List of upstreams (JDS) used as backup endpoints
-# In case of shares refused by the JDS, the fallback system will propose the same job to the next upstream in this list
+# List of upstreams (Pool and JDS) used as backup endpoints.
+# In case of shares refused by the Pool or JDS, the fallback system will propose
+# the same job to the next upstream in this list. The addresses below point at
+# the `pool` service defined in docker-compose.yml.
 [[upstreams]]
-authority_pubkey = "${JDC_UPSTREAM_AUTHORITY_PUBKEY}"
-pool_address = "${JDC_POOL_ADDRESS}"
-pool_port = "${JDC_POOL_PORT}"
-jds_address = "${JDC_UPSTREAM_JDS_ADDRESS}"
-jds_port = "${JDC_UPSTREAM_JDS_PORT}"
-user_identity = "${JDC_USER_IDENTITY}"
+authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+pool_address = "pool"
+pool_port = 3333
+jds_address = "pool"
+jds_port = 3334
+user_identity = "your_username_here"
 
 # Bitcoin Core IPC config
+# Supported networks: mainnet, testnet4, signet, regtest
 [template_provider_type.BitcoinCoreIpc]
 network = "mainnet"
-fee_threshold = ${JDC_FEE_THRESHOLD}
-min_interval = ${JDC_MIN_INTERVAL}
+fee_threshold = 100
+min_interval = 5
