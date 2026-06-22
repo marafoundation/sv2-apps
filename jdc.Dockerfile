@@ -24,13 +24,11 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # ── Runtime ───────────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gettext-base && \
-    rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 COPY --from=builder /app/jd_client_sv2 /app/jd_client_sv2
-COPY config/jdc-config.toml.template /app/jdc-config.toml.template
+# Baked default config. Values can be overridden at runtime with JDC__* env vars
+# (the binary layers environment variables on top of this file).
+COPY config/jdc-config.toml /app/jdc-config.toml
 
-ENTRYPOINT ["/bin/sh", "-c", "envsubst < /app/jdc-config.toml.template > /app/jdc-config.toml && exec /app/jd_client_sv2"]
+ENTRYPOINT ["/app/jd_client_sv2"]
