@@ -25,7 +25,7 @@ impl ServerMonitoring for ChannelManager {
                     let target = *aggregated_extended_channel.get_target();
                     let extranonce_prefix =
                         aggregated_extended_channel.get_extranonce_prefix().to_vec();
-                    let user_identity = aggregated_extended_channel.get_user_identity().clone();
+                    let user_identity = aggregated_extended_channel.get_user_identity().to_string();
                     let full_extranonce_size =
                         aggregated_extended_channel.get_full_extranonce_size();
                     let rollable_extranonce_size =
@@ -33,7 +33,11 @@ impl ServerMonitoring for ChannelManager {
                     let version_rolling = aggregated_extended_channel.is_version_rolling();
                     let nominal_hashrate = aggregated_extended_channel.get_nominal_hashrate();
                     let share_accounting = aggregated_extended_channel.get_share_accounting();
-                    let shares_rejected_by_reason = share_accounting.get_rejected_shares().clone();
+                    let shares_rejected_by_reason: std::collections::HashMap<String, u32> =
+                        share_accounting
+                            .get_rejected_shares()
+                            .map(|(reason, count)| (reason.to_string(), count))
+                            .collect();
                     let shares_rejected = shares_rejected_by_reason.values().copied().sum();
 
                     extended_channels.push(ServerExtendedChannelInfo {
@@ -67,12 +71,16 @@ impl ServerMonitoring for ChannelManager {
                     let extranonce_prefix = extended_channel.get_extranonce_prefix();
                     let user_identity = extended_channel.get_user_identity();
                     let share_accounting = extended_channel.get_share_accounting();
-                    let shares_rejected_by_reason = share_accounting.get_rejected_shares().clone();
+                    let shares_rejected_by_reason: std::collections::HashMap<String, u32> =
+                        share_accounting
+                            .get_rejected_shares()
+                            .map(|(reason, count)| (reason.to_string(), count))
+                            .collect();
                     let shares_rejected = shares_rejected_by_reason.values().copied().sum();
 
                     extended_channels.push(ServerExtendedChannelInfo {
                         channel_id,
-                        user_identity: user_identity.clone(),
+                        user_identity: user_identity.to_string(),
                         nominal_hashrate: if report_hashrate {
                             Some(extended_channel.get_nominal_hashrate())
                         } else {
