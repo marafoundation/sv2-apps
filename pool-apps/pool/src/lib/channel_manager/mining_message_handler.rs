@@ -25,39 +25,6 @@ use tracing::{error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 
-/// Smallest declared `nominal_hash_rate` (H/s) we will trust enough to seed the
-/// vardiff cold-start belief. Below this we treat the declaration as absent or
-/// a placeholder (some clients declare a sentinel like `1.0`) and fall back to
-/// a cold start, which is always safe — it just costs the ~65-min ramp.
-const MIN_SEEDABLE_NOMINAL_HASHRATE: f32 = 1_000.0;
-
-/// One tick's worth of prior weight for the cold-start seed: the seeded belief
-/// is overwritten by real shares within ~τ, so the seed is a prior, not a
-/// commitment (see `EwmaEstimator::new_seeded`).
-const SEED_PRIOR_TICKS: u32 = 1;
-
-/// Builds a vardiff state for a freshly opened channel, SEEDED from the
-/// miner's declared `nominal_hash_rate` when that declaration is plausible.
-///
-/// The channel's open-time difficulty is already set from `nominal_hash_rate`
-/// (`D = nominal / shares_per_minute`); seeding the estimator's rate to
-/// `shares_per_minute` therefore reconstructs a belief ≈ the declared nominal
-/// from the first cycle, collapsing the cold-start ramp. The seed inherits the
-/// open target's trust decision (and the miner's own `max_target` clamp) — it
-/// does not introduce a new one. Implausible declarations fall back to a
-/// (safe) cold start.
-fn build_vardiff(nominal_hash_rate: f32, shares_per_minute: f32) -> Result<VardiffState, PoolError<error::ChannelManager>> {
-    let seeded = nominal_hash_rate.is_finite()
-        && nominal_hash_rate >= MIN_SEEDABLE_NOMINAL_HASHRATE
-        && shares_per_minute.is_finite()
-        && shares_per_minute > 0.0;
-    if seeded {
-        VardiffState::new_seeded(shares_per_minute, SEED_PRIOR_TICKS).map_err(PoolError::shutdown)
-    } else {
-        VardiffState::new().map_err(PoolError::shutdown)
-    }
-}
-
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo, CLIENT_SEARCH_SPACE_BYTES},
     error::{self, PoolError, PoolErrorKind},
@@ -277,7 +244,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         PoolError::shutdown(e)
                     })?;
                 }
-                let vardiff = build_vardiff(nominal_hash_rate, self.shares_per_minute)?;
+                let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
                 channel_manager_data.vardiff.insert((downstream_id, channel_id).into(), vardiff);
 
                 Ok(messages)
@@ -549,7 +516,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         downstream_data
                             .extended_channels
                             .insert(channel_id, extended_channel);
-                        let vardiff = build_vardiff(nominal_hash_rate, self.shares_per_minute)?;
+                        let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
                         channel_manager_data
                             .vardiff
                             .insert((downstream_id, channel_id).into(), vardiff);
