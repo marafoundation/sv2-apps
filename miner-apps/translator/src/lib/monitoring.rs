@@ -146,6 +146,8 @@ mod tests {
             1.0,
             true,
             4,
+            // stratum past-jobs cap: `None` = library default (MAX_PAST_JOBS).
+            None,
         )
     }
 

@@ -948,6 +948,9 @@ impl ChannelManager {
                     hashrate,
                     true,
                     min_extranonce_size as u16,
+                    // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+                    // parameter. `None` selects the library default (MAX_PAST_JOBS).
+                    None,
                 );
                 self.extended_channels
                     .insert(next_channel_id, new_downstream_extended_channel);
@@ -1130,6 +1133,8 @@ mod tests {
                 1.0,
                 true,
                 8,
+                // stratum past-jobs cap: `None` = library default (MAX_PAST_JOBS).
+                None,
             ),
         );
         manager
@@ -1344,6 +1349,8 @@ mod tests {
                 1.0,
                 true,
                 6,
+                // stratum past-jobs cap: `None` = library default (MAX_PAST_JOBS).
+                None,
             ),
         );
 

@@ -238,6 +238,11 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     self.share_batch_size,
                     self.shares_per_minute,
                     self.pool_tag_string.clone(),
+                    // Unrelated to the vardiff change this branch is pinned for: stratum's
+                    // past-jobs cap added this parameter and sv2-apps has not caught up.
+                    // `None` selects the library default of 16, documented there as covering
+                    // one job per second.
+                    None,
                 ) {
                     Ok(channel) => channel,
                     Err(e) => match e {
@@ -477,6 +482,8 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     self.share_batch_size,
                     self.shares_per_minute,
                     self.pool_tag_string.clone(),
+                    // See the StandardChannel call site above: `None` = the library default of 16.
+                    None,
                 ) {
                     Ok(channel) => channel,
                     Err(e) => match e {

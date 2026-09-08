@@ -187,6 +187,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             hashrate,
             true,
             msg.extranonce_size,
+            // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+            // parameter. `None` selects the library default (MAX_PAST_JOBS).
+            None,
         );
 
         if let Some(prevhash) = self.last_new_prev_hash.get().map_err(JDCError::shutdown)? {

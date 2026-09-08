@@ -179,6 +179,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     nominal_hashrate,
                     version_rolling,
                     m.extranonce_size,
+                    // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+                    // parameter. `None` selects the library default (MAX_PAST_JOBS).
+                    None,
                 );
                 self.extended_channels
                     .insert(AGGREGATED_CHANNEL_ID, upstream_channel);
@@ -197,6 +200,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     nominal_hashrate,
                     true,
                     downstream_extranonce_len as u16,
+                    // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+                    // parameter. `None` selects the library default (MAX_PAST_JOBS).
+                    None,
                 );
                 self.extended_channels
                     .insert(1, new_downstream_extended_channel);
@@ -329,6 +335,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     nominal_hashrate,
                     version_rolling,
                     downstream_extranonce_len as u16,
+                    // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+                    // parameter. `None` selects the library default (MAX_PAST_JOBS).
+                    None,
                 );
                 self.extended_channels
                     .insert(m.channel_id, new_downstream_extended_channel);

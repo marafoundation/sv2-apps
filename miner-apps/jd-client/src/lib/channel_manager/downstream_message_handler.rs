@@ -323,6 +323,9 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 self.shares_per_minute,
                 pool_tag_string,
                 self.miner_tag_string.clone(),
+                // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+                // parameter. `None` selects the library default (MAX_PAST_JOBS).
+                None,
             ) {
                 Ok(standard_channel) => Some(standard_channel),
                 Err(e) => {
@@ -564,6 +567,9 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         self.shares_per_minute,
                         pool_tag_string,
                         self.miner_tag_string.clone(),
+                        // Unrelated to this branch's vardiff pin: stratum's past-jobs cap added this
+                        // parameter. `None` selects the library default (MAX_PAST_JOBS).
+                        None,
                     ) {
                         Ok(channel) => Some(channel),
                         Err(e) => {
