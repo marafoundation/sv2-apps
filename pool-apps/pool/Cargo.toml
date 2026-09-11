@@ -18,7 +18,13 @@ name = "pool_sv2"
 path = "src/lib/mod.rs"
 
 [dependencies]
-stratum-apps = { version = "0.8.0", path = "../../stratum-apps", features = ["pool"] }
+# `vardiff-tunable` is the DIAGNOSTIC override seam, and it is enabled here and nowhere else.
+# Deliberately not on the translator: it runs its own vardiff for SV1 downstreams, and a
+# `VARDIFF_*` variable set on a compose file reaches every container in it. The translator lives
+# in a separate workspace, so cargo does not unify the feature into it -- it keeps its compiled
+# defaults and cannot be retuned by an environment meant for the pool. That is the safe direction
+# and it is why the feature is per-binary rather than per-repo.
+stratum-apps = { version = "0.8.0", path = "../../stratum-apps", features = ["pool", "vardiff-tunable"] }
 async-channel = "1.5.1"
 serde = { version = "1.0.89", features = ["derive", "alloc"], default-features = false }
 tokio = { version = "1.44.1", features = ["full"] }
