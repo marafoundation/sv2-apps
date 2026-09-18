@@ -48,6 +48,11 @@ services:
       dockerfile: tproxy.Dockerfile
     environment:
       - TPROXY_USER_IDENTITY=your_username_here
+      # Verify upstream coinbase outputs against the payout encoded in TPROXY_USER_IDENTITY.
+      # false for standard pool mining (including address-as-username pools); true for
+      # solo/donation identities — sri/solo/<address>/<worker>,
+      # sri/donate/<pct>/<address>/<worker>, or legacy <address>[.worker].
+      - TPROXY_VERIFY_PAYOUT=false
       - TPROXY_AGGREGATE_CHANNELS=false
       - TPROXY_MIN_INDIVIDUAL_MINER_HASHRATE=10_000_000_000_000.0
       - TPROXY_SHARES_PER_MINUTE=6.0

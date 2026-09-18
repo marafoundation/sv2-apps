@@ -5,7 +5,10 @@ on:
     branches:
       - mara
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      # Only this fork's release tags. Plain upstream tags (v0.8.0) are mirrored
+      # into this repo for reference and must NOT trigger a build: the MARA
+      # Dockerfiles do not exist at those commits.
+      - 'v[0-9]+.[0-9]+.[0-9]+-mara.[0-9]+'
 
   workflow_dispatch:
 

@@ -37,7 +37,7 @@ use stratum_apps::{
         },
         template_distribution_sv2::SubmitSolutionOwned,
     },
-    utils::types::Sv2Frame,
+    utils::types::OutboundFrame,
 };
 use tracing::{debug, error, info, warn};
 
@@ -143,7 +143,7 @@ impl RouteMessageTo {
                 }
             }
             RouteMessageTo::Upstream(message) => {
-                let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(message).try_into()?;
+                let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(message))?;
                 channel_manager_io.upstream_sender.send(sv2_frame).await?;
             }
             RouteMessageTo::JobDeclarator(message) => {
@@ -323,12 +323,14 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 self.shares_per_minute,
                 pool_tag_string,
                 self.miner_tag_string.clone(),
+                self.max_past_jobs,
             ) {
                 Ok(standard_channel) => Some(standard_channel),
                 Err(e) => {
                     error!(?e, "Failed to create standard channel");
                     match e {
-                        StandardChannelError::OpenChannelInvalidNominalHashrate(code) => {
+                        StandardChannelError::OpenChannelInvalidNominalHashrate(code)
+                        | StandardChannelError::OpenChannelInvalidMaxTarget(code) => {
                             messages.push((downstream_id, build_error(code)).into());
                             None
                         }
@@ -564,12 +566,14 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         self.shares_per_minute,
                         pool_tag_string,
                         self.miner_tag_string.clone(),
+                        self.max_past_jobs,
                     ) {
                         Ok(channel) => Some(channel),
                         Err(e) => {
                             error!(?e, "Failed to create ExtendedChannel");
                             match e {
-                                ExtendedChannelError::OpenChannelInvalidNominalHashrate(code) => {
+                                ExtendedChannelError::OpenChannelInvalidNominalHashrate(code)
+                                | ExtendedChannelError::OpenChannelInvalidMaxTarget(code) => {
                                     messages.push((downstream_id, build_error(code)).into());
                                     None
                                 }
@@ -757,9 +761,8 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         if let Err(e) = update_channel {
                             error!(channel_id, ?e, "StandardChannel update failed");
                             let err_code = match e {
-                                StandardChannelError::UpdateChannelInvalidNominalHashrate(code) => {
-                                    code
-                                }
+                                StandardChannelError::UpdateChannelInvalidNominalHashrate(code)
+                                | StandardChannelError::UpdateChannelInvalidMaxTarget(code) => code,
                                 _ => "internal-error",
                             };
                             if err_code != "internal-error" {
@@ -793,9 +796,8 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         if let Err(e) = update_channel {
                             error!(channel_id, ?e, "ExtendedChannel update failed");
                             let err_code = match e {
-                                ExtendedChannelError::UpdateChannelInvalidNominalHashrate(code) => {
-                                    code
-                                }
+                                ExtendedChannelError::UpdateChannelInvalidNominalHashrate(code)
+                                | ExtendedChannelError::UpdateChannelInvalidMaxTarget(code) => code,
                                 _ => "internal-error",
                             };
                             if err_code != "internal-error" {

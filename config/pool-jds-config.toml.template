@@ -44,8 +44,15 @@ required_extensions = [
 monitoring_address = "0.0.0.0:9090"
 monitoring_cache_refresh_secs = 15
 
+# Past jobs retained per channel for late-share validation (optional). Unset or 0 uses the
+# channels_sv2 default of 16; set `ceil(16s / your job interval)` to reclaim ~4.5 kB per job.
+# max_past_jobs = 3
+
 # Bitcoin Core IPC config
 [template_provider_type.BitcoinCoreIpc]
+# Bitcoin Core IPC schema major version — must match the node this talks to.
+# Keep in step with BITCOIND_VERSION in bitcoind.Dockerfile. Accepts 30 or 31.
+version = 31
 network = "mainnet"
 fee_threshold = ${POOL_FEE_THRESHOLD}
 min_interval = ${POOL_MIN_INTERVAL}

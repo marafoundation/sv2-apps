@@ -37,7 +37,8 @@ pub struct TranslatorConfig {
     /// The size of the extranonce2 field for downstream mining connections.
     pub downstream_extranonce2_size: u16,
     /// Whether to verify upstream coinbase outputs against a payout address encoded in each
-    /// upstream `user_identity`.
+    /// upstream `user_identity`. Defaults to `false` for standard pool-mining configurations,
+    /// which trust the upstream's payout policy.
     #[serde(default)]
     pub verify_payout: bool,
     /// Configuration settings for managing difficulty on the downstream connection.
@@ -48,6 +49,12 @@ pub struct TranslatorConfig {
     /// Protocol extensions that the translator supports (will request if supported by server).
     #[serde(default)]
     pub supported_extensions: Vec<u16>,
+    /// Past jobs retained per channel for late-share validation.
+    ///
+    /// `None` and `Some(0)` both select the `channels_sv2` default. It is a retention window —
+    /// `cap / job rate` — and here the upstream sets the rate; see `channels_sv2` for sizing.
+    #[serde(default)]
+    pub max_past_jobs: Option<usize>,
     /// Protocol extensions that the translator requires (server must support these).
     /// If the upstream server doesn't support these, the translator will fail over to another
     /// upstream.
@@ -124,6 +131,9 @@ impl TranslatorConfig {
     ) -> Self {
         Self {
             upstreams,
+            // Programmatic construction takes the library default; the file-based path
+            // sets it via serde, and callers can assign the field directly.
+            max_past_jobs: None,
             downstream_address,
             downstream_port,
             max_supported_version,
@@ -202,10 +212,13 @@ pub struct DownstreamDifficultyConfig {
     /// Whether to enable variable difficulty adjustment mechanism.
     /// If false, difficulty will be managed by upstream (useful with JDC).
     pub enable_vardiff: bool,
-    /// Interval in seconds for sending keepalive jobs to downstream miners.
+    /// Minimum idle interval in seconds before sending a miner a keepalive job.
     /// The translator will send periodic mining.notify messages with updated time
     /// to prevent SV1 miners from timing out when the upstream doesn't send new jobs
     /// frequently enough (e.g., due to low Bitcoin mempool activity).
+    /// Only miners whose individual interval has elapsed receive a keepalive. Aggregated
+    /// keepalive generation advances nTime at most once per interval; other overdue miners
+    /// reuse the latest shared keepalive. Normal upstream jobs are not delayed by this interval.
     /// Set to 0 to disable keepalive jobs.
     pub job_keepalive_interval_secs: u16,
 }
@@ -572,5 +585,43 @@ mod tests {
         assert_eq!(config.upstreams.len(), 2);
         assert_eq!(config.upstreams[0].user_identity, "sri/solo/bc1qprimary");
         assert_eq!(config.upstreams[1].user_identity, "bc1qbackup.worker");
+        assert!(!config.verify_payout);
+    }
+}
+
+#[cfg(test)]
+mod max_past_jobs_tests {
+    /// Every shipped example must document the setting, commented out.
+    ///
+    /// Commented out matters: it keeps the library default in force for existing
+    /// deployments. Absent-means-default is also why `Some(0)` is treated as "no
+    /// opinion" rather than a literal zero — a zero cap would evict the job that just
+    /// retired and reject the most common late share as `invalid-job-id`.
+    ///
+    /// The test walks the directory rather than naming files, and asserts it found
+    /// some: an earlier version named one file, guessed the name wrong, and passed by
+    /// silently doing nothing.
+    #[test]
+    fn every_example_documents_the_cap_commented_out() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config-examples");
+        let mut checked = 0;
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("read config-examples") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "toml") {
+                    let text = std::fs::read_to_string(&path).expect("read example");
+                    assert!(
+                        text.contains("# max_past_jobs"),
+                        "{} does not document max_past_jobs (commented out)",
+                        path.display()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no examples found — the test would be vacuous");
     }
 }

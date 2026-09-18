@@ -132,6 +132,7 @@ mod tests {
             vec![],
             vec![],
             TproxyMode::Aggregated,
+            None,
             true,
         )
     }
@@ -146,7 +147,9 @@ mod tests {
             1.0,
             true,
             4,
+            None,
         )
+        .unwrap()
     }
 
     #[test]

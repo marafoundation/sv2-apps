@@ -24,7 +24,7 @@ use stratum_apps::{
     task_manager::TaskManager,
     utils::{
         protocol_message_type::{MessageType, protocol_message_type},
-        types::{Message, Sv2Frame},
+        types::{InboundFrame, Message, OutboundFrame},
     },
 };
 
@@ -35,22 +35,22 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone)]
 struct UpstreamIo {
     /// Receiver for the SV2 Upstream role
-    upstream_receiver: Receiver<Sv2Frame>,
+    upstream_receiver: Receiver<InboundFrame>,
     /// Sender for the SV2 Upstream role
-    upstream_sender: Sender<Sv2Frame>,
+    upstream_sender: Sender<OutboundFrame>,
     /// Sender for the ChannelManager to send SV2 frames
-    channel_manager_sender: Sender<Sv2Frame>,
+    channel_manager_sender: Sender<InboundFrame>,
     /// Receiver for the ChannelManager to receive SV2 frames
-    channel_manager_receiver: Receiver<Sv2Frame>,
+    channel_manager_receiver: Receiver<OutboundFrame>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl UpstreamIo {
     fn new(
-        upstream_receiver: Receiver<Sv2Frame>,
-        upstream_sender: Sender<Sv2Frame>,
-        channel_manager_sender: Sender<Sv2Frame>,
-        channel_manager_receiver: Receiver<Sv2Frame>,
+        upstream_receiver: Receiver<InboundFrame>,
+        upstream_sender: Sender<OutboundFrame>,
+        channel_manager_sender: Sender<InboundFrame>,
+        channel_manager_receiver: Receiver<OutboundFrame>,
     ) -> Self {
         Self {
             upstream_receiver,
@@ -172,8 +172,8 @@ impl Upstream {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         upstream: &UpstreamEntry,
-        channel_manager_sender: Sender<Sv2Frame>,
-        channel_manager_receiver: Receiver<Sv2Frame>,
+        channel_manager_sender: Sender<InboundFrame>,
+        channel_manager_receiver: Receiver<OutboundFrame>,
         cancellation_token: CancellationToken,
         fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
@@ -191,7 +191,7 @@ impl Upstream {
             ));
         }
 
-        let resolved_addr = resolve_host(&upstream.host, upstream.port)
+        let candidate_addrs = resolve_host(&upstream.host, upstream.port)
             .await
             .map_err(|e| {
                 error!(
@@ -201,11 +201,17 @@ impl Upstream {
                 TproxyError::fallback(TproxyErrorKind::NetworkHelpersError(e.into()))
             })?;
 
-        match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(resolved_addr))
-            .await
-            .map_err(TproxyError::fallback)?
+        // Each resolved address gets an attempt, so a pool that publishes both an IPv6 and an
+        // IPv4 address is still reachable when only one of the two accepts connections.
+        match tokio::time::timeout(
+            TCP_CONNECT_TIMEOUT,
+            TcpStream::connect(&candidate_addrs[..]),
+        )
+        .await
+        .map_err(TproxyError::fallback)?
         {
             Ok(socket) => {
+                let resolved_addr = socket.peer_addr().map_err(TproxyError::fallback)?;
                 info!("Connected to upstream at {}", resolved_addr);
 
                 tokio::select! {
@@ -266,7 +272,7 @@ impl Upstream {
                 }
             }
             Err(e) => {
-                error!("Failed to connect to {}: {e}.", resolved_addr);
+                error!("Failed to connect to any of {:?}: {e}.", candidate_addrs);
                 Err(TproxyError::fallback(e))
             }
         }
@@ -331,13 +337,11 @@ impl Upstream {
         // Build SetupConnection message
         let setup_conn_msg = Self::get_setup_connection_message(2, 2, &self.address, false)
             .map_err(TproxyError::shutdown)?;
-        let sv2_frame: Sv2Frame =
-            Message::Common(setup_conn_msg.into())
-                .try_into()
-                .map_err(|error| {
-                    error!("Failed to serialize SetupConnection message: {error:?}");
-                    TproxyError::shutdown(error)
-                })?;
+        let sv2_frame = OutboundFrame::from_message(Message::Common(setup_conn_msg.into()))
+            .map_err(|error| {
+                error!("Failed to serialize SetupConnection message: {error:?}");
+                TproxyError::shutdown(error)
+            })?;
 
         // Send SetupConnection message to upstream
         self.upstream_io
@@ -349,7 +353,7 @@ impl Upstream {
                 TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
             })?;
 
-        let mut incoming: Sv2Frame = match self.upstream_io.upstream_receiver.recv().await {
+        let mut incoming: InboundFrame = match self.upstream_io.upstream_receiver.recv().await {
             Ok(frame) => {
                 debug!("Received handshake response from upstream.");
                 frame
@@ -360,10 +364,7 @@ impl Upstream {
             }
         };
 
-        let header = incoming.get_header().ok_or_else(|| {
-            error!("Expected handshake frame but no header found.");
-            TproxyError::fallback(TproxyErrorKind::UnexpectedMessage(0, 0))
-        })?;
+        let header = incoming.header();
 
         if header.ext_type() != 0
             || !matches!(
@@ -396,9 +397,9 @@ impl Upstream {
                 require_extensions
             );
 
-            let sv2_frame: Sv2Frame = AnyMessageOwned::Extensions(require_extensions.into())
-                .try_into()
-                .map_err(TproxyError::shutdown)?;
+            let sv2_frame =
+                OutboundFrame::from_message(AnyMessageOwned::Extensions(require_extensions.into()))
+                    .map_err(TproxyError::shutdown)?;
 
             self.upstream_io
                 .upstream_sender
@@ -422,11 +423,7 @@ impl Upstream {
             .map_err(TproxyError::fallback)?;
 
         debug!("Upstream: received frame.");
-        let Some(header) = sv2_frame.get_header() else {
-            return Err(TproxyError::fallback(TproxyErrorKind::UnexpectedMessage(
-                0, 0,
-            )));
-        };
+        let header = sv2_frame.header();
 
         match protocol_message_type(header.ext_type(), header.msg_type()) {
             MessageType::Common => {

@@ -63,3 +63,12 @@ jobs:
       - name: Run semver checks for miner applications workspace
         working-directory: miner-apps
         run: cargo semver-checks --workspace --all-features
+
+  # Upstream's `version-bump-check` job is deliberately absent here. It asserts
+  # that every crate a PR touches carries a version above the latest published on
+  # crates.io — a gate that protects upstream's publishing flow. This fork
+  # publishes container images, not crates, and every upstream sync merges a
+  # release tag, which by definition lands each crate at exactly its published
+  # version. The job would therefore fail on every sync PR while protecting
+  # nothing. scripts/check-version-bumps.sh is left in place, unused, so upstream
+  # keeps ownership of the file and future merges don't conflict on it.
