@@ -64,19 +64,11 @@ jobs:
         working-directory: miner-apps
         run: cargo semver-checks --workspace --all-features
 
-  version-bump-check:
-    # Only pull requests have a base branch to diff against; the workflow
-    # also runs on pushes to main, where this check has nothing to compare.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          # Full history, so the script can diff the PR against its
-          # merge-base with the base branch.
-          fetch-depth: 0
-
-      - name: Check that modified crates carry a version bump
-        run: ./scripts/check-version-bumps.sh origin/${{ github.base_ref }}
+  # Upstream's `version-bump-check` job is deliberately absent here. It asserts
+  # that every crate a PR touches carries a version above the latest published on
+  # crates.io — a gate that protects upstream's publishing flow. This fork
+  # publishes container images, not crates, and every upstream sync merges a
+  # release tag, which by definition lands each crate at exactly its published
+  # version. The job would therefore fail on every sync PR while protecting
+  # nothing. scripts/check-version-bumps.sh is left in place, unused, so upstream
+  # keeps ownership of the file and future merges don't conflict on it.
