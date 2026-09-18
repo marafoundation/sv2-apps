@@ -24,7 +24,7 @@ use stratum_apps::{
         mining_sv2::*,
         parsers_sv2::{AnyMessageOwned, MiningOwned, Tlv},
     },
-    utils::types::Sv2Frame,
+    utils::types::OutboundFrame,
 };
 use tracing::{debug, error, info, warn};
 
@@ -129,8 +129,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             let close_channel =
                 create_close_channel_msg(msg.channel_id, "downstream not available");
             let close_channel = MiningOwned::CloseChannel(close_channel);
-            let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(close_channel)
-                .try_into()
+            let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(close_channel))
                 .map_err(JDCError::shutdown)?;
             self.channel_manager_io
                 .upstream_sender
@@ -162,8 +161,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 let close_channel =
                     create_close_channel_msg(msg.channel_id, "downstream not available");
                 let close_channel = MiningOwned::CloseChannel(close_channel);
-                let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(close_channel)
-                    .try_into()
+                let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(close_channel))
                     .map_err(JDCError::shutdown)?;
                 self.channel_manager_io
                     .upstream_sender
@@ -179,7 +177,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             JobFactory::new(true, pool_tag_string, Some(self.miner_tag_string.clone()));
         let extranonce_prefix = ExtranoncePrefix::from_wire(msg.extranonce_prefix.to_owned_bytes())
             .expect("prefix length already validated by allocator");
-        let mut extended_channel = ExtendedChannel::new(
+        let mut extended_channel = match ExtendedChannel::new(
             msg.channel_id,
             self.user_identity().to_string(),
             extranonce_prefix,
@@ -187,7 +185,16 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             hashrate,
             true,
             msg.extranonce_size,
-        );
+            self.max_past_jobs,
+        ) {
+            Ok(channel) => channel,
+            Err(e) => {
+                // an upstream that hands out a target no share can meet is misbehaving, so
+                // fall back
+                warn!("Upstream OpenExtendedMiningChannelSuccess rejected: {e:?}");
+                return Err(JDCError::fallback(e));
+            }
+        };
 
         if let Some(prevhash) = self.last_new_prev_hash.get().map_err(JDCError::shutdown)? {
             _ = extended_channel.on_chain_tip_update(prevhash.clone().into());
@@ -292,9 +299,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             if self.mode.is_coinbase_only() {
                 if let Some(custom_job) = set_custom_job {
                     let set_custom_job = MiningOwned::SetCustomMiningJob(custom_job);
-                    let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(set_custom_job)
-                        .try_into()
-                        .map_err(JDCError::shutdown)?;
+                    let sv2_frame =
+                        OutboundFrame::from_message(AnyMessageOwned::Mining(set_custom_job))
+                            .map_err(JDCError::shutdown)?;
                     self.channel_manager_io
                         .upstream_sender
                         .send(sv2_frame)
@@ -755,14 +762,22 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
         self.upstream_channel
-            .with(|upstream_channel| {
+            .with(|upstream_channel| -> Result<(), Self::Error> {
                 if let Some(upstream) = upstream_channel.as_mut() {
-                    upstream.set_target(Target::from_le_bytes(
-                        msg.maximum_target.clone().as_ref().try_into().unwrap(),
-                    ));
+                    upstream
+                        .set_target(Target::from_le_bytes(
+                            msg.maximum_target.clone().as_ref().try_into().unwrap(),
+                        ))
+                        .map_err(|e| {
+                            // an upstream that hands out a target no share can meet is
+                            // misbehaving, so fall back
+                            warn!("Upstream SetTarget rejected: {e:?}");
+                            JDCError::fallback(e)
+                        })?;
                 }
+                Ok(())
             })
-            .map_err(JDCError::shutdown)?;
+            .map_err(JDCError::shutdown)??;
         Ok(())
     }
 

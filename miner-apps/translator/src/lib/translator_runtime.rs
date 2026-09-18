@@ -11,7 +11,7 @@ use stratum_apps::{
     payout::PayoutMode,
     stratum_core::parsers_sv2::MiningOwned,
     task_manager::TaskManager,
-    utils::types::{GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, Sv2Frame},
+    utils::types::{GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, InboundFrame, OutboundFrame},
 };
 use tracing::{debug, error, info, warn};
 
@@ -24,10 +24,10 @@ use crate::{
 };
 
 struct Io {
-    channel_manager_to_upstream_sender: Sender<Sv2Frame>,
-    channel_manager_to_upstream_receiver: Receiver<Sv2Frame>,
-    upstream_to_channel_manager_sender: Sender<Sv2Frame>,
-    upstream_to_channel_manager_receiver: Receiver<Sv2Frame>,
+    channel_manager_to_upstream_sender: Sender<OutboundFrame>,
+    channel_manager_to_upstream_receiver: Receiver<OutboundFrame>,
+    upstream_to_channel_manager_sender: Sender<InboundFrame>,
+    upstream_to_channel_manager_receiver: Receiver<InboundFrame>,
     channel_manager_to_sv1_server_sender: Sender<MiningOwned>,
     channel_manager_to_sv1_server_receiver: Receiver<MiningOwned>,
     sv1_server_to_channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
@@ -256,6 +256,7 @@ impl TranslatorRuntime<IoReady> {
             self.translator.config.supported_extensions.clone(),
             self.translator.config.required_extensions.clone(),
             self.tproxy_mode,
+            self.translator.config.max_past_jobs,
             #[cfg(feature = "monitoring")]
             self.translator
                 .config

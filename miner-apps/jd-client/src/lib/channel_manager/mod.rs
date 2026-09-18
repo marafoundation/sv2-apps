@@ -31,7 +31,6 @@ use stratum_apps::{
             outputs::deserialize_outputs,
             server::{group::GroupChannel, jobs::factory::JobFactory, standard::StandardChannel},
         },
-        framing_sv2,
         handlers_sv2::{
             HandleExtensionsFromServerOwnedAsync, HandleJobDeclarationMessagesFromServerOwnedAsync,
             HandleMiningMessagesFromClientOwnedAsync, HandleMiningMessagesFromServerOwnedAsync,
@@ -49,8 +48,8 @@ use stratum_apps::{
     utils::{
         protocol_message_type::{MessageType, protocol_message_type},
         types::{
-            ChannelId, DownstreamId, RequestId, SharesBatchSize, SharesPerMinute, Sv2Frame,
-            TemplateId, UpstreamJobId, VardiffKey,
+            ChannelId, DownstreamId, InboundFrame, OutboundFrame, RequestId, SharesBatchSize,
+            SharesPerMinute, TemplateId, UpstreamJobId, VardiffKey,
         },
     },
 };
@@ -163,8 +162,8 @@ pub struct DeclaredJob {
 
 #[derive(Clone)]
 pub struct ChannelManagerIo {
-    upstream_sender: Sender<Sv2Frame>,
-    upstream_receiver: Receiver<Sv2Frame>,
+    upstream_sender: Sender<OutboundFrame>,
+    upstream_receiver: Receiver<InboundFrame>,
     jd_sender: Sender<JobDeclarationOwned>,
     jd_receiver: Receiver<JobDeclarationOwned>,
     tp_sender: Sender<TemplateDistributionOwned>,
@@ -301,6 +300,8 @@ pub struct ChannelManager {
     miner_tag_string: String,
     share_batch_size: SharesBatchSize,
     shares_per_minute: SharesPerMinute,
+    /// Past jobs retained per channel; `None` uses the `channels_sv2` default.
+    max_past_jobs: Option<usize>,
     user_identity: Arc<OnceLock<String>>,
     reserved_downstream_rollable_extranonce_size: u8,
     /// This represent the current state of Upstream channel
@@ -379,8 +380,8 @@ impl ChannelManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: JobDeclaratorClientConfig,
-        upstream_sender: Sender<Sv2Frame>,
-        upstream_receiver: Receiver<Sv2Frame>,
+        upstream_sender: Sender<OutboundFrame>,
+        upstream_receiver: Receiver<InboundFrame>,
         jd_sender: Sender<JobDeclarationOwned>,
         jd_receiver: Receiver<JobDeclarationOwned>,
         tp_sender: Sender<TemplateDistributionOwned>,
@@ -397,6 +398,14 @@ impl ChannelManager {
         let extranonce_allocator =
             ExtranonceAllocator::new(Vec::new(), SOLO_FULL_EXTRANONCE_SIZE, JDC_MAX_CHANNELS)
                 .map_err(JDCError::<error::ChannelManager>::shutdown)?;
+
+        // Record the cap actually in force. When unset it comes from the `channels_sv2`
+        // default, so it appears nowhere in this application's own config and is
+        // otherwise not recoverable from a running instance.
+        match config.max_past_jobs() {
+            Some(n) if n > 0 => info!(max_past_jobs = n, "past-jobs retention cap configured"),
+            _ => info!("past-jobs retention cap: using channels_sv2 default"),
+        }
 
         let channel_manager_io = ChannelManagerIo {
             upstream_sender,
@@ -435,6 +444,7 @@ impl ChannelManager {
             cached_shares: SharedMap::new(),
             share_batch_size: config.share_batch_size(),
             shares_per_minute: config.shares_per_minute(),
+            max_past_jobs: config.max_past_jobs(),
             miner_tag_string: config.jdc_signature().to_string(),
             user_identity: Arc::new(OnceLock::new()),
             reserved_downstream_rollable_extranonce_size: config
@@ -505,6 +515,8 @@ impl ChannelManager {
         let mut group_channel = match GroupChannel::new_for_job_declaration_client(
             channel_id,
             full_extranonce_size,
+            // the extended channels importing the group's jobs are opened with rolling allowed
+            true,
             pool_tag_string.clone(),
             miner_tag_string.clone(),
         ) {
@@ -891,12 +903,7 @@ impl ChannelManager {
             .recv()
             .await
             .map_err(JDCError::fallback)?;
-        let header = if let Some(header) = sv2_frame.get_header() {
-            header
-        } else {
-            error!("SV2 frame missing header");
-            return Err(JDCError::fallback(framing_sv2::Error::MissingHeader));
-        };
+        let header = sv2_frame.header();
         let message_type = header.msg_type();
         let extension_type = header.ext_type();
         let payload = sv2_frame.payload();
@@ -1020,9 +1027,10 @@ impl ChannelManager {
                             upstream_message.min_extranonce_size = upstream_min as u16;
                             let upstream_message =
                                 MiningOwned::OpenExtendedMiningChannel(upstream_message);
-                            let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(upstream_message)
-                                .try_into()
-                                .map_err(JDCError::shutdown)?;
+                            let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(
+                                upstream_message,
+                            ))
+                            .map_err(JDCError::shutdown)?;
                             self.channel_manager_io
                                 .upstream_sender
                                 .send(sv2_frame)
@@ -1089,9 +1097,9 @@ impl ChannelManager {
                             };
 
                             let message = MiningOwned::OpenExtendedMiningChannel(upstream_open);
-                            let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(message)
-                                .try_into()
-                                .map_err(JDCError::shutdown)?;
+                            let sv2_frame =
+                                OutboundFrame::from_message(AnyMessageOwned::Mining(message))
+                                    .map_err(JDCError::shutdown)?;
                             self.channel_manager_io
                                 .upstream_sender
                                 .send(sv2_frame)

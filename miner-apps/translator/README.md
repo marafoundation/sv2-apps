@@ -81,6 +81,27 @@ Make sure the machine running the Translator Proxy has its clock synced with an 
 - `downstream_address`: IP address for SV1 miners to connect to
 - `downstream_port`: Port for SV1 miners to connect to
 
+tProxy uses `sv1_api` to parse the initial `mining.configure`, `mining.subscribe`, or
+`mining.authorize` request before requesting a mining channel. Configure is optional,
+and subscribe and authorize may arrive in either order. Ancillary setup requests may
+follow; shares are accepted only after both subscribe and authorize responses have
+completed.
+
+Prefix updates follow job boundaries. If a change is processed before subscription,
+the subscribe response includes it. Otherwise, tProxy sends `mining.set_extranonce`
+immediately before the first delivered job using that prefix. During setup, it caches
+the transition instead of disconnecting immediately. The miner must announce support
+with `mining.extranonce.subscribe` before that job is delivered; without support,
+tProxy disconnects rather than advertising work with an unknown prefix. There is no
+additional capability-negotiation timeout.
+
+In aggregated mode, new miners can join while old-prefix jobs remain active or pending.
+Their subscribe response uses the active job's prefix, and inherited jobs retain their
+own upstream prefixes and validation targets. Later jobs use the current upstream state.
+As in `channels_sv2`, target changes update queued future jobs but leave active jobs' targets intact.
+All prefix variants preserve the miner's allocated `local_prefix | local_index`; joining
+does not reset the shared allocator, job history, or keepalive timer.
+
 #### **Protocol Configuration**
 - `max_supported_version`/`min_supported_version`: SV2 protocol version support
 - `min_extranonce2_size`: Minimum extranonce2 size (affects mining efficiency)
@@ -95,8 +116,11 @@ Make sure the machine running the Translator Proxy has its clock synced with an 
   address as the username.
 
 #### **Solo/Donation Payout Verification**
-Payout verification is disabled by default. Set `verify_payout = true` for solo mining or
-donation configurations where `user_identity` intentionally encodes an on-chain payout address:
+Payout verification defaults to `false` for compatibility with standard pool mining. When payout
+verification is disabled, tProxy trusts the upstream server's coinbase payout policy and does not
+verify that jobs pay the miner.
+Set `verify_payout = true` for solo mining, or donation configurations where `user_identity`
+intentionally encodes an on-chain payout address:
 
 - `sri/solo/<payout_address>/<worker>`: tProxy verifies every upstream extended job pays 100% of spendable coinbase outputs to `<payout_address>`
 - `<payout_address>[.worker]`: legacy solo mode, verified by checking that at least 90% of spendable coinbase outputs go to `<payout_address>`
@@ -111,6 +135,14 @@ If verification fails, tProxy triggers upstream fallback instead of forwarding t
 - `enable_vardiff`: Enable/disable variable difficulty adjustment (set to false when using with JDC)
   - When `true`: Translator manages difficulty adjustments based on share submission rates
   - When `false`: Upstream manages difficulty, translator forwards SetTarget messages to miners
+
+- `job_keepalive_interval_secs`: Idle interval before a miner receives a keepalive
+  `mining.notify`; `0` disables keepalives. Only miners whose own interval has elapsed
+  receive one. In aggregated mode, tProxy generates at most one new shared keepalive
+  per interval. A miner becoming due between advances receives the existing
+  shared job. A late joiner also receives the current shared job without resetting
+  shared history or the keepalive schedule. Normal upstream jobs are forwarded
+  without waiting for keepalive deadlines.
 
 #### **Miner Telemetry**
 Translator Proxy can enrich the monitoring API with telemetry from the ASICs connected to its SV1

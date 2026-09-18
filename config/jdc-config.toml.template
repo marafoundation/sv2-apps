@@ -49,18 +49,25 @@ supported_extensions = [
 monitoring_address = "0.0.0.0:9091"
 monitoring_cache_refresh_secs = 15
 
+# Past jobs retained per channel for late-share validation (optional). Unset or 0 uses the
+# channels_sv2 default of 16; set `ceil(16s / your job interval)` to reclaim ~4.5 kB per job.
+# max_past_jobs = 3
+
 # List of upstreams (JDS) used as backup endpoints
 # In case of shares refused by the JDS, the fallback system will propose the same job to the next upstream in this list
 [[upstreams]]
 authority_pubkey = "${JDC_UPSTREAM_AUTHORITY_PUBKEY}"
 pool_address = "${JDC_POOL_ADDRESS}"
-pool_port = "${JDC_POOL_PORT}"
+pool_port = ${JDC_POOL_PORT}
 jds_address = "${JDC_UPSTREAM_JDS_ADDRESS}"
-jds_port = "${JDC_UPSTREAM_JDS_PORT}"
+jds_port = ${JDC_UPSTREAM_JDS_PORT}
 user_identity = "${JDC_USER_IDENTITY}"
 
 # Bitcoin Core IPC config
 [template_provider_type.BitcoinCoreIpc]
+# Bitcoin Core IPC schema major version — must match the node this talks to.
+# Keep in step with BITCOIND_VERSION in bitcoind.Dockerfile. Accepts 30 or 31.
+version = 31
 network = "mainnet"
 fee_threshold = ${JDC_FEE_THRESHOLD}
 min_interval = ${JDC_MIN_INTERVAL}
