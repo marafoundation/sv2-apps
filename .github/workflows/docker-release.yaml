@@ -67,14 +67,20 @@ jobs:
           IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image }}
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            # Version-tag pushes publish under the git ref name (the version
-            # tag), and :latest is moved to follow it.
-            {
-              echo "tags<<EOF"
-              echo "${IMAGE}:${{ github.ref_name }}"
-              echo "${IMAGE}:latest"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
+            # Version-tag pushes publish under the git ref name, and nothing else.
+            #
+            # No :latest. These ECR repositories have tag immutability enabled, so
+            # a tag cannot be repointed once it exists — moving :latest to follow a
+            # release is exactly the operation immutability forbids:
+            #
+            #   The image tag 'latest' already exists in the 'pool' repository and
+            #   cannot be overwritten because the tag is immutable.
+            #
+            # That failed the whole push for pool, jdc and tproxy on
+            # v0.8.0-mara.1 after the images had already built. A mutable
+            # floating tag and an immutable registry cannot both be had; deployments
+            # pin the version tag, which is what immutability buys us.
+            echo "tags=${IMAGE}:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           else
             # Branch pushes and manual dispatch publish under the commit SHA so
             # devs can deploy a specific build without touching :latest.
