@@ -536,7 +536,14 @@ impl Sv1Server {
                                 self.downstreams.insert(downstream_id, downstream.clone());
                                 // Insert vardiff state for this downstream only if vardiff is enabled
                                 if self.config.downstream_difficulty_config.enable_vardiff {
-                                    let vardiff = VardiffState::new().expect("Failed to create vardiffstate");
+                                    // Give the controller the same configured minimum `first_target`
+                                    // is derived from, so the opening difficulty and the controller's
+                                    // absolute floor cannot disagree about how small a miner may be.
+                                    // `VardiffState::new()` substitutes an internal 1.0 H/s default,
+                                    // which is twelve orders of magnitude below anything this config
+                                    // admits.
+                                    let min_hashrate = self.config.downstream_difficulty_config.min_individual_miner_hashrate;
+                                    let vardiff = VardiffState::new_with_min(min_hashrate).expect("Failed to create vardiffstate");
                                     self.vardiff.insert(downstream_id, vardiff);
                                 }
                                 info!("Downstream {} registered successfully (channel will be opened after first message)", downstream_id);
