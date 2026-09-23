@@ -2382,14 +2382,21 @@ mod tests {
         server.pending_target_updates.insert(7, stale_pending);
 
         // Drive vardiff to a deterministic downward adjustment: one share in the
-        // last two minutes against 5 shares/minute expected collapses the hashrate
+        // last four minutes against 5 shares/minute expected collapses the hashrate
         // estimate, so the new (easier) target takes the immediate path.
+        //
+        // Four minutes, not two. At 5 shares/minute the controller is on its sparse
+        // branch, and over a two-minute window the threshold in force is 91.46% --
+        // one share in two minutes is a 90% deviation, which lands *inside* the bar
+        // by 1.46 points, so vardiff correctly returns no update and nothing clears
+        // the pending target. Doubling the window both deepens the deviation and
+        // narrows the bar, so the move is unambiguous rather than marginal.
         let mut vardiff_state = VardiffState::new().unwrap();
         let two_minutes_ago = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
-            - 120;
+            - 240;
         vardiff_state.set_timestamp_of_last_update(two_minutes_ago);
         vardiff_state.set_shares_since_last_update(1);
         server.vardiff.insert(7, vardiff_state);
