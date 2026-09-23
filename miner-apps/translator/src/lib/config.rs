@@ -208,6 +208,29 @@ pub struct DownstreamDifficultyConfig {
     /// frequently enough (e.g., due to low Bitcoin mempool activity).
     /// Set to 0 to disable keepalive jobs.
     pub job_keepalive_interval_secs: u16,
+    /// Difficulty at or above which the SV1 egress rounds **down** to a power of two.
+    ///
+    /// Below this value difficulties are emitted unchanged as fractional JSON numbers; at or above it
+    /// they are rounded down to the largest power of two not exceeding the difficulty. Rounding never
+    /// rounds up, because upstream credits shares against its own unrounded target and a miner told a
+    /// higher difficulty silently discards every share in between.
+    ///
+    /// # Why this is configurable rather than a constant
+    ///
+    /// The library function has always taken it as a parameter
+    /// (`build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding`), and the translator
+    /// hardcoded `1.0` — which rounds *everything*. That makes the power-of-two lattice, and the settled
+    /// error it forces, a property no operator can change without a rebuild. Raising this above the
+    /// operating difficulty emits exact difficulties instead.
+    ///
+    /// Defaults to `1.0`, i.e. round everything, so behaviour is unchanged unless it is set.
+    #[serde(default = "default_min_difficulty_for_pow2_rounding")]
+    pub minimum_difficulty_for_integer_power_of_two_rounding: f64,
+}
+
+/// Round every difficulty, which is the behaviour before this key existed.
+fn default_min_difficulty_for_pow2_rounding() -> f64 {
+    1.0
 }
 
 impl DownstreamDifficultyConfig {
@@ -223,6 +246,10 @@ impl DownstreamDifficultyConfig {
             shares_per_minute,
             enable_vardiff,
             job_keepalive_interval_secs,
+            // Deliberately not a constructor argument: every existing caller wants the previous
+            // behaviour, and an operator changing it does so through the config file.
+            minimum_difficulty_for_integer_power_of_two_rounding:
+                default_min_difficulty_for_pow2_rounding(),
         }
     }
 }

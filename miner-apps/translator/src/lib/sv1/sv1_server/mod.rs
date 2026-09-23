@@ -74,7 +74,10 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
+// The power-of-two rounding threshold moved to `DownstreamDifficultyConfig`
+// (`minimum_difficulty_for_integer_power_of_two_rounding`, default 1.0). It was a compile-time
+// constant here, which made the lattice — and the settled error it forces — unchangeable
+// without a rebuild, even though the library function has always taken it as a parameter.
 
 #[derive(Clone)]
 struct Sv1ServerIo {
@@ -1035,7 +1038,9 @@ impl Sv1Server {
                         let set_difficulty =
                         build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
                             first_target,
-                            SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                            self.config
+                                .downstream_difficulty_config
+                                .minimum_difficulty_for_integer_power_of_two_rounding,
                         )
                         .map_err(TproxyError::shutdown)?;
                         // send the set_difficulty message to the downstream
@@ -1395,7 +1400,9 @@ impl Sv1Server {
                     d.set_pending_target(
                         sv1_advertised_target_from_sv2_target(
                             target,
-                            SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                            self.config
+                                .downstream_difficulty_config
+                                .minimum_difficulty_for_integer_power_of_two_rounding,
                         )
                         .unwrap_or(target),
                         downstream_id,
@@ -1427,7 +1434,9 @@ impl Sv1Server {
             let set_difficulty_msg =
                 match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
                     target,
-                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                    self.config
+                        .downstream_difficulty_config
+                        .minimum_difficulty_for_integer_power_of_two_rounding,
                 ) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -1503,7 +1512,9 @@ impl Sv1Server {
                     d.set_pending_target(
                         sv1_advertised_target_from_sv2_target(
                             target,
-                            SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                            self.config
+                                .downstream_difficulty_config
+                                .minimum_difficulty_for_integer_power_of_two_rounding,
                         )
                         .unwrap_or(target),
                         downstream_id,
@@ -1524,7 +1535,9 @@ impl Sv1Server {
         let set_difficulty_msg =
             match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
                 target,
-                SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                self.config
+                    .downstream_difficulty_config
+                    .minimum_difficulty_for_integer_power_of_two_rounding,
             ) {
                 Ok(msg) => msg,
                 Err(e) => {

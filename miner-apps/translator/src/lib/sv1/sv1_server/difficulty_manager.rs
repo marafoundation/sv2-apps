@@ -3,7 +3,7 @@ use stratum_apps::stratum_core::{mining_sv2::UpdateChannelOwned, parsers_sv2::Mi
 
 use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
-    sv1::{Sv1Server, sv1_server::SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING},
+    sv1::Sv1Server,
 };
 
 use stratum_apps::{
@@ -131,7 +131,9 @@ impl Sv1Server {
                                 data.set_pending_target(
                                     sv1_advertised_target_from_sv2_target(
                                         new_target,
-                                        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                                        self.config
+                        .downstream_difficulty_config
+                        .minimum_difficulty_for_integer_power_of_two_rounding,
                                     )
                                     .unwrap_or(new_target),
                                     downstream.downstream_id,
@@ -229,7 +231,9 @@ impl Sv1Server {
             let set_difficulty_msg =
                 match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
                     target,
-                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                    self.config
+                        .downstream_difficulty_config
+                        .minimum_difficulty_for_integer_power_of_two_rounding,
                 ) {
                     Ok(message) => message,
                     Err(e) => {
@@ -576,7 +580,9 @@ impl Sv1Server {
             let set_difficulty_msg =
                 match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
                     new_target,
-                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                    self.config
+                        .downstream_difficulty_config
+                        .minimum_difficulty_for_integer_power_of_two_rounding,
                 ) {
                     Ok(message) => message,
                     Err(e) => {

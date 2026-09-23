@@ -48,6 +48,10 @@ cidrs = ["192.168.1.0/24"]
 min_individual_miner_hashrate=10_000_000_000_000.0
 # target number of shares per minute the miner should be sending
 shares_per_minute = 6.0
+# Difficulty at or above which the SV1 egress rounds DOWN to a power of two. Below it, exact
+# fractional difficulties are sent. 1.0 rounds everything, which is the historical behaviour and
+# the default. Raise it above your operating difficulty to send exact difficulties instead.
+minimum_difficulty_for_integer_power_of_two_rounding = 1.0
 # enable variable difficulty for per-miner difficulty tuning
 enable_vardiff = true
 
