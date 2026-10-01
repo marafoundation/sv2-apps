@@ -42,6 +42,13 @@ monitoring_cache_refresh_secs = 15
 # channels_sv2 default of 16; set `ceil(16s / your job interval)` to reclaim ~4.5 kB per job.
 # max_past_jobs = 3
 
+# Seconds to drain SV1 miners for on SIGTERM/SIGINT (optional). The listener closes and miners
+# are disconnected gradually across the window while the upstream stays up; 0 drops them all at
+# once. Size your supervisor stop timeout (e.g. Kubernetes terminationGracePeriodSeconds) above it.
+# drain_seconds = 0
+# Send `client.reconnect` to each miner before closing its connection during the drain.
+# drain_send_reconnect = false
+
 # LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
 [miner_telemetry]
 cidrs = ["192.168.1.0/24"]

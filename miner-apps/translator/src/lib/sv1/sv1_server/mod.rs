@@ -245,6 +245,16 @@ pub struct Sv1Server {
     user_identity: Arc<OnceLock<String>>,
 }
 
+/// Accepts on the listener while it is open; pending forever once it has been closed.
+async fn accept(
+    listener: &Option<TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1Server {
     async fn handle_error_action(
@@ -478,6 +488,8 @@ impl Sv1Server {
     ///
     /// # Arguments
     /// * `cancellation_token` - Global application cancellation token
+    /// * `drain_token` - Cancelled to close the listener and drain downstreams (see
+    ///   [`Sv1Server::drain_downstreams`]); the global token is cancelled once drained
     /// * `fallback_coordinator` - Fallback coordinator
     /// * `task_manager` - Manager for spawned async tasks
     ///
@@ -487,6 +499,7 @@ impl Sv1Server {
     pub async fn start(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
+        drain_token: CancellationToken,
         fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
     ) -> TproxyResult<(), error::Sv1Server> {
@@ -511,6 +524,8 @@ impl Sv1Server {
         })?;
 
         info!("Translator Proxy: listening on {}", self.listener_addr);
+        // Dropped when a drain starts, so new connections are refused from then on.
+        let mut listener = Some(listener);
 
         let task_manager_clone = task_manager.clone();
         let vardiff_enabled = self.config.downstream_difficulty_config.enable_vardiff;
@@ -545,7 +560,29 @@ impl Sv1Server {
                         self.cleanup();
                         break;
                     }
-                    result = listener.accept() => {
+                    _ = drain_token.cancelled(), if listener.is_some() => {
+                        listener = None;
+                        let window = Duration::from_secs(self.config.drain_seconds);
+                        info!(
+                            "SV1 Server: drain started, listener closed; disconnecting {} downstreams over {}s",
+                            self.downstreams.len(),
+                            window.as_secs()
+                        );
+                        // Not registered with the fallback coordinator: a fallback clears every
+                        // downstream anyway, after which this task finishes and shuts down.
+                        let sv1_server = self.clone();
+                        let cancellation_token = cancellation_token.clone();
+                        task_manager.spawn(async move {
+                            tokio::select! {
+                                _ = cancellation_token.cancelled() => {}
+                                _ = sv1_server.drain_downstreams(window) => {
+                                    info!("SV1 Server: all downstreams drained, shutting down");
+                                    cancellation_token.cancel();
+                                }
+                            }
+                        });
+                    }
+                    result = accept(&listener) => {
                         match result {
                             Ok((stream, addr)) => {
                                 info!("New SV1 downstream connection from {}", addr);
@@ -674,6 +711,38 @@ impl Sv1Server {
         });
 
         Ok(())
+    }
+
+    /// Disconnects the downstreams registered when called one at a time, spread evenly across
+    /// `window`, then waits until they have all been removed.
+    ///
+    /// The window is split into one slot per downstream and each disconnect lands at a random
+    /// point inside its slot, so miners reconnect elsewhere in a steady trickle instead of all at
+    /// once. If `drain_send_reconnect` is set each miner is sent `client.reconnect` first.
+    pub(crate) async fn drain_downstreams(&self, window: Duration) {
+        let mut ids = self.downstreams.keys();
+        ids.sort_unstable();
+        let start = tokio::time::Instant::now();
+        let slot = window / (ids.len().max(1) as u32);
+        let jitter = std::collections::hash_map::RandomState::new();
+        for (i, id) in ids.into_iter().enumerate() {
+            // Uniform in [0, 1) from a randomly keyed hash; avoids a new dependency for one value.
+            let unit =
+                (std::hash::BuildHasher::hash_one(&jitter, i) >> 11) as f64 / (1u64 << 53) as f64;
+            tokio::time::sleep_until(start + slot * i as u32 + slot.mul_f64(unit)).await;
+            let Some(downstream) = self.downstreams.get_cloned(&id) else {
+                continue;
+            };
+            info!("Draining downstream {id}");
+            if self.config.drain_send_reconnect {
+                downstream.reconnect();
+            } else {
+                downstream.disconnect();
+            }
+        }
+        while !self.downstreams.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Handles messages received from downstream SV1 miners.
@@ -2245,6 +2314,82 @@ mod tests {
             unreachable!();
         };
         server_to_client::Notify::try_from(notification).unwrap()
+    }
+
+    /// Each downstream is disconnected inside its own slot of the window, so disconnects are
+    /// spread across it instead of landing together.
+    #[tokio::test(start_paused = true)]
+    async fn drain_disconnects_downstreams_one_slot_apart() {
+        let server = Arc::new(create_test_sv1_server());
+        let ids: Vec<DownstreamId> = (1..=4).collect();
+        for &id in &ids {
+            register_test_downstream(&server, id, None, 100.0, false);
+        }
+        let window = Duration::from_secs(40);
+        let slot = window / ids.len() as u32;
+        let start = tokio::time::Instant::now();
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(window).await }
+        });
+
+        let tick = Duration::from_millis(100);
+        let mut disconnected_at = vec![None; ids.len()];
+        while disconnected_at.iter().any(Option::is_none) {
+            assert!(start.elapsed() <= window, "drain overran its window");
+            tokio::time::sleep(tick).await;
+            for (i, id) in ids.iter().enumerate() {
+                let gone = server
+                    .downstreams
+                    .with(id, |d| d.is_disconnected())
+                    .unwrap();
+                if gone && disconnected_at[i].is_none() {
+                    disconnected_at[i] = Some(start.elapsed());
+                }
+            }
+        }
+        for (i, at) in disconnected_at.into_iter().enumerate() {
+            let at = at.unwrap();
+            let slot_start = slot * i as u32;
+            assert!(
+                at >= slot_start && at <= slot_start + slot + tick,
+                "downstream {} disconnected at {at:?}, outside slot {i}",
+                ids[i]
+            );
+        }
+
+        // Drain returns only once the downstream tasks have removed themselves.
+        assert!(!drain.is_finished());
+        server.downstreams.clear();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should finish once downstreams are gone")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_with_reconnect_sends_client_reconnect_then_closes() {
+        let mut server = create_test_sv1_server();
+        server.config.drain_send_reconnect = true;
+        let (_, miner_rx) =
+            register_test_downstream_with_sv1_receiver(&server, 1, None, 100.0, false);
+        let server = Arc::new(server);
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(Duration::from_secs(10)).await }
+        });
+
+        let json_rpc::Message::Notification(msg) = miner_rx.recv().await.unwrap() else {
+            panic!("expected a notification");
+        };
+        assert_eq!(msg.method, "client.reconnect");
+        assert!(
+            miner_rx.recv().await.is_err(),
+            "outbound channel should close after reconnect"
+        );
+
+        server.downstreams.clear();
+        drain.await.unwrap();
     }
 
     #[test]

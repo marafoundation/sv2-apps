@@ -444,6 +444,7 @@ impl TranslatorRuntime<UpstreamReady> {
             .clone()
             .start(
                 self.translator.cancellation_token.clone(),
+                self.translator.drain_token.clone(),
                 self.fallback_coordinator.clone(),
                 self.task_manager.clone(),
             )

@@ -16,6 +16,42 @@ async fn main() {
     inner_main().await;
 }
 
+/// Waits for SIGINT (Ctrl+C) or, on Unix, SIGTERM. Returns `false` if no handler could be
+/// installed, in which case no signal-driven shutdown happens.
+async fn shutdown_signal() -> bool {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {e}");
+                return tokio::signal::ctrl_c().await.is_ok();
+            }
+        };
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                if res.is_err() {
+                    return false;
+                }
+                tracing::info!("Ctrl+C received — initiating graceful shutdown...");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received — initiating graceful shutdown...");
+            }
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let received = tokio::signal::ctrl_c().await.is_ok();
+        if received {
+            tracing::info!("Ctrl+C received — initiating graceful shutdown...");
+        }
+        received
+    }
+}
+
 /// Entrypoint for the Translator binary.
 ///
 /// Loads the configuration from TOML and initializes the main runtime
@@ -33,9 +69,8 @@ async fn inner_main() {
     tokio::spawn({
         let translator = translator.clone();
         async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("Ctrl+C received — initiating graceful shutdown...");
-                translator.shutdown().await;
+            if shutdown_signal().await {
+                translator.drain_and_shutdown().await;
             }
         }
     });

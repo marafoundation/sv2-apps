@@ -70,6 +70,19 @@ pub struct TranslatorConfig {
     monitoring_cache_refresh_secs: Option<u64>,
     #[serde(default)]
     miner_telemetry: MinerTelemetryConfig,
+    /// Seconds to drain SV1 downstreams for on SIGTERM/SIGINT before shutting down.
+    ///
+    /// When non-zero, a shutdown signal closes the SV1 listener and then disconnects the
+    /// connected miners one at a time, spread evenly (with jitter) across this window, while the
+    /// upstream SV2 connection keeps serving the miners that are still connected. The translator
+    /// exits once the last miner is gone or the window elapses, whichever comes first. `0` (the
+    /// default) shuts down immediately and drops every miner at once.
+    #[serde(default)]
+    pub drain_seconds: u64,
+    /// Whether to send SV1 `client.reconnect` (no parameters, i.e. "reconnect to the same
+    /// host and port") to each miner just before closing its connection during a drain.
+    #[serde(default)]
+    pub drain_send_reconnect: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -148,6 +161,8 @@ impl TranslatorConfig {
             monitoring_address,
             monitoring_cache_refresh_secs,
             miner_telemetry: MinerTelemetryConfig::default(),
+            drain_seconds: 0,
+            drain_send_reconnect: false,
         }
     }
 

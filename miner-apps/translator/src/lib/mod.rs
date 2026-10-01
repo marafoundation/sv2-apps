@@ -11,13 +11,16 @@
 //! It relies on several sub-modules (`config`, `downstream_sv1`, `upstream_sv2`, `proxy`, `status`,
 //! etc.) for specialized functionalities.
 use error::TproxyErrorKind;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub use stratum_apps::stratum_core::sv1_api::server_to_client;
 
@@ -42,6 +45,8 @@ pub mod utils;
 pub struct TranslatorSv2 {
     config: TranslatorConfig,
     cancellation_token: CancellationToken,
+    /// Cancelled to start draining SV1 downstreams ahead of shutdown.
+    drain_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
 }
@@ -56,6 +61,7 @@ impl TranslatorSv2 {
         Self {
             config,
             cancellation_token: CancellationToken::new(),
+            drain_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
         }
@@ -135,14 +141,38 @@ impl TranslatorSv2 {
     }
 
     pub async fn shutdown(&self) {
+        // The Notified future is guaranteed to receive wakeups from notify_waiters()
+        // as soon as it has been created, even if it has not yet been polled. Creating it
+        // before checking `is_alive` means a teardown that completes concurrently is either
+        // seen here or wakes us.
+        let notified = self.shutdown_notify.notified();
         if !self.is_alive.load(Ordering::Acquire) {
             return;
         }
-        // The Notified future is guaranteed to receive wakeups from notify_waiters()
-        // as soon as it has been created, even if it has not yet been polled.
-        let notified = self.shutdown_notify.notified();
         self.cancellation_token.cancel();
         notified.await;
+    }
+
+    /// Drains SV1 downstreams for up to `drain_seconds`, then shuts down.
+    ///
+    /// The SV1 listener is closed and connected miners are disconnected gradually across the
+    /// window while the upstream connection stays up. Shutdown starts as soon as the last miner
+    /// is gone, or when the window elapses, at which point any remaining miners are dropped by
+    /// [`TranslatorSv2::shutdown`]. With `drain_seconds = 0` this is exactly
+    /// [`TranslatorSv2::shutdown`].
+    pub async fn drain_and_shutdown(&self) {
+        let window = Duration::from_secs(self.config.drain_seconds);
+        if !window.is_zero() && self.is_alive.load(Ordering::Acquire) {
+            info!("Draining SV1 downstreams for up to {}s", window.as_secs());
+            self.drain_token.cancel();
+            if tokio::time::timeout(window, self.cancellation_token.cancelled())
+                .await
+                .is_err()
+            {
+                warn!("Drain window elapsed; dropping remaining SV1 downstreams");
+            }
+        }
+        self.shutdown().await;
     }
 }
 
@@ -150,5 +180,68 @@ impl Drop for TranslatorSv2 {
     fn drop(&mut self) {
         info!("TranslatorSv2 dropped");
         self.cancellation_token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::{DownstreamDifficultyConfig, Upstream};
+    use std::str::FromStr;
+    use stratum_apps::key_utils::Secp256k1PublicKey;
+
+    fn translator(drain_seconds: u64) -> TranslatorSv2 {
+        let pubkey =
+            Secp256k1PublicKey::from_str("9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan")
+                .unwrap();
+        let upstream = Upstream::new("127.0.0.1".into(), 4444, pubkey, "test".into());
+        let mut config = TranslatorConfig::new(
+            vec![upstream],
+            "0.0.0.0".into(),
+            3333,
+            DownstreamDifficultyConfig::new(100.0, 5.0, true, 60),
+            2,
+            1,
+            4,
+            false,
+            true,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        config.drain_seconds = drain_seconds;
+        TranslatorSv2::new(config)
+    }
+
+    /// `drain_seconds = 0` shuts down at once without starting a drain.
+    #[tokio::test(start_paused = true)]
+    async fn zero_drain_window_shuts_down_immediately() {
+        let translator = translator(0);
+        // No runtime is running to acknowledge shutdown, so this never completes on its own.
+        let shutdown = tokio::spawn({
+            let translator = translator.clone();
+            async move { translator.drain_and_shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(translator.cancellation_token.is_cancelled());
+        assert!(!translator.drain_token.is_cancelled());
+        shutdown.abort();
+    }
+
+    /// A drain that does not finish is cut at the window and turns into a normal shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn drain_is_cut_at_the_window() {
+        let translator = translator(30);
+        let shutdown = tokio::spawn({
+            let translator = translator.clone();
+            async move { translator.drain_and_shutdown().await }
+        });
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert!(translator.drain_token.is_cancelled());
+        assert!(!translator.cancellation_token.is_cancelled());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(translator.cancellation_token.is_cancelled());
+        shutdown.abort();
     }
 }
