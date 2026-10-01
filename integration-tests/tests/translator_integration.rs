@@ -2906,14 +2906,15 @@ async fn translator_drains_sv1_downstreams_gradually() {
         closed_at.push(close.await.unwrap());
     }
     closed_at.sort();
-    // One slot of `window / 4` per miner: the first closes in the first slot and the last in the
-    // last slot, so they are at least two slots apart.
+    // Disconnects are spread over 3.6s (the window less a tenth), one 0.9s slot per miner: the
+    // first closes in the first slot and the last in the last slot, so they are at least two
+    // slots (1.8s) apart. That leaves 0.2s for scheduling and close latency.
     assert!(
-        closed_at[3] - closed_at[0] >= window / 2,
+        closed_at[3] - closed_at[0] >= window * 2 / 5,
         "miners were not disconnected gradually: {closed_at:?}"
     );
-    // The last disconnect can land just under `window` after the drain task's own start, which is
-    // later than `start` here, and the EOF reaches the reader later still: allow some slack.
+    // The last disconnect lands by 3.6s after the drain task's own start, which is later than
+    // `start` here, and the EOF reaches the reader later still: allow some slack.
     assert!(
         closed_at[3] <= window + Duration::from_millis(500),
         "drain overran its window: {closed_at:?}"
