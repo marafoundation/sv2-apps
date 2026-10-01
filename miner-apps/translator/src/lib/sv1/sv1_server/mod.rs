@@ -488,8 +488,6 @@ impl Sv1Server {
     ///
     /// # Arguments
     /// * `cancellation_token` - Global application cancellation token
-    /// * `drain_token` - Cancelled to close the listener and drain downstreams (see
-    ///   [`Sv1Server::drain_downstreams`]); the global token is cancelled once drained
     /// * `fallback_coordinator` - Fallback coordinator
     /// * `task_manager` - Manager for spawned async tasks
     ///
@@ -497,6 +495,24 @@ impl Sv1Server {
     /// * `Ok(())` - Server shut down gracefully
     /// * `Err(TproxyError)` - Server encountered an error
     pub async fn start(
+        self: Arc<Self>,
+        cancellation_token: CancellationToken,
+        fallback_coordinator: FallbackCoordinator,
+        task_manager: Arc<TaskManager>,
+    ) -> TproxyResult<(), error::Sv1Server> {
+        self.start_with_drain(
+            cancellation_token,
+            CancellationToken::new(),
+            fallback_coordinator,
+            task_manager,
+        )
+        .await
+    }
+
+    /// Like [`Sv1Server::start`], plus a `drain_token`: cancelling it closes the listener and
+    /// drains downstreams (see [`Sv1Server::drain_downstreams`]), and the global token is
+    /// cancelled once drained.
+    pub async fn start_with_drain(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
         drain_token: CancellationToken,
