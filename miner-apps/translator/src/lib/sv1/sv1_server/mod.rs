@@ -255,6 +255,13 @@ async fn accept(
     }
 }
 
+/// The part of a drain window that disconnects are spread over: the window less a tenth, at most
+/// 1s, so the last disconnect lands before [`crate::TranslatorSv2::drain_and_shutdown`]'s
+/// deadline instead of racing it.
+fn drain_span(window: Duration) -> Duration {
+    window - (window / 10).min(Duration::from_secs(1))
+}
+
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1Server {
     async fn handle_error_action(
@@ -578,20 +585,22 @@ impl Sv1Server {
                     }
                     _ = drain_token.cancelled(), if listener.is_some() => {
                         listener = None;
-                        let window = Duration::from_secs(self.config.drain_seconds);
+                        let span = drain_span(Duration::from_secs(self.config.drain_seconds));
                         info!(
-                            "SV1 Server: drain started, listener closed; disconnecting {} downstreams over {}s",
+                            "SV1 Server: drain started, listener closed; disconnecting {} downstreams over {:?}",
                             self.downstreams.len(),
-                            window.as_secs()
+                            span
                         );
-                        // Not registered with the fallback coordinator: a fallback clears every
-                        // downstream anyway, after which this task finishes and shuts down.
+                        // Not registered with the fallback coordinator, so it never holds up
+                        // fallback cleanup. A fallback clears every downstream; the server it
+                        // restarts sees the cancelled drain token, has nothing to drain and
+                        // cancels the global token, which ends this task too.
                         let sv1_server = self.clone();
                         let cancellation_token = cancellation_token.clone();
                         task_manager.spawn(async move {
                             tokio::select! {
                                 _ = cancellation_token.cancelled() => {}
-                                _ = sv1_server.drain_downstreams(window) => {
+                                _ = sv1_server.drain_downstreams(span) => {
                                     info!("SV1 Server: all downstreams drained, shutting down");
                                     cancellation_token.cancel();
                                 }
@@ -2381,6 +2390,21 @@ mod tests {
             .await
             .expect("drain should finish once downstreams are gone")
             .unwrap();
+    }
+
+    /// The span leaves a tenth of the window, capped at 1s, before the shutdown deadline.
+    #[test]
+    fn drain_span_ends_before_the_window() {
+        assert_eq!(drain_span(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            drain_span(Duration::from_secs(4)),
+            Duration::from_millis(3600)
+        );
+        assert_eq!(drain_span(Duration::from_secs(10)), Duration::from_secs(9));
+        assert_eq!(
+            drain_span(Duration::from_secs(600)),
+            Duration::from_secs(599)
+        );
     }
 
     #[tokio::test(start_paused = true)]
