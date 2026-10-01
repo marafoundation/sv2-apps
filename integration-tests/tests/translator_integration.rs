@@ -2912,8 +2912,10 @@ async fn translator_drains_sv1_downstreams_gradually() {
         closed_at[3] - closed_at[0] >= window / 2,
         "miners were not disconnected gradually: {closed_at:?}"
     );
+    // The last disconnect can land just under `window` after the drain task's own start, which is
+    // later than `start` here, and the EOF reaches the reader later still: allow some slack.
     assert!(
-        closed_at[3] <= window,
+        closed_at[3] <= window + Duration::from_millis(500),
         "drain overran its window: {closed_at:?}"
     );
 

@@ -578,7 +578,7 @@ impl Sv1Server {
                     }
                     _ = drain_token.cancelled(), if listener.is_some() => {
                         listener = None;
-                        let window = Duration::from_secs(self.config.drain_seconds);
+                        let window = self.config.drain_window();
                         info!(
                             "SV1 Server: drain started, listener closed; disconnecting {} downstreams over {}s",
                             self.downstreams.len(),
@@ -736,6 +736,7 @@ impl Sv1Server {
     /// point inside its slot, so miners reconnect elsewhere in a steady trickle instead of all at
     /// once. If `drain_send_reconnect` is set each miner is sent `client.reconnect` first.
     pub(crate) async fn drain_downstreams(&self, window: Duration) {
+        const POLL: Duration = Duration::from_millis(100);
         let mut ids = self.downstreams.keys();
         ids.sort_unstable();
         let start = tokio::time::Instant::now();
@@ -745,7 +746,14 @@ impl Sv1Server {
             // Uniform in [0, 1) from a randomly keyed hash; avoids a new dependency for one value.
             let unit =
                 (std::hash::BuildHasher::hash_one(&jitter, i) >> 11) as f64 / (1u64 << 53) as f64;
-            tokio::time::sleep_until(start + slot * i as u32 + slot.mul_f64(unit)).await;
+            // Wake early if every miner has already left, so the drain ends with the last one.
+            let at = start + slot * i as u32 + slot.mul_f64(unit);
+            while tokio::time::Instant::now() < at && !self.downstreams.is_empty() {
+                tokio::time::sleep_until(at.min(tokio::time::Instant::now() + POLL)).await;
+            }
+            if self.downstreams.is_empty() {
+                break;
+            }
             let Some(downstream) = self.downstreams.get_cloned(&id) else {
                 continue;
             };
@@ -757,7 +765,7 @@ impl Sv1Server {
             }
         }
         while !self.downstreams.is_empty() {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(POLL).await;
         }
     }
 
@@ -2381,6 +2389,28 @@ mod tests {
             .await
             .expect("drain should finish once downstreams are gone")
             .unwrap();
+    }
+
+    /// Miners that leave on their own end the drain early instead of it sleeping out the window.
+    #[tokio::test(start_paused = true)]
+    async fn drain_ends_once_downstreams_leave_on_their_own() {
+        let server = Arc::new(create_test_sv1_server());
+        for id in 1..=2 {
+            register_test_downstream(&server, id, None, 100.0, false);
+        }
+        let start = tokio::time::Instant::now();
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(Duration::from_secs(40)).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        server.downstreams.clear();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should end once every downstream has left")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]

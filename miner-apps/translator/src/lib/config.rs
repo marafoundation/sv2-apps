@@ -124,6 +124,12 @@ impl Upstream {
 }
 
 impl TranslatorConfig {
+    /// `drain_seconds` as a window, capped at one day so the drain deadline cannot overflow
+    /// `Instant`.
+    pub fn drain_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.drain_seconds.min(86_400))
+    }
+
     /// Creates a new `TranslatorConfig` instance with the specified upstream and downstream
     /// configurations and version constraints.
     #[allow(clippy::too_many_arguments)]

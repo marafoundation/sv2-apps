@@ -11,12 +11,9 @@
 //! It relies on several sub-modules (`config`, `downstream_sv1`, `upstream_sv2`, `proxy`, `status`,
 //! etc.) for specialized functionalities.
 use error::TproxyErrorKind;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -161,7 +158,7 @@ impl TranslatorSv2 {
     /// [`TranslatorSv2::shutdown`]. With `drain_seconds = 0` this is exactly
     /// [`TranslatorSv2::shutdown`].
     pub async fn drain_and_shutdown(&self) {
-        let window = Duration::from_secs(self.config.drain_seconds);
+        let window = self.config.drain_window();
         if !window.is_zero() && self.is_alive.load(Ordering::Acquire) {
             info!("Draining SV1 downstreams for up to {}s", window.as_secs());
             self.drain_token.cancel();
@@ -187,7 +184,7 @@ impl Drop for TranslatorSv2 {
 mod tests {
     use super::*;
     use config::{DownstreamDifficultyConfig, Upstream};
-    use std::str::FromStr;
+    use std::{str::FromStr, time::Duration};
     use stratum_apps::key_utils::Secp256k1PublicKey;
 
     fn translator(drain_seconds: u64) -> TranslatorSv2 {

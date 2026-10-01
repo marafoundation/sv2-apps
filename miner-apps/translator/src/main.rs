@@ -16,40 +16,40 @@ async fn main() {
     inner_main().await;
 }
 
-/// Waits for SIGINT (Ctrl+C) or, on Unix, SIGTERM. Returns `false` if no handler could be
-/// installed, in which case no signal-driven shutdown happens.
-async fn shutdown_signal() -> bool {
+/// Waits for SIGINT (Ctrl+C) or, on Unix when `sigterm` is set, SIGTERM. Returns `false` if no
+/// handler could be installed, in which case no signal-driven shutdown happens.
+///
+/// SIGTERM is only caught when a drain is configured: with `drain_seconds = 0` it keeps its
+/// default action (immediate exit), exactly as before draining existed.
+async fn shutdown_signal(sigterm: bool) -> bool {
     #[cfg(unix)]
-    {
+    if sigterm {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(sigterm) => sigterm,
-            Err(e) => {
-                tracing::error!("Failed to install SIGTERM handler: {e}");
-                return tokio::signal::ctrl_c().await.is_ok();
-            }
-        };
-        tokio::select! {
-            res = tokio::signal::ctrl_c() => {
-                if res.is_err() {
-                    return false;
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if res.is_err() {
+                            return false;
+                        }
+                        tracing::info!("Ctrl+C received — initiating graceful shutdown...");
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received — initiating graceful shutdown...");
+                    }
                 }
-                tracing::info!("Ctrl+C received — initiating graceful shutdown...");
+                return true;
             }
-            _ = sigterm.recv() => {
-                tracing::info!("SIGTERM received — initiating graceful shutdown...");
-            }
+            Err(e) => tracing::error!("Failed to install SIGTERM handler: {e}"),
         }
-        true
     }
     #[cfg(not(unix))]
-    {
-        let received = tokio::signal::ctrl_c().await.is_ok();
-        if received {
-            tracing::info!("Ctrl+C received — initiating graceful shutdown...");
-        }
-        received
+    let _ = sigterm;
+    let received = tokio::signal::ctrl_c().await.is_ok();
+    if received {
+        tracing::info!("Ctrl+C received — initiating graceful shutdown...");
     }
+    received
 }
 
 /// Entrypoint for the Translator binary.
@@ -65,11 +65,12 @@ async fn inner_main() {
 
     init_logging(proxy_config.log_dir());
 
+    let drain = !proxy_config.drain_window().is_zero();
     let translator = TranslatorSv2::new(proxy_config);
     tokio::spawn({
         let translator = translator.clone();
         async move {
-            if shutdown_signal().await {
+            if shutdown_signal(drain).await {
                 translator.drain_and_shutdown().await;
             }
         }
