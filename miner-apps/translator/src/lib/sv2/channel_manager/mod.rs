@@ -18,8 +18,9 @@ use stratum_apps::{
     stratum_core::{
         channels_sv2::{
             client::{
-                extended::ExtendedChannel, group::GroupChannel,
-                share_accounting::ShareValidationError,
+                extended::ExtendedChannel,
+                group::GroupChannel,
+                share_accounting::{ShareValidationError, ShareValidationResult},
             },
             extranonce_manager::{ExtranonceAllocator, bytes_needed},
         },
@@ -752,7 +753,16 @@ impl ChannelManager {
                             aggregated_channel.validate_share(m.clone())
                         });
                     match value {
-                        Some(Ok(_result)) => {
+                        Some(Ok(result)) => {
+                            if let ShareValidationResult::BlockFound(share_hash) = result {
+                                info!(
+                                    channel_id = downstream_channel_id,
+                                    upstream_channel_id = upstream_extended_channel_id,
+                                    user_identity = ?self.extended_channels.with(&downstream_channel_id, |c| c.get_user_identity().to_string()).unwrap_or_default(),
+                                    share_user_identity = ?sv1_worker_name.as_deref().unwrap_or_default(),
+                                    "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
+                                );
+                            }
                             info!(
                                 "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
                                 upstream_extended_channel_id, m.sequence_number
@@ -797,7 +807,15 @@ impl ChannelManager {
                             extended_channel.validate_share(m.clone())
                         });
                     match value {
-                        Some(Ok(_result)) => {
+                        Some(Ok(result)) => {
+                            if let ShareValidationResult::BlockFound(share_hash) = result {
+                                info!(
+                                    channel_id = m.channel_id,
+                                    user_identity = ?self.extended_channels.with(&m.channel_id, |c| c.get_user_identity().to_string()).unwrap_or_default(),
+                                    share_user_identity = ?sv1_worker_name.as_deref().unwrap_or_default(),
+                                    "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
+                                );
+                            }
                             info!(
                                 "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
                                 m.channel_id, m.sequence_number

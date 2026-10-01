@@ -346,7 +346,10 @@ pub fn validate_cached_share(
             upstream_message.sequence_number =
                 sequence_number_factory.fetch_add(1, Ordering::Relaxed);
 
-            info!("💰 Block Found (cached extended)!!! 💰 {share_hash}");
+            info!(
+                upstream_channel_id = upstream_message.channel_id,
+                "💰 Block Found (cached extended)!!! 💰 {share_hash}"
+            );
 
             let mut channel_extranonce = upstream_channel.get_extranonce_prefix().to_vec();
             channel_extranonce.extend_from_slice(upstream_message.extranonce.as_bytes());
