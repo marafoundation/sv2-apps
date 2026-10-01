@@ -954,7 +954,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         is_downstream_share_valid = true;
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
-                        info!("SubmitSharesStandard on downstream channel: 💰 Block Found!!! 💰{share_hash}");
+                        info!(
+                            downstream_id,
+                            channel_id,
+                            user_identity = ?standard_channel.get_user_identity(),
+                            template_id = ?template_id,
+                            "SubmitSharesStandard on downstream channel: 💰 Block Found!!! 💰{share_hash}"
+                        );
                         downstream_share_hash = Some(share_hash);
                         is_downstream_share_valid = true;
                         if let Some(template_id) = template_id {
@@ -1063,7 +1069,14 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                                     Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
                                         upstream_message.sequence_number =
                                             self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
-                                        info!("SubmitSharesStandard forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}");
+                                        info!(
+                                            downstream_id,
+                                            channel_id,
+                                            upstream_channel_id = upstream_message.channel_id,
+                                            user_identity = ?standard_channel.get_user_identity(),
+                                            template_id = ?template_id,
+                                            "SubmitSharesStandard forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}"
+                                        );
                                         let push_solution = PushSolutionOwned {
                                             extranonce: standard_channel
                                                 .get_extranonce_prefix()
@@ -1207,7 +1220,7 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
             let validation = downstream.extended_channels.with_mut(&channel_id, |extended_channel| {
                 let mut messages: Vec<RouteMessageTo> = vec![];
                 // here we extract and set the user_identity from the TLV fields if the extension is negotiated
-                let _user_identity = if negotiated_extensions
+                let user_identity = if negotiated_extensions
                     .as_ref()
                     .is_ok_and(|exts| exts.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING))
                 {
@@ -1249,7 +1262,14 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         is_downstream_share_valid = true;
                     }
                     Ok(ShareValidationResult::BlockFound(share_hash, template_id, coinbase)) => {
-                        info!("SubmitSharesExtended on downstream channel: 💰 Block Found!!! 💰{share_hash}");
+                        info!(
+                            downstream_id,
+                            channel_id,
+                            user_identity = ?extended_channel.get_user_identity(),
+                            share_user_identity = ?user_identity.as_ref().map(|u| u.as_string_or_hex()).unwrap_or_default(),
+                            template_id = ?template_id,
+                            "SubmitSharesExtended on downstream channel: 💰 Block Found!!! 💰{share_hash}"
+                        );
                         downstream_share_hash = Some(share_hash);
                         if let Some(template_id) = template_id {
                             info!("SubmitSharesExtended: Propagating solution to the Template Provider.");
@@ -1361,7 +1381,15 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                                     Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
                                         upstream_message.sequence_number =
                                             self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
-                                        info!("SubmitSharesExtended forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}");
+                                        info!(
+                                            downstream_id,
+                                            channel_id,
+                                            upstream_channel_id = upstream_message.channel_id,
+                                            user_identity = ?extended_channel.get_user_identity(),
+                                            share_user_identity = ?user_identity.as_ref().map(|u| u.as_string_or_hex()).unwrap_or_default(),
+                                            template_id = ?template_id,
+                                            "SubmitSharesExtended forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}"
+                                        );
                                         let mut channel_extranonce =
                                             upstream_channel.get_extranonce_prefix().to_vec();
                                         channel_extranonce
