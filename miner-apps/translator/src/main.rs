@@ -28,12 +28,16 @@ async fn shutdown_signal(sigterm: bool) -> bool {
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
                 tokio::select! {
-                    res = tokio::signal::ctrl_c() => {
-                        if res.is_err() {
-                            return false;
+                    res = tokio::signal::ctrl_c() => match res {
+                        Ok(()) => tracing::info!("Ctrl+C received — initiating graceful shutdown..."),
+                        // The SIGTERM handler is installed by now, replacing SIGTERM's default
+                        // action, so returning here would leave the process ignoring SIGTERM.
+                        Err(e) => {
+                            tracing::error!("Failed to listen for Ctrl+C: {e}");
+                            sigterm.recv().await;
+                            tracing::info!("SIGTERM received — initiating graceful shutdown...");
                         }
-                        tracing::info!("Ctrl+C received — initiating graceful shutdown...");
-                    }
+                    },
                     _ = sigterm.recv() => {
                         tracing::info!("SIGTERM received — initiating graceful shutdown...");
                     }
