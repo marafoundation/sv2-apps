@@ -16,6 +16,46 @@ async fn main() {
     inner_main().await;
 }
 
+/// Waits for SIGINT (Ctrl+C) or, on Unix when `sigterm` is set, SIGTERM. Returns `false` if no
+/// handler could be installed, in which case no signal-driven shutdown happens.
+///
+/// SIGTERM is only caught when a drain is configured: with `drain_seconds = 0` it keeps its
+/// default action (immediate exit), exactly as before draining existed.
+async fn shutdown_signal(sigterm: bool) -> bool {
+    #[cfg(unix)]
+    if sigterm {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => match res {
+                        Ok(()) => tracing::info!("Ctrl+C received — initiating graceful shutdown..."),
+                        // The SIGTERM handler is installed by now, replacing SIGTERM's default
+                        // action, so returning here would leave the process ignoring SIGTERM.
+                        Err(e) => {
+                            tracing::error!("Failed to listen for Ctrl+C: {e}");
+                            sigterm.recv().await;
+                            tracing::info!("SIGTERM received — initiating graceful shutdown...");
+                        }
+                    },
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received — initiating graceful shutdown...");
+                    }
+                }
+                return true;
+            }
+            Err(e) => tracing::error!("Failed to install SIGTERM handler: {e}"),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = sigterm;
+    let received = tokio::signal::ctrl_c().await.is_ok();
+    if received {
+        tracing::info!("Ctrl+C received — initiating graceful shutdown...");
+    }
+    received
+}
+
 /// Entrypoint for the Translator binary.
 ///
 /// Loads the configuration from TOML and initializes the main runtime
@@ -29,13 +69,13 @@ async fn inner_main() {
 
     init_logging(proxy_config.log_dir());
 
+    let drain = !proxy_config.drain_window().is_zero();
     let translator = TranslatorSv2::new(proxy_config);
     tokio::spawn({
         let translator = translator.clone();
         async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("Ctrl+C received — initiating graceful shutdown...");
-                translator.shutdown().await;
+            if shutdown_signal(drain).await {
+                translator.drain_and_shutdown().await;
             }
         }
     });

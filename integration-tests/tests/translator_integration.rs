@@ -2810,3 +2810,122 @@ async fn tproxy_per_upstream_user_identity_switches_on_fallback() {
 
     shutdown_all!(translator);
 }
+
+// Draining closes the SV1 listener, then disconnects the connected miners one at a time across
+// the drain window rather than all at once, and the translator shuts down once they are gone.
+#[tokio::test]
+async fn translator_drains_sv1_downstreams_gradually() {
+    use tokio::io::AsyncReadExt;
+    use translator_sv2::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let _upstream = MockUpstream::new(
+        upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        vec![Upstream::new(
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            authority_pubkey,
+            "user_identity".to_string(),
+        )],
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        true,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    let window = Duration::from_secs(4);
+    config.drain_seconds = window.as_secs();
+    let translator = translator_sv2::TranslatorSv2::new(config);
+    tokio::spawn({
+        let translator = translator.clone();
+        async move {
+            let _ = translator.start().await;
+        }
+    });
+
+    let mut miners = Vec::new();
+    for _ in 0..4 {
+        let miner = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(stream) = TcpStream::connect(listen_addr).await {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("translator should accept SV1 connections");
+        miners.push(miner);
+    }
+    // Let the accept loop register every connection before draining.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let start = tokio::time::Instant::now();
+    let drain = tokio::spawn({
+        let translator = translator.clone();
+        async move { translator.drain_and_shutdown().await }
+    });
+    let closes: Vec<_> = miners
+        .into_iter()
+        .map(|mut miner| {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while matches!(miner.read(&mut buf).await, Ok(n) if n > 0) {}
+                start.elapsed()
+            })
+        })
+        .collect();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        TcpStream::connect(listen_addr).await.is_err(),
+        "listener should be closed once the drain starts"
+    );
+
+    let mut closed_at = Vec::new();
+    for close in closes {
+        closed_at.push(close.await.unwrap());
+    }
+    closed_at.sort();
+    // Disconnects are spread over 3.6s (the window less a tenth), one 0.9s slot per miner: the
+    // first closes in the first slot and the last in the last slot, so they are at least two
+    // slots (1.8s) apart. That leaves 0.2s for scheduling and close latency.
+    assert!(
+        closed_at[3] - closed_at[0] >= window * 2 / 5,
+        "miners were not disconnected gradually: {closed_at:?}"
+    );
+    // The last disconnect lands by 3.6s after the drain task's own start, which is later than
+    // `start` here, and the EOF reaches the reader later still: allow some slack.
+    assert!(
+        closed_at[3] <= window + Duration::from_millis(500),
+        "drain overran its window: {closed_at:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("translator should shut down once drained")
+        .unwrap();
+    assert!(
+        start.elapsed() < closed_at[3] + Duration::from_secs(1),
+        "shutdown should follow the last disconnect"
+    );
+}

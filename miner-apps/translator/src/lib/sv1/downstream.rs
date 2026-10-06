@@ -349,6 +349,19 @@ impl Downstream {
         self.downstream_cancellation_token.cancel();
     }
 
+    /// Sends `client.reconnect` without parameters, asking the miner to reconnect to the host and
+    /// port it already uses, then closes the outbound channel. The connection writer flushes what
+    /// is queued (this message included) before it closes the socket, which then runs the same
+    /// cleanup as [`Downstream::disconnect`].
+    pub(super) fn reconnect(&self) {
+        let sender = &self.downstream_io.downstream_sv1_sender;
+        let _ = sender.try_send(json_rpc::Message::Notification(json_rpc::Notification {
+            method: "client.reconnect".to_string(),
+            params: serde_json::Value::Array(vec![]),
+        }));
+        sender.close();
+    }
+
     #[cfg(test)]
     pub(super) fn is_disconnected(&self) -> bool {
         self.downstream_cancellation_token.is_cancelled()

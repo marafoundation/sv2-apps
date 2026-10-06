@@ -442,8 +442,9 @@ impl TranslatorRuntime<UpstreamReady> {
             .state
             .sv1_server
             .clone()
-            .start(
+            .start_with_drain(
                 self.translator.cancellation_token.clone(),
+                self.translator.drain_token.clone(),
                 self.fallback_coordinator.clone(),
                 self.task_manager.clone(),
             )
