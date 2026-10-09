@@ -30,6 +30,10 @@ share_batch_size = 10
 # Keep the default if this pool serves job-declaration clients: each SetCustomMiningJob
 # retires the active job, so the client sets the rate.
 # max_past_jobs = 3
+# Payout modes a user_identity may select (optional). "any" (the default) honours solo,
+# legacy solo and donate identities; "pool_only" refuses channels whose identity pays the
+# miner and, with [jds], declared coinbases that pay anything but coinbase_reward_script.
+# payout_modes = "pool_only"
 
 
 monitoring_address = "127.0.0.1:9090"

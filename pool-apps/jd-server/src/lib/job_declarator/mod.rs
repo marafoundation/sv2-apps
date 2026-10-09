@@ -58,6 +58,7 @@ const JANITOR_INTERVAL_SECS: u64 = 10;
 mod downstream;
 mod job_declaration_message_handler;
 pub mod job_validation;
+mod pool_only_payouts;
 pub mod token_management;
 
 /// Shared JDP payload exchanged between Job Declarator and downstreams.
@@ -113,6 +114,8 @@ pub struct JobDeclarator {
     job_validator: Arc<dyn JobValidationEngine>,
     job_declarator_io: Arc<JobDeclaratorIo>,
     coinbase_reward_script: CoinbaseRewardScript,
+    /// Refuse declared coinbases that pay any script other than `coinbase_reward_script`.
+    pool_only_payouts: bool,
     downstream_clients: SharedMap<DownstreamId, Downstream>,
     downstream_id_factory: Arc<AtomicUsize>,
 }
@@ -142,6 +145,7 @@ impl JobDeclarator {
             job_validator: engine,
             job_declarator_io,
             coinbase_reward_script,
+            pool_only_payouts: false,
             downstream_clients: SharedMap::new(),
             downstream_id_factory: Arc::new(AtomicUsize::new(0)),
         })
@@ -150,6 +154,14 @@ impl JobDeclarator {
 
 /// Generic implementation for all [`JobValidationEngine`] types.
 impl JobDeclarator {
+    /// When enabled, a `DeclareMiningJob` whose coinbase pays any script other than
+    /// `coinbase_reward_script` is refused with `invalid-coinbase-tx`, before it reaches the
+    /// validation backend (see [`pool_only_payouts::coinbase_pays_only`]).
+    pub fn with_pool_only_payouts(mut self, enabled: bool) -> Self {
+        self.pool_only_payouts = enabled;
+        self
+    }
+
     fn handle_error_action(
         &self,
         context: &str,

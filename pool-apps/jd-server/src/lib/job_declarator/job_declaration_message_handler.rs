@@ -1,7 +1,10 @@
 use crate::{
     error,
     error::JDSError,
-    job_declarator::{JobDeclarator, job_validation::DeclareMiningJobResult},
+    job_declarator::{
+        JobDeclarator, job_validation::DeclareMiningJobResult,
+        pool_only_payouts::coinbase_pays_only,
+    },
 };
 use std::time::Instant;
 use stratum_apps::{
@@ -11,6 +14,7 @@ use stratum_apps::{
         job_declaration_sv2::{
             AllocateMiningJobTokenOwned, AllocateMiningJobTokenSuccessOwned,
             DeclareMiningJobErrorOwned, DeclareMiningJobOwned, DeclareMiningJobSuccessOwned,
+            ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_MINING_JOB_TOKEN,
             ERROR_CODE_DECLARE_MINING_JOB_MISSING_TXS, ProvideMissingTransactionsOwned,
             ProvideMissingTransactionsSuccessOwned, PushSolutionOwned,
@@ -19,7 +23,7 @@ use stratum_apps::{
     },
     utils::types::JdToken,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
@@ -177,12 +181,29 @@ impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
             return Ok(());
         }
 
+        // A declaration that misses transactions is stored and re-validated as this same `msg`
+        // (see handle_provide_missing_transactions_success), so checking here covers it.
+        let pays_only_pool = !self.pool_only_payouts
+            || coinbase_pays_only(
+                msg.coinbase_tx_prefix.as_bytes(),
+                msg.coinbase_tx_suffix.as_bytes(),
+                &self.coinbase_reward_script.script_pubkey(),
+            );
+        let result = if pays_only_pool {
+            self.job_validator
+                .handle_declare_mining_job(client_id, msg.clone(), None)
+                .await
+        } else {
+            warn!(
+                client_id,
+                request_id = msg.request_id,
+                "Refusing DeclareMiningJob: its coinbase pays a script other than the pool's"
+            );
+            DeclareMiningJobResult::Error(ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX)
+        };
+
         // validate job
-        let response = match self
-            .job_validator
-            .handle_declare_mining_job(client_id, msg.clone(), None)
-            .await
-        {
+        let response = match result {
             // if job is valid, activate token and return DeclareMiningJobSuccess
             DeclareMiningJobResult::Success => {
                 match self.token_manager.activate(token, client_id) {
