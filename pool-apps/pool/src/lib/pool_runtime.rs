@@ -28,6 +28,7 @@ use jd_server_sv2::job_declarator::{
 use super::PoolSv2;
 use crate::{
     channel_manager::ChannelManager,
+    config::PayoutModes,
     error::PoolErrorKind,
     template_receiver::{
         bitcoin_core::{BitcoinCoreSv2TDPConfig, connect_to_bitcoin_core},
@@ -296,7 +297,9 @@ impl PoolRuntime<IoReady> {
             )
             .await
             {
-                Ok(jd) => jd,
+                Ok(jd) => jd.with_pool_only_payouts(
+                    self.pool.config.payout_modes() == PayoutModes::PoolOnly,
+                ),
                 Err(err) => return Err((PoolErrorKind::Jds(err), self)),
             };
 

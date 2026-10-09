@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 use jd_server_sv2::job_declarator::JobDeclarator;
 
 use crate::{
-    config::PoolConfig,
+    config::{PayoutModes, PoolConfig},
     downstream::Downstream,
     error::{self, Action, LoopControl, PoolError, PoolErrorKind, PoolResult},
     utils::DownstreamMessage,
@@ -114,6 +114,8 @@ pub struct ChannelManager {
     /// Past jobs retained per channel; `None` uses the `channels_sv2` default.
     max_past_jobs: Option<usize>,
     coinbase_reward_script: CoinbaseRewardScript,
+    /// Which payout modes a channel's `user_identity` may select.
+    payout_modes: PayoutModes,
     /// Protocol extensions that the pool supports (will accept if requested by clients).
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).
@@ -192,6 +194,7 @@ impl ChannelManager {
             Some(n) if n > 0 => info!(max_past_jobs = n, "past-jobs retention cap configured"),
             _ => info!("past-jobs retention cap: using channels_sv2 default"),
         }
+        info!(payout_modes = ?config.payout_modes(), "user_identity payout modes accepted");
 
         let channel_manager = ChannelManager {
             downstreams: SharedMap::new(),
@@ -207,6 +210,7 @@ impl ChannelManager {
             max_past_jobs: config.max_past_jobs(),
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
+            payout_modes: config.payout_modes(),
             supported_extensions: config.supported_extensions().to_vec(),
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,

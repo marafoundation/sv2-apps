@@ -60,6 +60,22 @@ pub struct PoolConfig {
     /// `SetCustomMiningJob` retires the active job, so the rate is the client's, not this pool's.
     #[serde(default)]
     max_past_jobs: Option<usize>,
+    #[serde(default)]
+    payout_modes: PayoutModes,
+}
+
+/// Which payout modes a `user_identity` may select (see [`stratum_apps::payout::PayoutMode`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayoutModes {
+    /// Every payout mode: solo, legacy solo, donate and full donation.
+    #[default]
+    Any,
+    /// Only identities that pay the whole reward to `coinbase_reward_script`: one with no payout
+    /// mode, or `sri/donate[/<worker>]`. Opening a channel with a solo, legacy solo or donate
+    /// identity is refused with `invalid-user-identity`, and the embedded JDS refuses declared
+    /// coinbases that pay any other script.
+    PoolOnly,
 }
 
 impl PoolConfig {
@@ -94,6 +110,7 @@ impl PoolConfig {
             shares_per_minute,
             share_batch_size,
             max_past_jobs: None,
+            payout_modes: PayoutModes::default(),
             log_file: None,
             server_id,
             supported_extensions,
@@ -107,6 +124,16 @@ impl PoolConfig {
     /// Returns the coinbase output.
     pub fn coinbase_reward_script(&self) -> &CoinbaseRewardScript {
         &self.coinbase_reward_script
+    }
+
+    /// Returns which payout modes a `user_identity` may select.
+    pub fn payout_modes(&self) -> PayoutModes {
+        self.payout_modes
+    }
+
+    /// Sets which payout modes a `user_identity` may select.
+    pub fn set_payout_modes(&mut self, payout_modes: PayoutModes) {
+        self.payout_modes = payout_modes;
     }
 
     /// Returns Pool listenining address.
@@ -321,5 +348,50 @@ address = "127.0.0.1:8442"
         let mut cfg = load_with("", "setter");
         cfg.set_max_past_jobs(Some(50));
         assert_eq!(cfg.max_past_jobs(), Some(50));
+    }
+
+    #[test]
+    fn payout_modes_is_read_from_config() {
+        // Absent keeps upstream behaviour; a deployment opts in.
+        assert_eq!(
+            load_with("", "payout-absent").payout_modes(),
+            PayoutModes::Any
+        );
+        assert_eq!(
+            load_with("payout_modes = \"any\"", "payout-any").payout_modes(),
+            PayoutModes::Any
+        );
+        assert_eq!(
+            load_with("payout_modes = \"pool_only\"", "payout-pool-only").payout_modes(),
+            PayoutModes::PoolOnly
+        );
+    }
+
+    #[test]
+    fn payout_modes_rejects_unknown_values() {
+        // A typo must not silently fall back to the permissive default.
+        let path = std::env::temp_dir().join("pool-config-payout-typo.toml");
+        std::fs::write(
+            &path,
+            r#"
+listen_address = "0.0.0.0:34254"
+authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+cert_validity_sec = 3600
+coinbase_reward_script = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)"
+pool_signature = "test"
+shares_per_minute = 6.0
+share_batch_size = 10
+payout_modes = "pool-only"
+
+[template_provider_type.Sv2Tp]
+address = "127.0.0.1:8442"
+"#,
+        )
+        .expect("write temp config");
+        let loaded: Result<PoolConfig, _> =
+            load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"]);
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.is_err());
     }
 }
