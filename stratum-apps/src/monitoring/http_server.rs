@@ -838,6 +838,12 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         .as_secs()
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
+    if let (Some(gauge), Some(age)) = (
+        &state.metrics.sv2_monitoring_snapshot_age_seconds,
+        state.cache.snapshot_age(),
+    ) {
+        gauge.set(age.as_secs_f64());
+    }
 
     // Gather and encode — all other metrics were set by the last cache refresh
     let encoder = TextEncoder::new();

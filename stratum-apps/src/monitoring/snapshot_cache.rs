@@ -37,7 +37,7 @@
 //! ```
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -49,10 +49,10 @@ use stratum_core::mining_sv2::{
     ERROR_CODE_SUBMIT_SHARES_INVALID_NON_ROLLABLE_VERSION_BIT,
     ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE, ERROR_CODE_SUBMIT_SHARES_STALE_SHARE,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{
-    client::{Sv2ClientInfo, Sv2ClientsMonitoring, Sv2ClientsSummary},
+    client::{CoinbaseOutputInfo, Sv2ClientInfo, Sv2ClientsMonitoring, Sv2ClientsSummary},
     prometheus_metrics::PrometheusMetrics,
     server::{ServerInfo, ServerMonitoring, ServerSummary},
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
@@ -89,6 +89,9 @@ struct PreviousPrometheusLabelSets {
     /// Labels for client per-rejection GaugeVecs: [client_id, channel_id, user_identity,
     /// error_code]
     client_rejected_share_labels: HashSet<[String; 4]>,
+    /// Coinbase outputs exported on the previous refresh. Also used to log each output as it
+    /// appears or disappears, which includes the first refresh after start-up.
+    coinbase_outputs: BTreeSet<CoinbaseOutputInfo>,
 }
 
 /// Cached snapshot of monitoring data.
@@ -102,6 +105,7 @@ pub struct MonitoringSnapshot {
     pub server_summary: Option<ServerSummary>,
     pub sv2_clients: Option<Vec<Sv2ClientInfo>>,
     pub sv2_clients_summary: Option<Sv2ClientsSummary>,
+    pub coinbase_outputs: Option<BTreeSet<CoinbaseOutputInfo>>,
     pub sv1_clients: Option<Vec<Sv1ClientInfo>>,
     pub sv1_clients_summary: Option<Sv1ClientsSummary>,
 }
@@ -154,6 +158,7 @@ impl Clone for SnapshotCache {
                 client_rejected_share_labels: previous_metrics_labels
                     .client_rejected_share_labels
                     .clone(),
+                coinbase_outputs: previous_metrics_labels.coinbase_outputs.clone(),
             }),
         }
     }
@@ -233,6 +238,7 @@ impl SnapshotCache {
         if let Some(ref source) = self.sv2_clients_source {
             new_snapshot.sv2_clients = Some(source.get_sv2_clients());
             new_snapshot.sv2_clients_summary = Some(source.get_sv2_clients_summary());
+            new_snapshot.coinbase_outputs = Some(source.get_coinbase_outputs());
         }
 
         // Collect Sv1 clients data
@@ -550,10 +556,42 @@ impl SnapshotCache {
             }
         }
 
+        let current_coinbase_outputs = snapshot.coinbase_outputs.clone().unwrap_or_default();
+        if let Some(ref m) = metrics.sv2_coinbase_output_info {
+            for output in &current_coinbase_outputs {
+                m.with_label_values(&[&output.script_hex, &output.address])
+                    .set(1.0);
+            }
+            for stale in previous_metrics_labels
+                .coinbase_outputs
+                .difference(&current_coinbase_outputs)
+            {
+                if let Err(e) = m.remove_label_values(&[&stale.script_hex, &stale.address]) {
+                    debug!(output = ?stale, error = %e, "failed to remove stale coinbase output label");
+                }
+            }
+        }
+        for added in current_coinbase_outputs.difference(&previous_metrics_labels.coinbase_outputs)
+        {
+            info!(script_hex = %added.script_hex, address = %added.address, "coinbase output added");
+        }
+        for removed in previous_metrics_labels
+            .coinbase_outputs
+            .difference(&current_coinbase_outputs)
+        {
+            info!(script_hex = %removed.script_hex, address = %removed.address, "coinbase output removed");
+        }
+
         previous_metrics_labels.server_channel_labels = current_server_labels;
         previous_metrics_labels.server_rejected_share_labels = current_server_rejected_labels;
         previous_metrics_labels.client_channel_labels = current_client_labels;
         previous_metrics_labels.client_rejected_share_labels = current_client_rejected_labels;
+        previous_metrics_labels.coinbase_outputs = current_coinbase_outputs;
+    }
+
+    /// Time since the last refresh, or `None` before the first one.
+    pub fn snapshot_age(&self) -> Option<Duration> {
+        self.snapshot.read().unwrap().timestamp.map(|t| t.elapsed())
     }
 
     /// Get the refresh interval
@@ -740,5 +778,75 @@ mod tests {
             total_cache_requests > 2,
             "Cache should have processed requests",
         );
+    }
+
+    struct CoinbaseOutputsMonitoring(Mutex<BTreeSet<CoinbaseOutputInfo>>);
+    impl Sv2ClientsMonitoring for CoinbaseOutputsMonitoring {
+        fn get_sv2_clients(&self) -> Vec<Sv2ClientInfo> {
+            vec![]
+        }
+        fn get_coinbase_outputs(&self) -> BTreeSet<CoinbaseOutputInfo> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn coinbase_output_series(metrics: &PrometheusMetrics) -> Vec<(String, String)> {
+        let mut series = Vec::new();
+        for family in metrics.registry.gather() {
+            if family.get_name() != "sv2_coinbase_output_info" {
+                continue;
+            }
+            for metric in family.get_metric() {
+                assert_eq!(metric.get_gauge().get_value(), 1.0);
+                let label = |name: &str| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .find(|l| l.get_name() == name)
+                        .unwrap()
+                        .get_value()
+                        .to_string()
+                };
+                series.push((label("script_hex"), label("address")));
+            }
+        }
+        series.sort();
+        series
+    }
+
+    #[test]
+    fn coinbase_output_info_follows_source_and_drops_stale_outputs() {
+        let output = |script_hex: &str, address: &str| CoinbaseOutputInfo {
+            script_hex: script_hex.to_string(),
+            address: address.to_string(),
+        };
+        let source = Arc::new(CoinbaseOutputsMonitoring(Mutex::new(BTreeSet::from([
+            output("a914aa87", "3pool"),
+            output("0014bb", ""),
+        ]))));
+        let metrics = PrometheusMetrics::new(false, true, false).unwrap();
+        let cache = SnapshotCache::new(Duration::from_secs(5), None, Some(source.clone()))
+            .with_metrics(metrics.clone());
+
+        cache.refresh();
+        assert_eq!(
+            coinbase_output_series(&metrics),
+            vec![
+                ("0014bb".to_string(), String::new()),
+                ("a914aa87".to_string(), "3pool".to_string()),
+            ]
+        );
+
+        *source.0.lock().unwrap() = BTreeSet::from([output("a914aa87", "3pool")]);
+        cache.refresh();
+        assert_eq!(
+            coinbase_output_series(&metrics),
+            vec![("a914aa87".to_string(), "3pool".to_string())]
+        );
+
+        source.0.lock().unwrap().clear();
+        cache.refresh();
+        assert!(coinbase_output_series(&metrics).is_empty());
+        assert!(cache.snapshot_age().unwrap() < Duration::from_secs(5));
     }
 }

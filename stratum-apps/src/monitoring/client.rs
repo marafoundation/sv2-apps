@@ -4,7 +4,7 @@
 //! Each client can have multiple channels opened with the app.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "asic-rs-telemetry")]
 use std::net::IpAddr;
 use utoipa::ToSchema;
@@ -198,6 +198,19 @@ pub struct Sv2ClientsSummary {
     pub total_hashrate: f32,
 }
 
+/// A coinbase output in work the app sends to its clients.
+///
+/// Exported as the `sv2_coinbase_output_info` Prometheus metric so operators can check the
+/// outputs the app actually builds, rather than the ones its config says it should build.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CoinbaseOutputInfo {
+    /// Hex-encoded `script_pubkey`.
+    pub script_hex: String,
+    /// The `script_pubkey` rendered as an address, or empty if the app does not know its
+    /// network or the script has no address form.
+    pub address: String,
+}
+
 /// Trait for monitoring Sv2 clients (downstream connections)
 pub trait Sv2ClientsMonitoring: Send + Sync {
     /// Get all Sv2 clients with their channels
@@ -226,6 +239,15 @@ pub trait Sv2ClientsMonitoring: Send + Sync {
             standard_channels: standard,
             total_hashrate: clients.iter().map(|c| c.total_hashrate()).sum(),
         }
+    }
+
+    /// Coinbase outputs in the jobs the app sends to its clients. The Pool reports every output
+    /// since start-up, because a replaced job can still be mined.
+    ///
+    /// Only apps that build coinbases themselves (the Pool) have anything to report, so the
+    /// default is empty and the metric then has no series.
+    fn get_coinbase_outputs(&self) -> BTreeSet<CoinbaseOutputInfo> {
+        BTreeSet::new()
     }
 }
 

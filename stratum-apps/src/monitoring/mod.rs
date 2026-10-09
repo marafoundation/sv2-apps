@@ -20,7 +20,7 @@ pub mod snapshot_cache;
 pub mod sv1;
 
 pub use client::{
-    ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
+    CoinbaseOutputInfo, ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
     Sv2ClientsMonitoring, Sv2ClientsSummary,
 };
 pub use http_server::{
