@@ -99,6 +99,30 @@ async fn pool_monitoring_with_sv2_mining_device() {
     // Pool should see 1 SV2 client (the mining device) with a standard channel
     assert_metric_eq(&pool_metrics, "sv2_clients_total", 1.0);
 
+    // The mining device's user_identity has no payout mode, so its jobs pay only the pool's
+    // own script (POOL_COINBASE_REWARD_DESCRIPTOR). An Sv2Tp template provider gives the pool
+    // no network, so the output is exported without an address.
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels(
+            "sv2_coinbase_output_info",
+            &[
+                ("script_hex", "0014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc"),
+                ("address", ""),
+            ],
+        ),
+        1.0,
+    );
+    assert_eq!(
+        pool_metrics
+            .lines()
+            .filter(|line| line.starts_with("sv2_coinbase_output_info{"))
+            .count(),
+        1,
+        "the witness commitment must not be exported as an output"
+    );
+    assert_metric_present(&pool_metrics, "sv2_monitoring_snapshot_age_seconds");
+
     shutdown_all!(pool);
 }
 

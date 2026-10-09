@@ -95,6 +95,7 @@ impl HandleTemplateDistributionMessagesFromServerOwnedAsync for ChannelManager {
                         };
                         active_job
                     };
+                    self.record_sent_coinbase_outputs(group_job.get_coinbase_outputs());
                     // If REQUIRES_STANDARD_JOBS is not set and the group channel is not
                     // empty we need to send the NewExtendedMiningJob message to the group
                     // channel.
@@ -146,6 +147,7 @@ impl HandleTemplateDistributionMessagesFromServerOwnedAsync for ChannelManager {
                             .get_active_job()
                             .expect("active job must exist")
                     };
+                    self.record_sent_coinbase_outputs(standard_job.get_coinbase_outputs());
                     downstream_messages.push(
                         (
                             downstream_id,

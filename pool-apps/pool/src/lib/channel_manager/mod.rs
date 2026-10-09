@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     net::SocketAddr,
     sync::{
         Arc,
@@ -20,10 +21,11 @@ use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
     stratum_core::{
-        bitcoin::{Amount, TxOut},
+        bitcoin::{Amount, Network, ScriptBuf, TxOut},
         channels_sv2::{
             Vardiff, VardiffState,
             extranonce_manager::{ExtranonceAllocator, bytes_needed},
+            outputs::deserialize_outputs,
             server::{extended::ExtendedChannel, group::GroupChannel, standard::StandardChannel},
         },
         handlers_sv2::{
@@ -35,6 +37,7 @@ use stratum_apps::{
     },
     sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
+    tp_type::{BitcoinNetwork, TemplateProviderType},
     utils::types::{ChannelId, DownstreamId, SharesPerMinute, VardiffKey},
 };
 use tokio::{net::TcpListener, select};
@@ -51,6 +54,45 @@ use crate::{
 
 mod mining_message_handler;
 mod template_distribution_message_handler;
+
+/// Upper bound on the distinct coinbase outputs remembered for monitoring. Clients choose their
+/// own payout script through `user_identity`, so the set is client-controlled: past the bound the
+/// pool stops growing it and reports an overflow marker instead.
+pub(crate) const MAX_SENT_COINBASE_OUTPUTS: usize = 256;
+
+/// Every coinbase output the pool has put in a job since start-up, reported to monitoring.
+///
+/// Kept for the life of the process instead of being read from the current jobs at refresh time:
+/// a job replaced within one refresh interval stays minable as a past job until the next
+/// prevhash, so a snapshot of the active jobs can miss an output clients can still find a block
+/// on.
+#[derive(Debug, Default)]
+#[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
+pub(crate) struct SentCoinbaseOutputs {
+    pub(crate) scripts: BTreeSet<ScriptBuf>,
+    /// Set once an output was not recorded because the bound was reached.
+    pub(crate) overflowed: bool,
+}
+
+impl SentCoinbaseOutputs {
+    /// Zero-value OP_RETURN outputs are skipped: they are commitments (such as the segwit witness
+    /// commitment), change with every template and pay nobody. Every other output is kept,
+    /// including an OP_RETURN that burns value.
+    pub(crate) fn record(&mut self, outputs: &[TxOut]) {
+        for output in outputs {
+            if output.script_pubkey.is_op_return() && output.value == Amount::ZERO {
+                continue;
+            }
+            if self.scripts.len() < MAX_SENT_COINBASE_OUTPUTS
+                || self.scripts.contains(&output.script_pubkey)
+            {
+                self.scripts.insert(output.script_pubkey.clone());
+            } else {
+                self.overflowed = true;
+            }
+        }
+    }
+}
 
 // Size of the static identifier for this pool server, placed at the start of the pool's
 // extranonce allocation. One byte covers up to 256 distinct pool servers.
@@ -114,6 +156,12 @@ pub struct ChannelManager {
     /// Past jobs retained per channel; `None` uses the `channels_sv2` default.
     max_past_jobs: Option<usize>,
     coinbase_reward_script: CoinbaseRewardScript,
+    /// Chain the template provider is on, used to render coinbase outputs as addresses for
+    /// monitoring. `None` when the template provider type does not say (Sv2Tp).
+    #[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
+    pub(crate) network: Option<Network>,
+    /// See [`SentCoinbaseOutputs`].
+    pub(crate) sent_coinbase_outputs: SharedLock<SentCoinbaseOutputs>,
     /// Protocol extensions that the pool supports (will accept if requested by clients).
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).
@@ -207,10 +255,25 @@ impl ChannelManager {
             max_past_jobs: config.max_past_jobs(),
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
+            network: match config.template_provider_type() {
+                TemplateProviderType::Sv2Tp { .. } => None,
+                TemplateProviderType::BitcoinCoreIpc { network, .. } => Some(match network {
+                    BitcoinNetwork::Mainnet => Network::Bitcoin,
+                    BitcoinNetwork::Testnet4 => Network::Testnet4,
+                    BitcoinNetwork::Signet => Network::Signet,
+                    BitcoinNetwork::Regtest => Network::Regtest,
+                }),
+            },
+            sent_coinbase_outputs: SharedLock::new(SentCoinbaseOutputs::default()),
             supported_extensions: config.supported_extensions().to_vec(),
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,
         };
+
+        // The loaded outputs keep the metric present before any client connects.
+        channel_manager.record_sent_coinbase_outputs(
+            &deserialize_outputs(channel_manager.coinbase_outputs.clone()).unwrap_or_default(),
+        );
 
         Ok(channel_manager)
     }
@@ -264,8 +327,19 @@ impl ChannelManager {
             error!(error = ?e, "Failed to set new prevhash for group channel");
             return Ok(None);
         }
+        if let Some(job) = group_channel.get_active_job() {
+            self.record_sent_coinbase_outputs(job.get_coinbase_outputs());
+        }
 
         Ok(Some(group_channel))
+    }
+
+    /// Records the coinbase outputs of a job the pool is about to send. Every call that creates a
+    /// job must pass the new job's outputs here, or monitoring will not see them.
+    pub(crate) fn record_sent_coinbase_outputs(&self, outputs: &[TxOut]) {
+        // Only this method takes the lock and it cannot panic while holding it, so the lock is
+        // never poisoned in practice.
+        let _ = self.sent_coinbase_outputs.with(|sent| sent.record(outputs));
     }
 
     /// Starts the downstream server, and accepts new connection request.
