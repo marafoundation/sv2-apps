@@ -20,7 +20,7 @@ pub mod snapshot_cache;
 pub mod sv1;
 
 pub use client::{
-    CoinbaseOutputInfo, ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
+    ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
     Sv2ClientsMonitoring, Sv2ClientsSummary,
 };
 pub use http_server::{
@@ -34,8 +34,8 @@ pub use miner_telemetry::{
     MinerTelemetryStatus, match_discovered_miners_to_downstreams_by_worker_and_port,
 };
 pub use server::{
-    ServerExtendedChannelInfo, ServerInfo, ServerMonitoring, ServerStandardChannelInfo,
-    ServerSummary,
+    CoinbaseOutputInfo, ServerExtendedChannelInfo, ServerInfo, ServerMonitoring,
+    ServerStandardChannelInfo, ServerSummary,
 };
 pub use snapshot_cache::{MonitoringSnapshot, SnapshotCache};
 pub use sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary};

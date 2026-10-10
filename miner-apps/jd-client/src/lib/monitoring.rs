@@ -15,8 +15,9 @@ use stratum_apps::{
             Sv2ClientsMonitoring,
         },
         match_discovered_miners_to_downstreams_by_worker_and_port,
-        server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+        server::{CoinbaseOutputInfo, ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
     },
+    stratum_core::channels_sv2::outputs::deserialize_outputs,
     utils::types::DownstreamId,
 };
 
@@ -32,6 +33,18 @@ const MINER_TELEMETRY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 impl ServerMonitoring for ChannelManager {
     fn get_server(&self) -> ServerInfo {
+        // The outputs JDC builds its jobs from: its configured reward script, or the outputs the
+        // JDS allocated with the last token.
+        let coinbase_outputs = CoinbaseOutputInfo::from_scripts(
+            self.coinbase_outputs
+                .get()
+                .ok()
+                .and_then(|outputs| deserialize_outputs(outputs).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|output| output.script_pubkey),
+            self.network,
+        );
         self.upstream_channel
             .with(|upstream_channel| {
                 let mut extended_channels = Vec::new();
@@ -72,11 +85,13 @@ impl ServerMonitoring for ChannelManager {
                 ServerInfo {
                     extended_channels,
                     standard_channels,
+                    coinbase_outputs: coinbase_outputs.clone(),
                 }
             })
             .unwrap_or_else(|_| ServerInfo {
                 extended_channels: Vec::new(),
                 standard_channels: Vec::new(),
+                coinbase_outputs,
             })
     }
 }

@@ -824,25 +824,25 @@ async fn handle_sv1_client_by_id(
 ///
 /// All GaugeVec metric values are updated atomically by the background cache refresh
 /// task in `SnapshotCache::refresh()`. This handler only needs to:
-/// 1. Set the uptime gauge (requires wall-clock time at scrape time)
+/// 1. Set the uptime and snapshot-age gauges (require wall-clock time at scrape time)
 /// 2. Gather and encode all registered metrics
 ///
 /// Because metric values are always kept in sync with the snapshot data, there is
 /// never a gap where label series momentarily disappear. Tests can assert on metrics
 /// directly after a cache refresh without polling for transient states.
 async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response {
-    // Uptime is the only metric set at scrape time (needs current wall clock)
+    // Uptime and snapshot age are the only metrics set at scrape time (need current time)
     let uptime_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
-    if let (Some(gauge), Some(age)) = (
-        &state.metrics.sv2_monitoring_snapshot_age_seconds,
-        state.cache.snapshot_age(),
-    ) {
-        gauge.set(age.as_secs_f64());
+    if let Some(refreshed) = state.cache.get_snapshot().timestamp {
+        state
+            .metrics
+            .sv2_monitoring_snapshot_age_seconds
+            .set(refreshed.elapsed().as_secs_f64());
     }
 
     // Gather and encode — all other metrics were set by the last cache refresh
@@ -1256,6 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn global_endpoint_with_data() {
         let server = Arc::new(MockServer(ServerInfo {
+            coinbase_outputs: vec![],
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![],
         }));
@@ -1296,6 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn server_endpoint_with_data() {
         let server = Arc::new(MockServer(ServerInfo {
+            coinbase_outputs: vec![],
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![create_server_standard_channel_info(2, Some(50.0))],
         }));
@@ -1317,6 +1319,7 @@ mod tests {
     #[tokio::test]
     async fn server_channels_endpoint_with_pagination() {
         let server = Arc::new(MockServer(ServerInfo {
+            coinbase_outputs: vec![],
             extended_channels: vec![
                 create_server_extended_channel_info(1, Some(100.0)),
                 create_server_extended_channel_info(2, Some(200.0)),
@@ -1350,6 +1353,7 @@ mod tests {
     #[tokio::test]
     async fn server_channels_endpoint_keeps_rejected_shares_total_compatible() {
         let server = Arc::new(MockServer(ServerInfo {
+            coinbase_outputs: vec![],
             extended_channels: vec![],
             standard_channels: vec![create_server_standard_channel_info(1, Some(50.0))],
         }));
@@ -1618,6 +1622,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_returns_prometheus_format() {
         let server = Arc::new(MockServer(ServerInfo {
+            coinbase_outputs: vec![],
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![],
         }));
@@ -1788,6 +1793,7 @@ mod tests {
         // Server channel with zero rejections.
         // Helper defaults for standard channel set shares_rejected=1; override to 0.
         let mut server_info = super::super::server::ServerInfo {
+            coinbase_outputs: vec![],
             extended_channels: vec![create_server_extended_channel_info(1, Some(100.0))],
             standard_channels: vec![create_server_standard_channel_info(2, Some(50.0))],
         };

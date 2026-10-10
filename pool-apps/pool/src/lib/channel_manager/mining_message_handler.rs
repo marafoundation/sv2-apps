@@ -310,7 +310,6 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 let future_standard_job = standard_channel
                     .get_future_job(future_standard_job_id)
                     .expect("future job must exist");
-                self.record_sent_coinbase_outputs(future_standard_job.get_coinbase_outputs());
                 let future_standard_job_message =
                     future_standard_job.get_job_message().clone();
 
@@ -598,7 +597,6 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     let future_extended_job = extended_channel
                         .get_future_job(future_extended_job_id)
                         .expect("future job must exist");
-                    self.record_sent_coinbase_outputs(future_extended_job.get_coinbase_outputs());
 
                     let future_extended_job_message =
                         future_extended_job.get_job_message().clone();
@@ -1398,10 +1396,6 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         let job_id = extended_channel
                             .on_set_custom_mining_job(msg_static.clone())
                             .map_err(|error| PoolError::disconnect(error, downstream_id))?;
-                        // The client declared these outputs; the new custom job is now active.
-                        if let Some(job) = extended_channel.get_active_job() {
-                            self.record_sent_coinbase_outputs(job.get_coinbase_outputs());
-                        }
 
                         let success = SetCustomMiningJobSuccessOwned {
                             channel_id: msg_static.channel_id,

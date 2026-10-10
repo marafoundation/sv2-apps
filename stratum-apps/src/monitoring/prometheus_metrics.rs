@@ -9,6 +9,7 @@ pub struct PrometheusMetrics {
     pub registry: Registry,
     // System metrics
     pub sv2_uptime_seconds: Gauge,
+    pub sv2_monitoring_snapshot_age_seconds: Gauge,
     // Server metrics (upstream connection)
     pub sv2_server_channels: Option<GaugeVec>,
     pub sv2_server_hashrate_total: Option<Gauge>,
@@ -16,6 +17,7 @@ pub struct PrometheusMetrics {
     pub sv2_server_shares_accepted_total: Option<GaugeVec>,
     pub sv2_server_shares_rejected_total: Option<GaugeVec>,
     pub sv2_server_blocks_found_total: Option<Gauge>,
+    pub sv2_coinbase_output_info: Option<GaugeVec>,
     // Clients metrics (downstream connections)
     pub sv2_clients_total: Option<Gauge>,
     pub sv2_client_channels: Option<GaugeVec>,
@@ -24,8 +26,6 @@ pub struct PrometheusMetrics {
     pub sv2_client_shares_accepted_total: Option<GaugeVec>,
     pub sv2_client_shares_rejected_total: Option<GaugeVec>,
     pub sv2_client_blocks_found_total: Option<Gauge>,
-    pub sv2_coinbase_output_info: Option<GaugeVec>,
-    pub sv2_monitoring_snapshot_age_seconds: Option<Gauge>,
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
@@ -42,6 +42,12 @@ impl PrometheusMetrics {
         // System metrics (always enabled)
         let sv2_uptime_seconds = Gauge::new("sv2_uptime_seconds", "Server uptime in seconds")?;
         registry.register(Box::new(sv2_uptime_seconds.clone()))?;
+        // Set at scrape time: every other metric keeps its last value if refreshes stop.
+        let sv2_monitoring_snapshot_age_seconds = Gauge::new(
+            "sv2_monitoring_snapshot_age_seconds",
+            "Seconds since the monitoring snapshot was last refreshed",
+        )?;
+        registry.register(Box::new(sv2_monitoring_snapshot_age_seconds.clone()))?;
 
         // Server metrics (upstream connection)
         let (
@@ -51,6 +57,7 @@ impl PrometheusMetrics {
             sv2_server_shares_accepted_total,
             sv2_server_shares_rejected_total,
             sv2_server_blocks_found_total,
+            sv2_coinbase_output_info,
         ) = if enable_server_metrics {
             let channels = GaugeVec::new(
                 Opts::new("sv2_server_channels", "Number of server channels by type"),
@@ -97,6 +104,15 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(blocks_found.clone()))?;
 
+            let coinbase_output_info = GaugeVec::new(
+                Opts::new(
+                    "sv2_coinbase_output_info",
+                    "Scripts paid by the coinbase outputs the app builds its jobs from (always 1)",
+                ),
+                &["script_hex", "address"],
+            )?;
+            registry.register(Box::new(coinbase_output_info.clone()))?;
+
             (
                 Some(channels),
                 Some(hashrate),
@@ -104,9 +120,10 @@ impl PrometheusMetrics {
                 Some(shares_accepted),
                 Some(shares_rejected),
                 Some(blocks_found),
+                Some(coinbase_output_info),
             )
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
 
         // Clients metrics (downstream connections)
@@ -118,8 +135,6 @@ impl PrometheusMetrics {
             sv2_client_shares_accepted_total,
             sv2_client_shares_rejected_total,
             sv2_client_blocks_found_total,
-            sv2_coinbase_output_info,
-            sv2_monitoring_snapshot_age_seconds,
         ) = if enable_clients_metrics {
             let clients_total =
                 Gauge::new("sv2_clients_total", "Total number of connected clients")?;
@@ -170,23 +185,6 @@ impl PrometheusMetrics {
             )?;
             registry.register(Box::new(blocks_found.clone()))?;
 
-            let coinbase_output_info = GaugeVec::new(
-                Opts::new(
-                    "sv2_coinbase_output_info",
-                    "Coinbase outputs in the jobs currently sent to clients (always 1)",
-                ),
-                &["script_hex", "address"],
-            )?;
-            registry.register(Box::new(coinbase_output_info.clone()))?;
-
-            // Set at scrape time, so a refresh that has stopped running is visible: every other
-            // client metric would keep serving its last value.
-            let snapshot_age = Gauge::new(
-                "sv2_monitoring_snapshot_age_seconds",
-                "Seconds since the snapshot behind the client metrics was refreshed",
-            )?;
-            registry.register(Box::new(snapshot_age.clone()))?;
-
             (
                 Some(clients_total),
                 Some(channels),
@@ -195,11 +193,9 @@ impl PrometheusMetrics {
                 Some(shares_accepted),
                 Some(shares_rejected),
                 Some(blocks_found),
-                Some(coinbase_output_info),
-                Some(snapshot_age),
             )
         } else {
-            (None, None, None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
 
         // SV1 metrics
@@ -218,12 +214,14 @@ impl PrometheusMetrics {
         Ok(Self {
             registry,
             sv2_uptime_seconds,
+            sv2_monitoring_snapshot_age_seconds,
             sv2_server_channels,
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
             sv2_server_shares_accepted_total,
             sv2_server_shares_rejected_total,
             sv2_server_blocks_found_total,
+            sv2_coinbase_output_info,
             sv2_clients_total,
             sv2_client_channels,
             sv2_client_hashrate_total,
@@ -231,8 +229,6 @@ impl PrometheusMetrics {
             sv2_client_shares_accepted_total,
             sv2_client_shares_rejected_total,
             sv2_client_blocks_found_total,
-            sv2_coinbase_output_info,
-            sv2_monitoring_snapshot_age_seconds,
             sv1_clients_total,
             sv1_hashrate_total,
         })
@@ -262,6 +258,7 @@ mod tests {
         assert!(m.sv2_server_channel_hashrate.is_some());
         assert!(m.sv2_server_shares_accepted_total.is_some());
         assert!(m.sv2_server_shares_rejected_total.is_some());
+        assert!(m.sv2_coinbase_output_info.is_some());
         // clients and sv1 should be None
         assert!(m.sv2_clients_total.is_none());
         assert!(m.sv1_clients_total.is_none());
@@ -276,8 +273,6 @@ mod tests {
         assert!(m.sv2_client_channel_hashrate.is_some());
         assert!(m.sv2_client_shares_accepted_total.is_some());
         assert!(m.sv2_client_shares_rejected_total.is_some());
-        assert!(m.sv2_coinbase_output_info.is_some());
-        assert!(m.sv2_monitoring_snapshot_age_seconds.is_some());
         // server and sv1 should be None
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv1_clients_total.is_none());
@@ -294,16 +289,19 @@ mod tests {
     }
 
     #[test]
-    fn all_metrics_disabled_only_uptime() {
+    fn all_metrics_disabled_only_system_metrics() {
         let m = PrometheusMetrics::new(false, false, false).unwrap();
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv2_clients_total.is_none());
         assert!(m.sv1_clients_total.is_none());
 
         let families = m.registry.gather();
-        // Only uptime should be registered (with default value 0)
-        assert_eq!(families.len(), 1);
-        assert_eq!(families[0].get_name(), "sv2_uptime_seconds");
+        // Only the system metrics should be registered (with default value 0)
+        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        assert_eq!(
+            names,
+            ["sv2_monitoring_snapshot_age_seconds", "sv2_uptime_seconds"]
+        );
     }
 
     #[test]
