@@ -102,6 +102,7 @@ pub enum TemplateProviderType {
 impl TemplateProviderType {
     /// The chain the template provider is on, if its config names it (`Sv2Tp` does not).
     pub fn network(&self) -> Option<stratum_core::bitcoin::Network> {
+        #[cfg(feature = "bitcoin-core-sv2")]
         use stratum_core::bitcoin::Network;
         match self {
             Self::Sv2Tp { .. } => None,

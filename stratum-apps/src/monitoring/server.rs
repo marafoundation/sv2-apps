@@ -91,7 +91,8 @@ pub struct ServerInfo {
     pub standard_channels: Vec<ServerStandardChannelInfo>,
     /// Scripts paid by the coinbase outputs this app builds its jobs from (the Pool's reward
     /// script and connected miners' payout modes, the JDC's coinbase outputs). Read from that
-    /// state, not from each job sent. Empty for apps that build no coinbase.
+    /// state, not from each job sent, so outputs in custom jobs declared by JD clients are not
+    /// included. Empty for apps that build no coinbase.
     pub coinbase_outputs: Vec<CoinbaseOutputInfo>,
 }
 
@@ -313,13 +314,24 @@ mod tests {
         );
         assert_eq!(outputs[1].script_hex, "6a0101");
 
-        let testnet = CoinbaseOutputInfo::from_scripts([p2wpkh.clone()], Some(Network::Testnet4));
-        assert!(testnet[0].address.starts_with("tb1q"));
-        let round_trip = Address::from_str(&testnet[0].address)
-            .unwrap()
-            .require_network(Network::Testnet4)
-            .unwrap();
-        assert_eq!(round_trip.script_pubkey(), p2wpkh);
+        // expected strings computed independently of rust-bitcoin (BIP173 reference encoder)
+        for (network, expected) in [
+            (
+                Network::Testnet4,
+                "tb1qar0srrr7xfkvy5l643lydnw9re59gtzzy00gkn",
+            ),
+            (
+                Network::Signet,
+                "tb1qar0srrr7xfkvy5l643lydnw9re59gtzzy00gkn",
+            ),
+            (
+                Network::Regtest,
+                "bcrt1qar0srrr7xfkvy5l643lydnw9re59gtzzxxk9p6",
+            ),
+        ] {
+            let outputs = CoinbaseOutputInfo::from_scripts([p2wpkh.clone()], Some(network));
+            assert_eq!(outputs[0].address, expected);
+        }
 
         let unknown = CoinbaseOutputInfo::from_scripts([p2wpkh.clone()], None);
         assert_eq!(unknown[0].address, "");

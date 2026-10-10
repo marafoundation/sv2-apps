@@ -12,6 +12,8 @@ use stratum_apps::{
     stratum_core::channels_sv2::outputs::deserialize_outputs,
 };
 
+use std::sync::atomic::Ordering;
+
 use crate::{channel_manager::ChannelManager, downstream::Downstream};
 
 /// Helper to convert a Downstream to Sv2ClientInfo.
@@ -120,7 +122,9 @@ impl Sv2ClientsMonitoring for ChannelManager {
 impl ServerMonitoring for ChannelManager {
     /// The scripts the pool's jobs pay: its loaded coinbase outputs, used for clients without a
     /// payout mode, and the outputs of each connected client's payout mode. This is the state
-    /// jobs are built from, not a record of each job sent.
+    /// jobs are built from, not a record of each job sent: outputs in custom jobs declared by JD
+    /// clients are not included, and a client whose channels use different payout modes reports
+    /// only the mode of its latest channel.
     fn get_server(&self) -> ServerInfo {
         let mut scripts: Vec<_> = deserialize_outputs(self.coinbase_outputs.clone())
             .unwrap_or_default()
@@ -128,6 +132,10 @@ impl ServerMonitoring for ChannelManager {
             .map(|output| output.script_pubkey)
             .collect();
         self.downstreams.for_each(|_, downstream| {
+            // the pool builds no jobs for these clients (see `handle_new_template`)
+            if downstream.requires_custom_work.load(Ordering::SeqCst) {
+                return;
+            }
             // a poisoned lock only drops this client's scripts from one refresh
             let _ = downstream.payout_mode.with(|payout_mode| {
                 if let Some(payout_mode) = payout_mode {

@@ -131,6 +131,59 @@ async fn pool_monitoring_with_sv2_mining_device() {
     shutdown_all!(pool);
 }
 
+// A miner whose user_identity donates 50% is paid by the pool's jobs: the pool exports both its
+// own script and the miner's.
+#[tokio::test]
+async fn pool_monitoring_exports_miner_payout_script() {
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool, pool_addr, pool_monitoring) =
+        start_pool(sv2_tp_config(tp_addr), vec![], vec![], true).await;
+    let (sniffer, sniffer_addr) = start_sniffer("B", pool_addr, false, vec![], None);
+    start_mining_device_sv2(
+        sniffer_addr,
+        None,
+        None,
+        Some("sri/donate/50/tb1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3apj6d3/worker".to_string()),
+        1,
+        None,
+        true,
+    );
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+
+    let pool_mon =
+        MonitoringApi::builder(pool_monitoring.expect("pool monitoring should be enabled")).build();
+    // Sv2Tp names no network, so both series carry an empty address.
+    let miner_output = Metric::with_labels(
+        "sv2_coinbase_output_info",
+        &[
+            ("script_hex", "00141111111111111111111111111111111111111111"),
+            ("address", ""),
+        ],
+    );
+    let pool_metrics = pool_mon
+        .poll_metric_gte(miner_output, 1.0, METRIC_POLL_TIMEOUT)
+        .await;
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels(
+            "sv2_coinbase_output_info",
+            &[
+                ("script_hex", "0014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc"),
+                ("address", ""),
+            ],
+        ),
+        1.0,
+    );
+
+    shutdown_all!(pool);
+}
+
 // Pool + tProxy + SV1 miner: Pool sees 1 SV2 client, tProxy sees 1 SV1 client and 1 upstream
 // channel.
 #[tokio::test]
