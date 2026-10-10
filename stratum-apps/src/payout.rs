@@ -469,10 +469,7 @@ impl fmt::Display for PayoutModeError {
                 write!(f, "invalid donation percentage: {percentage}")
             }
             Self::NotAllowed(mode) => {
-                write!(
-                    f,
-                    "payout mode `{mode}` is not allowed: only pool payouts are"
-                )
+                write!(f, "payout mode not allowed, only pool payouts are: {mode}")
             }
             Self::MissingMinerPayout {
                 user_identity,
@@ -886,10 +883,13 @@ mod tests {
             );
         }
         for allowed in [AllowedPayoutModes::Any, AllowedPayoutModes::PoolOnly] {
-            assert!(matches!(
-                allowed.check(PayoutMode::FullDonation),
-                Ok(PayoutMode::FullDonation)
-            ));
+            for identity in ["sri/donate", "sri/donate/worker"] {
+                let mode = PayoutMode::try_from(identity).unwrap();
+                assert!(
+                    matches!(allowed.check(mode), Ok(PayoutMode::FullDonation)),
+                    "{identity}"
+                );
+            }
         }
     }
 
@@ -996,9 +996,17 @@ mod tests {
         assert!(decode_declared_coinbase_tx(&short, &suffix).is_err());
         // garbage suffix
         assert!(decode_declared_coinbase_tx(&prefix, &[0xff; 3]).is_err());
-        // a 256 MiB scriptSig length is refused before anything is sized by it
-        let mut huge = prefix[..43].to_vec();
-        huge.extend_from_slice(&[0xfe, 0x00, 0x00, 0x00, 0x10]);
-        assert!(decode_declared_coinbase_tx(&huge, &suffix).is_err());
+        // a scriptSig length over 100 bytes, even 256 MiB, is refused before anything is sized
+        // by it
+        for len in [&[101][..], &[0xfe, 0x00, 0x00, 0x00, 0x10]] {
+            let mut long = prefix[..43].to_vec();
+            long.extend_from_slice(len);
+            assert_eq!(
+                decode_declared_coinbase_tx(&long, &suffix),
+                Err(PayoutValidationError::DecodeCoinbaseTransaction(
+                    "scriptSig is longer than 100 bytes".into()
+                ))
+            );
+        }
     }
 }
