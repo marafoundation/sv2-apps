@@ -11,21 +11,23 @@ use integration_tests_sv2::{
     template_provider::DifficultyLevel,
     *,
 };
-use pool_sv2::config::PayoutModes;
-use stratum_apps::stratum_core::{
-    binary_sv2::Seq064KOwned,
-    bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        absolute::LockTime,
-        consensus::{deserialize, serialize},
-        hashes::{Hash, sha256d},
-        script::Builder,
-        transaction::Version,
+use stratum_apps::{
+    payout::AllowedPayoutModes,
+    stratum_core::{
+        binary_sv2::Seq064KOwned,
+        bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+            absolute::LockTime,
+            consensus::{deserialize, serialize},
+            hashes::{Hash, sha256d},
+            script::Builder,
+            transaction::Version,
+        },
+        common_messages_sv2::{MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, Protocol},
+        job_declaration_sv2::*,
+        mining_sv2::*,
+        parsers_sv2::{AnyMessageOwned, JobDeclarationOwned, MiningOwned},
     },
-    common_messages_sv2::{MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, Protocol},
-    job_declaration_sv2::*,
-    mining_sv2::*,
-    parsers_sv2::{AnyMessageOwned, JobDeclarationOwned, MiningOwned},
 };
 
 use pool_sv2::{
@@ -44,7 +46,7 @@ use stratum_apps::{
 async fn start_pool_with_payout_modes(
     template_provider: TemplateProviderType,
     jds_address: Option<SocketAddr>,
-    payout_modes: PayoutModes,
+    payout_modes: AllowedPayoutModes,
 ) -> (PoolSv2, SocketAddr) {
     let pool_address = utils::get_available_address();
     let mut config = PoolConfig::new(
@@ -173,7 +175,7 @@ async fn open_both(
     [extended, standard]
 }
 
-async fn channel_replies(payout_modes: PayoutModes) -> Vec<(String, [Option<String>; 2])> {
+async fn channel_replies(payout_modes: AllowedPayoutModes) -> Vec<(String, [Option<String>; 2])> {
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let (pool, pool_addr) =
         start_pool_with_payout_modes(sv2_tp_config(tp_addr), None, payout_modes).await;
@@ -209,7 +211,7 @@ async fn channel_replies(payout_modes: PayoutModes) -> Vec<(String, [Option<Stri
 async fn pool_only_refuses_channels_whose_identity_pays_the_miner() {
     start_tracing();
     let refused = Some(ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY.to_string());
-    for (identity, reply) in channel_replies(PayoutModes::PoolOnly).await {
+    for (identity, reply) in channel_replies(AllowedPayoutModes::PoolOnly).await {
         let pays_pool = POOL_IDENTITIES.contains(&identity.as_str());
         let expected = if pays_pool { None } else { refused.clone() };
         assert_eq!(reply, [expected.clone(), expected], "{identity:?}");
@@ -219,7 +221,7 @@ async fn pool_only_refuses_channels_whose_identity_pays_the_miner() {
 #[tokio::test]
 async fn any_accepts_every_payout_identity() {
     start_tracing();
-    for (identity, reply) in channel_replies(PayoutModes::Any).await {
+    for (identity, reply) in channel_replies(AllowedPayoutModes::Any).await {
         assert_eq!(reply, [None, None], "{identity:?}");
     }
 }
@@ -339,7 +341,7 @@ fn pays_miner(sats: u64) -> TxOut {
 }
 
 /// Error codes for a declaration paying (pool only, pool and miner, miner only).
-async fn declaration_replies(payout_modes: PayoutModes) -> [Option<String>; 3] {
+async fn declaration_replies(payout_modes: AllowedPayoutModes) -> [Option<String>; 3] {
     let (tp, _tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let jds_addr = utils::get_available_address();
     let (pool, _pool_addr) = start_pool_with_payout_modes(
@@ -382,7 +384,8 @@ async fn declaration_replies(payout_modes: PayoutModes) -> [Option<String>; 3] {
 async fn pool_only_jds_refuses_declared_coinbases_that_pay_anyone_else() {
     start_tracing();
     let refused = Some(ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX.to_string());
-    let [pool_only, pool_and_miner, miner_only] = declaration_replies(PayoutModes::PoolOnly).await;
+    let [pool_only, pool_and_miner, miner_only] =
+        declaration_replies(AllowedPayoutModes::PoolOnly).await;
     assert_eq!(
         pool_only, None,
         "a coinbase paying only the pool is accepted"
@@ -396,7 +399,7 @@ async fn any_jds_does_not_check_who_a_declared_coinbase_pays() {
     start_tracing();
     // the same declarations pool_only refuses are accepted
     assert_eq!(
-        declaration_replies(PayoutModes::Any).await,
+        declaration_replies(AllowedPayoutModes::Any).await,
         [None, None, None]
     );
 }
@@ -415,7 +418,7 @@ async fn pool_only_accepts_a_jd_client_mining_for_the_pool() {
             None,
         ),
         Some(jds_addr),
-        PayoutModes::PoolOnly,
+        AllowedPayoutModes::PoolOnly,
     )
     .await;
     let (jdc_pool_sniffer, jdc_pool_sniffer_addr) =

@@ -17,7 +17,7 @@ name = "jd_server_sv2"
 path = "src/lib/mod.rs"
 
 [dependencies]
-stratum-apps = { version = "0.8.0", path = "../../stratum-apps", features = ["jd_server"] }
+stratum-apps = { version = "0.8.0", path = "../../stratum-apps", features = ["jd_server", "payout"] }
 async-channel = "1.5.1"
 serde = { version = "1.0.89", features = ["derive", "alloc"], default-features = false }
 tracing = { version = "0.1" }

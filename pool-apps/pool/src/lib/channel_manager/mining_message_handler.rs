@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::{convert::TryFrom, sync::atomic::Ordering};
 use stratum_apps::stratum_core::{
     mining_sv2::{
         CloseChannelOwned, OpenExtendedMiningChannelOwned, OpenExtendedMiningChannelSuccessOwned,
@@ -38,7 +38,7 @@ use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
 use crate::{
     channel_manager::{CLIENT_SEARCH_SPACE_BYTES, ChannelManager, RouteMessageTo},
     error::{self, PoolError, PoolErrorKind},
-    utils::{create_close_channel_msg, resolve_payout_mode},
+    utils::{PayoutMode, PayoutModeError, create_close_channel_msg},
 };
 
 fn extranonce_allocation_error_code(
@@ -165,10 +165,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     ));
                 };
 
-                let payout_mode = match resolve_payout_mode(&user_identity, self.payout_modes) {
+                let payout_mode = match PayoutMode::try_from(user_identity.as_str())
+                    .and_then(|mode| self.payout_modes.check(mode))
+                {
                     Ok(mode) => mode,
-                    Err(reason) => {
-                        error!("Invalid user_identity '{}': {}", user_identity, reason);
+                    Err(PayoutModeError::NoPayoutMode(_)) => PayoutMode::FullDonation,
+                    Err(e) => {
+                        error!("Invalid user_identity '{}': {}", user_identity, e);
                         let open_standard_mining_channel_error = OpenMiningChannelErrorOwned {
                             request_id,
                             error_code: ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY
@@ -434,10 +437,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     }
                 };
 
-                let payout_mode = match resolve_payout_mode(&user_identity, self.payout_modes) {
+                let payout_mode = match PayoutMode::try_from(user_identity.as_str())
+                    .and_then(|mode| self.payout_modes.check(mode))
+                {
                     Ok(mode) => mode,
-                    Err(reason) => {
-                        error!("Invalid user_identity '{}': {}", user_identity, reason);
+                    Err(PayoutModeError::NoPayoutMode(_)) => PayoutMode::FullDonation,
+                    Err(e) => {
+                        error!("Invalid user_identity '{}': {}", user_identity, e);
                         let open_extended_mining_channel_error = OpenMiningChannelErrorOwned {
                             request_id,
                             error_code: ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY

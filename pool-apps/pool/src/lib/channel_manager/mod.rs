@@ -19,6 +19,7 @@ use stratum_apps::{
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
+    payout::AllowedPayoutModes,
     stratum_core::{
         bitcoin::{Amount, TxOut},
         channels_sv2::{
@@ -43,7 +44,7 @@ use tracing::{debug, error, info, warn};
 use jd_server_sv2::job_declarator::JobDeclarator;
 
 use crate::{
-    config::{PayoutModes, PoolConfig},
+    config::PoolConfig,
     downstream::Downstream,
     error::{self, Action, LoopControl, PoolError, PoolErrorKind, PoolResult},
     utils::DownstreamMessage,
@@ -115,7 +116,7 @@ pub struct ChannelManager {
     max_past_jobs: Option<usize>,
     coinbase_reward_script: CoinbaseRewardScript,
     /// Which payout modes a channel's `user_identity` may select.
-    payout_modes: PayoutModes,
+    payout_modes: AllowedPayoutModes,
     /// Protocol extensions that the pool supports (will accept if requested by clients).
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).

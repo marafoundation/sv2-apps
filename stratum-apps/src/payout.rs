@@ -10,11 +10,118 @@ use std::fmt;
 
 use crate::{
     config_helpers::CoinbaseRewardScript,
-    stratum_core::bitcoin::{Amount, ScriptBuf, Transaction, TxOut, consensus::deserialize},
+    stratum_core::bitcoin::{
+        Amount, Script, ScriptBuf, Transaction, TxOut, VarInt,
+        consensus::{Decodable, deserialize},
+    },
 };
 
 // Legacy solo identities do not encode a fee policy, so allow at most a 10% service fee.
 const MIN_LEGACY_SOLO_PAYOUT_PERCENTAGE: u8 = 90;
+
+// Consensus limit on a coinbase scriptSig.
+const MAX_COINBASE_SCRIPT_SIG_LEN: u64 = 100;
+
+/// Which [`PayoutMode`]s a pool lets a `user_identity` select. Pool config key `payout_modes`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowedPayoutModes {
+    /// Every payout mode (default).
+    #[default]
+    Any,
+    /// Only [`PayoutMode::FullDonation`]: the whole reward goes to the pool. Solo, legacy solo and
+    /// donate identities are refused, and declared coinbases must pass
+    /// [`validate_pool_only_outputs`].
+    PoolOnly,
+}
+
+impl AllowedPayoutModes {
+    /// Returns `mode` if this setting allows it, so it chains after [`PayoutMode::try_from`].
+    pub fn check(self, mode: PayoutMode) -> Result<PayoutMode, PayoutModeError> {
+        if self == Self::PoolOnly && !matches!(mode, PayoutMode::FullDonation) {
+            return Err(PayoutModeError::NotAllowed(mode.to_string()));
+        }
+        Ok(mode)
+    }
+}
+
+/// Verifies that a coinbase pays only `pool_script`: every output pays it or is a zero-value
+/// OP_RETURN (a commitment), and at least one output pays it.
+///
+/// The total is not compared with the block reward, which the caller may not know: value left
+/// unclaimed pays nobody.
+pub fn validate_pool_only_outputs(
+    outputs: &[TxOut],
+    pool_script: &Script,
+) -> Result<(), PayoutValidationError> {
+    if let Some(index) = outputs.iter().position(|output| {
+        output.script_pubkey.as_script() != pool_script
+            && !(output.script_pubkey.is_op_return() && output.value == Amount::ZERO)
+    }) {
+        return Err(PayoutValidationError::NonPoolOutput(index));
+    }
+    if !outputs
+        .iter()
+        .any(|output| output.script_pubkey.as_script() == pool_script)
+    {
+        return Err(PayoutValidationError::NoSpendableOutputs);
+    }
+    Ok(())
+}
+
+/// Reassembles a coinbase from its SV2 split, `prefix | zeroed extranonce | suffix`, and decodes
+/// it.
+///
+/// The extranonce bytes are zero-filled because callers only need the transaction to decode and
+/// expose its outputs and input; the actual extranonce value does not affect them.
+pub fn decode_coinbase_tx_parts(
+    coinbase_tx_prefix: &[u8],
+    coinbase_tx_suffix: &[u8],
+    full_extranonce_size: usize,
+) -> Result<Transaction, PayoutValidationError> {
+    let mut coinbase = Vec::with_capacity(
+        coinbase_tx_prefix.len() + full_extranonce_size + coinbase_tx_suffix.len(),
+    );
+    coinbase.extend_from_slice(coinbase_tx_prefix);
+    coinbase.resize(coinbase.len() + full_extranonce_size, 0);
+    coinbase.extend_from_slice(coinbase_tx_suffix);
+
+    deserialize(&coinbase)
+        .map_err(|e| PayoutValidationError::DecodeCoinbaseTransaction(e.to_string()))
+}
+
+/// [`decode_coinbase_tx_parts`] for a split that does not carry the extranonce size, such as
+/// `DeclareMiningJob`'s: the prefix must end inside the scriptSig, and the extranonce fills the
+/// rest of the scriptSig length the prefix declares.
+///
+/// Rejects, without panicking or allocating by it, a prefix that is too short or ends past the
+/// scriptSig, and a scriptSig length over the consensus limit of 100 bytes.
+pub fn decode_declared_coinbase_tx(
+    coinbase_tx_prefix: &[u8],
+    coinbase_tx_suffix: &[u8],
+) -> Result<Transaction, PayoutValidationError> {
+    let invalid = |reason: &str| PayoutValidationError::DecodeCoinbaseTransaction(reason.into());
+    // version(4) [+ segwit marker and flag(2)] + input count(1) + outpoint(36)
+    let script_sig_len_offset = if coinbase_tx_prefix.get(4..6) == Some(&[0, 1]) {
+        43
+    } else {
+        41
+    };
+    let mut script_sig = coinbase_tx_prefix
+        .get(script_sig_len_offset..)
+        .ok_or_else(|| invalid("prefix ends before the scriptSig length"))?;
+    let script_sig_len = VarInt::consensus_decode(&mut script_sig)
+        .map_err(|e| PayoutValidationError::DecodeCoinbaseTransaction(e.to_string()))?
+        .0;
+    if script_sig_len > MAX_COINBASE_SCRIPT_SIG_LEN {
+        return Err(invalid("scriptSig is longer than 100 bytes"));
+    }
+    // `script_sig` now holds the scriptSig bytes already in the prefix.
+    let full_extranonce_size = (script_sig_len as usize)
+        .checked_sub(script_sig.len())
+        .ok_or_else(|| invalid("prefix ends past the scriptSig"))?;
+    decode_coinbase_tx_parts(coinbase_tx_prefix, coinbase_tx_suffix, full_extranonce_size)
+}
 
 /// Represents the payout mode encoded by a mining `user_identity`.
 ///
@@ -172,28 +279,16 @@ impl PayoutMode {
     ///
     /// The SV2 split only guarantees that `coinbase_tx_suffix` is the part after the full
     /// extranonce. The suffix can still contain remaining coinbase scriptSig bytes before the input
-    /// sequence, so this reconstructs and deserializes the full transaction before checking
-    /// outputs.
-    ///
-    /// The extranonce bytes are zero-filled because payout verification only needs the transaction
-    /// to decode and expose its outputs; the actual extranonce value does not affect the output
-    /// set.
+    /// sequence, so this reconstructs and deserializes the full transaction (see
+    /// [`decode_coinbase_tx_parts`]) before checking outputs.
     pub fn validate_coinbase_tx_parts(
         &self,
         coinbase_tx_prefix: &[u8],
         coinbase_tx_suffix: &[u8],
         full_extranonce_size: usize,
     ) -> Result<(), PayoutValidationError> {
-        let mut coinbase = Vec::with_capacity(
-            coinbase_tx_prefix.len() + full_extranonce_size + coinbase_tx_suffix.len(),
-        );
-        coinbase.extend_from_slice(coinbase_tx_prefix);
-        coinbase.resize(coinbase.len() + full_extranonce_size, 0);
-        coinbase.extend_from_slice(coinbase_tx_suffix);
-
-        let coinbase: Transaction = deserialize(&coinbase)
-            .map_err(|e| PayoutValidationError::DecodeCoinbaseTransaction(e.to_string()))?;
-
+        let coinbase =
+            decode_coinbase_tx_parts(coinbase_tx_prefix, coinbase_tx_suffix, full_extranonce_size)?;
         self.validate_coinbase_outputs(&coinbase.output)
     }
 
@@ -334,6 +429,8 @@ pub enum PayoutModeError {
     InvalidPayoutAddress { address: String, error: String },
     /// Donation percentage was not an integer in the supported 1..100 range.
     InvalidDonationPercentage(String),
+    /// The payout mode is valid but [`AllowedPayoutModes`] refuses it.
+    NotAllowed(String),
     /// Payout verification was requested but no miner payout address is present.
     MissingMinerPayout {
         user_identity: String,
@@ -370,6 +467,12 @@ impl fmt::Display for PayoutModeError {
             }
             Self::InvalidDonationPercentage(percentage) => {
                 write!(f, "invalid donation percentage: {percentage}")
+            }
+            Self::NotAllowed(mode) => {
+                write!(
+                    f,
+                    "payout mode `{mode}` is not allowed: only pool payouts are"
+                )
             }
             Self::MissingMinerPayout {
                 user_identity,
@@ -411,6 +514,8 @@ pub enum PayoutValidationError {
     },
     /// Failed to decode the reconstructed coinbase transaction.
     DecodeCoinbaseTransaction(String),
+    /// The output at this index pays a script other than the pool's.
+    NonPoolOutput(usize),
 }
 
 impl fmt::Display for PayoutValidationError {
@@ -429,6 +534,12 @@ impl fmt::Display for PayoutValidationError {
             ),
             Self::DecodeCoinbaseTransaction(e) => {
                 write!(f, "failed to decode coinbase transaction: {e}")
+            }
+            Self::NonPoolOutput(index) => {
+                write!(
+                    f,
+                    "coinbase output {index} pays a script other than the pool's"
+                )
             }
         }
     }
@@ -753,5 +864,141 @@ mod tests {
         expected
             .validate_coinbase_tx_parts(&prefix, &suffix, FULL_EXTRANONCE_SIZE)
             .unwrap();
+    }
+
+    #[test]
+    fn pool_only_allows_only_full_donation() {
+        let solo = format!("sri/solo/{MINER_ADDRESS}/worker");
+        let legacy = format!("{MINER_ADDRESS}.worker");
+        let donate = format!("sri/donate/10/{MINER_ADDRESS}/worker");
+        for identity in [solo.as_str(), MINER_ADDRESS, &legacy, &donate] {
+            let mode = PayoutMode::try_from(identity).unwrap();
+            assert!(
+                AllowedPayoutModes::Any.check(mode.clone()).is_ok(),
+                "{identity}"
+            );
+            assert!(
+                matches!(
+                    AllowedPayoutModes::PoolOnly.check(mode),
+                    Err(PayoutModeError::NotAllowed(_))
+                ),
+                "{identity}"
+            );
+        }
+        for allowed in [AllowedPayoutModes::Any, AllowedPayoutModes::PoolOnly] {
+            assert!(matches!(
+                allowed.check(PayoutMode::FullDonation),
+                Ok(PayoutMode::FullDonation)
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_pool_only_outputs() {
+        let pool = script_from_address(OTHER_ADDRESS).unwrap().script_pubkey();
+        let commitment = |sats| TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: ScriptBuf::new_op_return([0xaa; 36]),
+        };
+        let pays = |sats, address| tx_out(sats, address);
+        for outputs in [
+            vec![pays(1_000, OTHER_ADDRESS)],
+            vec![pays(1_000, OTHER_ADDRESS), commitment(0)],
+            vec![pays(600, OTHER_ADDRESS), pays(400, OTHER_ADDRESS)],
+        ] {
+            validate_pool_only_outputs(&outputs, &pool).unwrap();
+        }
+        for (outputs, expected) in [
+            (
+                vec![pays(900, OTHER_ADDRESS), pays(100, MINER_ADDRESS)],
+                PayoutValidationError::NonPoolOutput(1),
+            ),
+            (
+                vec![pays(1_000, MINER_ADDRESS), commitment(0)],
+                PayoutValidationError::NonPoolOutput(0),
+            ),
+            (
+                vec![pays(1_000, OTHER_ADDRESS), pays(0, MINER_ADDRESS)],
+                PayoutValidationError::NonPoolOutput(1),
+            ),
+            (
+                vec![pays(1_000, OTHER_ADDRESS), commitment(1)],
+                PayoutValidationError::NonPoolOutput(1),
+            ),
+            (
+                vec![commitment(0)],
+                PayoutValidationError::NoSpendableOutputs,
+            ),
+            (vec![], PayoutValidationError::NoSpendableOutputs),
+        ] {
+            assert_eq!(
+                validate_pool_only_outputs(&outputs, &pool),
+                Err(expected),
+                "{outputs:?}"
+            );
+        }
+    }
+
+    /// Splits `tx` as a `DeclareMiningJob` does: the last `FULL_EXTRANONCE_SIZE` scriptSig bytes
+    /// are left out of both parts.
+    fn declared_parts(tx: &Transaction) -> (Vec<u8>, Vec<u8>) {
+        let bytes = serialize(tx);
+        let script_sig = tx.input[0].script_sig.as_bytes();
+        let script_sig_end = bytes
+            .windows(script_sig.len())
+            .position(|w| w == script_sig)
+            .unwrap()
+            + script_sig.len();
+        (
+            bytes[..script_sig_end - FULL_EXTRANONCE_SIZE].to_vec(),
+            bytes[script_sig_end..].to_vec(),
+        )
+    }
+
+    fn coinbase(witness: bool) -> Transaction {
+        use crate::stratum_core::bitcoin::{
+            OutPoint, Sequence, TxIn, Witness, absolute::LockTime, transaction::Version,
+        };
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x03, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0]),
+                sequence: Sequence::MAX,
+                witness: if witness {
+                    Witness::from_slice(&[[0u8; 32]])
+                } else {
+                    Witness::new()
+                },
+            }],
+            output: vec![tx_out(1_000, OTHER_ADDRESS)],
+        }
+    }
+
+    #[test]
+    fn decodes_declared_coinbase() {
+        for witness in [true, false] {
+            let tx = coinbase(witness);
+            let (prefix, suffix) = declared_parts(&tx);
+            assert_eq!(decode_declared_coinbase_tx(&prefix, &suffix).unwrap(), tx);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_declared_coinbase_without_panicking() {
+        let (prefix, suffix) = declared_parts(&coinbase(true));
+        // shorter than the fixed fields before the scriptSig length
+        assert!(decode_declared_coinbase_tx(&prefix[..20], &suffix).is_err());
+        // scriptSig length smaller than its bytes already in the prefix
+        let mut short = prefix.clone();
+        short[43] = 1;
+        assert!(decode_declared_coinbase_tx(&short, &suffix).is_err());
+        // garbage suffix
+        assert!(decode_declared_coinbase_tx(&prefix, &[0xff; 3]).is_err());
+        // a 256 MiB scriptSig length is refused before anything is sized by it
+        let mut huge = prefix[..43].to_vec();
+        huge.extend_from_slice(&[0xfe, 0x00, 0x00, 0x00, 0x10]);
+        assert!(decode_declared_coinbase_tx(&huge, &suffix).is_err());
     }
 }

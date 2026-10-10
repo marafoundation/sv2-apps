@@ -1,13 +1,11 @@
 use crate::{
     error,
     error::JDSError,
-    job_declarator::{
-        JobDeclarator, job_validation::DeclareMiningJobResult,
-        pool_only_payouts::coinbase_pays_only,
-    },
+    job_declarator::{JobDeclarator, job_validation::DeclareMiningJobResult},
 };
 use std::time::Instant;
 use stratum_apps::{
+    payout::{AllowedPayoutModes, decode_declared_coinbase_tx, validate_pool_only_outputs},
     stratum_core::{
         bitcoin::{Amount, TxOut, Wtxid, consensus, hashes::Hash},
         handlers_sv2::HandleJobDeclarationMessagesFromClientOwnedAsync,
@@ -183,23 +181,30 @@ impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
 
         // A declaration that misses transactions is stored and re-validated as this same `msg`
         // (see handle_provide_missing_transactions_success), so checking here covers it.
-        let pays_only_pool = !self.pool_only_payouts
-            || coinbase_pays_only(
+        let pool_only = match self.payout_modes {
+            AllowedPayoutModes::Any => Ok(()),
+            AllowedPayoutModes::PoolOnly => decode_declared_coinbase_tx(
                 msg.coinbase_tx_prefix.as_bytes(),
                 msg.coinbase_tx_suffix.as_bytes(),
-                &self.coinbase_reward_script.script_pubkey(),
-            );
-        let result = if pays_only_pool {
-            self.job_validator
-                .handle_declare_mining_job(client_id, msg.clone(), None)
-                .await
-        } else {
-            warn!(
-                client_id,
-                request_id = msg.request_id,
-                "Refusing DeclareMiningJob: its coinbase pays a script other than the pool's"
-            );
-            DeclareMiningJobResult::Error(ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX)
+            )
+            .and_then(|tx| {
+                validate_pool_only_outputs(&tx.output, &self.coinbase_reward_script.script_pubkey())
+            }),
+        };
+        let result = match pool_only {
+            Ok(()) => {
+                self.job_validator
+                    .handle_declare_mining_job(client_id, msg.clone(), None)
+                    .await
+            }
+            Err(e) => {
+                warn!(
+                    client_id,
+                    request_id = msg.request_id,
+                    "Refusing DeclareMiningJob: {e}"
+                );
+                DeclareMiningJobResult::Error(ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX)
+            }
         };
 
         // validate job
