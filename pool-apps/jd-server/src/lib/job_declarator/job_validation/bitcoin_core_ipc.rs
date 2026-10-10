@@ -21,12 +21,11 @@ use stratum_apps::{
             io::{JdRequest, JdResponse, ValidationContext},
         },
     },
+    payout::decode_declared_coinbase_tx,
     stratum_core::{
         bitcoin::{
-            self, BlockHash, CompactTarget, Transaction, TxMerkleNode, Txid, Wtxid,
-            block::Version,
-            consensus::{Decodable, Encodable},
-            hashes::Hash,
+            self, BlockHash, CompactTarget, Transaction, TxMerkleNode, Txid, Wtxid, block::Version,
+            consensus::Encodable, hashes::Hash,
         },
         job_declaration_sv2::{
             DeclareMiningJobOwned, ERROR_CODE_DECLARE_MINING_JOB_INTERNAL_ERROR,
@@ -159,58 +158,17 @@ impl DeclaredCustomJob {
         self.validation_context.prev_hash
     }
 
-    /// Reconstructs the declared coinbase transaction by concatenating prefix, extranonce (zeros),
-    /// and suffix.
-    ///
-    /// The extranonce size is calculated from the scriptSig size in the coinbase_tx_prefix
+    /// Reconstructs the declared coinbase transaction (see
+    /// [`stratum_apps::payout::decode_declared_coinbase_tx`]).
     ///
     /// Error type is () because we don't need extra granularity for error_code =
     /// "invalid-coinbase-tx"
     fn get_coinbase_tx(&self) -> Result<Transaction, ()> {
-        let declared_coinbase_tx_prefix: Vec<u8> =
-            self.declare_mining_job.coinbase_tx_prefix.to_owned_bytes();
-        let declared_coinbase_tx_suffix: Vec<u8> =
-            self.declare_mining_job.coinbase_tx_suffix.to_owned_bytes();
-
-        // Parse scriptSig size from coinbase prefix
-        // Coinbase structure: version(4) + marker+flag(2) + input_count(1) + outpoint(32) +
-        // index(4) = 43 bytes Then comes scriptSig length (VarInt) followed by scriptSig
-        // data
-        const COINBASE_PREFIX_LEN: usize = 43;
-        let script_sig_size: usize = {
-            let mut cursor = &declared_coinbase_tx_prefix[COINBASE_PREFIX_LEN..];
-            match bitcoin::VarInt::consensus_decode(&mut cursor) {
-                Ok(varint) => varint.0 as usize,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to decode scriptSig size from coinbase prefix: {}",
-                        e
-                    );
-                    return Err(());
-                }
-            }
-        };
-
-        // Calculate the size of scriptSig bytes already in the prefix.
-        let varint_size = bitcoin::VarInt(script_sig_size as u64).size();
-        let script_sig_offset = COINBASE_PREFIX_LEN + varint_size;
-        let script_sig_bytes_in_prefix = declared_coinbase_tx_prefix.len() - script_sig_offset;
-
-        // The full extranonce fills the remaining space in scriptSig
-        let full_extranonce_size: usize = script_sig_size - script_sig_bytes_in_prefix;
-
-        // Concatenate prefix + full extranonce (zeros) + suffix to form the complete transaction
-        // bytes
-        let mut declared_coinbase_tx = declared_coinbase_tx_prefix;
-        declared_coinbase_tx.extend_from_slice(&vec![0; full_extranonce_size]);
-        declared_coinbase_tx.extend_from_slice(&declared_coinbase_tx_suffix);
-
-        // Deserialize the transaction
-        bitcoin::consensus::Decodable::consensus_decode(&mut &declared_coinbase_tx[..]).map_err(
-            |e| {
-                tracing::error!("Failed to deserialize declared coinbase transaction: {}", e);
-            },
+        decode_declared_coinbase_tx(
+            self.declare_mining_job.coinbase_tx_prefix.as_bytes(),
+            self.declare_mining_job.coinbase_tx_suffix.as_bytes(),
         )
+        .map_err(|e| tracing::error!("Invalid declared coinbase transaction: {e}"))
     }
 
     /// Computes the coinbase merkle branch in the txid merkle tree.

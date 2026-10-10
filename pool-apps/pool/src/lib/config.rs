@@ -17,6 +17,7 @@ pub use jd_server_sv2::config::{JDSConfig, JDSPartialConfig};
 use stratum_apps::{
     config_helpers::{CoinbaseRewardScript, opt_path_from_toml},
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
+    payout::AllowedPayoutModes,
     stratum_core::bitcoin::{Amount, TxOut},
     tp_type::TemplateProviderType,
     utils::types::{SharesBatchSize, SharesPerMinute},
@@ -60,22 +61,9 @@ pub struct PoolConfig {
     /// `SetCustomMiningJob` retires the active job, so the rate is the client's, not this pool's.
     #[serde(default)]
     max_past_jobs: Option<usize>,
+    /// Which payout modes a `user_identity` may select; `pool_only` also binds the embedded JDS.
     #[serde(default)]
-    payout_modes: PayoutModes,
-}
-
-/// Which payout modes a `user_identity` may select (see [`stratum_apps::payout::PayoutMode`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PayoutModes {
-    /// Every payout mode: solo, legacy solo, donate and full donation.
-    #[default]
-    Any,
-    /// Only identities that pay the whole reward to `coinbase_reward_script`: one with no payout
-    /// mode, or `sri/donate[/<worker>]`. Opening a channel with a solo, legacy solo or donate
-    /// identity is refused with `invalid-user-identity`, and the embedded JDS refuses declared
-    /// coinbases that pay any other script.
-    PoolOnly,
+    payout_modes: AllowedPayoutModes,
 }
 
 impl PoolConfig {
@@ -110,7 +98,7 @@ impl PoolConfig {
             shares_per_minute,
             share_batch_size,
             max_past_jobs: None,
-            payout_modes: PayoutModes::default(),
+            payout_modes: AllowedPayoutModes::default(),
             log_file: None,
             server_id,
             supported_extensions,
@@ -127,12 +115,12 @@ impl PoolConfig {
     }
 
     /// Returns which payout modes a `user_identity` may select.
-    pub fn payout_modes(&self) -> PayoutModes {
+    pub fn payout_modes(&self) -> AllowedPayoutModes {
         self.payout_modes
     }
 
     /// Sets which payout modes a `user_identity` may select.
-    pub fn set_payout_modes(&mut self, payout_modes: PayoutModes) {
+    pub fn set_payout_modes(&mut self, payout_modes: AllowedPayoutModes) {
         self.payout_modes = payout_modes;
     }
 
@@ -355,15 +343,15 @@ address = "127.0.0.1:8442"
         // Absent keeps upstream behaviour; a deployment opts in.
         assert_eq!(
             load_with("", "payout-absent").payout_modes(),
-            PayoutModes::Any
+            AllowedPayoutModes::Any
         );
         assert_eq!(
             load_with("payout_modes = \"any\"", "payout-any").payout_modes(),
-            PayoutModes::Any
+            AllowedPayoutModes::Any
         );
         assert_eq!(
             load_with("payout_modes = \"pool_only\"", "payout-pool-only").payout_modes(),
-            PayoutModes::PoolOnly
+            AllowedPayoutModes::PoolOnly
         );
     }
 
