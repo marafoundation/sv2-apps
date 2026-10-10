@@ -23,7 +23,7 @@ use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
     stratum_core::{
-        bitcoin::{Amount, Target, TxOut},
+        bitcoin::{Amount, Network, Target, TxOut},
         channels_sv2::{
             Vardiff, VardiffState,
             client::extended::ExtendedChannel,
@@ -298,6 +298,10 @@ pub struct ChannelManager {
     /// validated again and propagated upstream.
     pub cached_shares: SharedMap<TemplateId, BinaryHeap<SharesOrderedByDiff>>,
     miner_tag_string: String,
+    /// Chain the template provider is on, for rendering coinbase output scripts as addresses
+    /// in monitoring. `None` when the template provider config does not name it (Sv2Tp).
+    #[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
+    pub(crate) network: Option<Network>,
     share_batch_size: SharesBatchSize,
     shares_per_minute: SharesPerMinute,
     /// Past jobs retained per channel; `None` uses the `channels_sv2` default.
@@ -446,6 +450,7 @@ impl ChannelManager {
             shares_per_minute: config.shares_per_minute(),
             max_past_jobs: config.max_past_jobs(),
             miner_tag_string: config.jdc_signature().to_string(),
+            network: config.template_provider_type().network(),
             user_identity: Arc::new(OnceLock::new()),
             reserved_downstream_rollable_extranonce_size: config
                 .reserved_downstream_rollable_extranonce_size(),
