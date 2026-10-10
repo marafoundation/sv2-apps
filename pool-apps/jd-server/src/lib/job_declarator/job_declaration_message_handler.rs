@@ -5,12 +5,14 @@ use crate::{
 };
 use std::time::Instant;
 use stratum_apps::{
+    payout::{AllowedPayoutModes, decode_declared_coinbase_tx, validate_pool_only_outputs},
     stratum_core::{
         bitcoin::{Amount, TxOut, Wtxid, consensus, hashes::Hash},
         handlers_sv2::HandleJobDeclarationMessagesFromClientOwnedAsync,
         job_declaration_sv2::{
             AllocateMiningJobTokenOwned, AllocateMiningJobTokenSuccessOwned,
             DeclareMiningJobErrorOwned, DeclareMiningJobOwned, DeclareMiningJobSuccessOwned,
+            ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_MINING_JOB_TOKEN,
             ERROR_CODE_DECLARE_MINING_JOB_MISSING_TXS, ProvideMissingTransactionsOwned,
             ProvideMissingTransactionsSuccessOwned, PushSolutionOwned,
@@ -19,7 +21,7 @@ use stratum_apps::{
     },
     utils::types::JdToken,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
@@ -177,12 +179,36 @@ impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
             return Ok(());
         }
 
+        // A declaration that misses transactions is stored and re-validated as this same `msg`
+        // (see handle_provide_missing_transactions_success), so checking here covers it.
+        let pool_only = match self.payout_modes {
+            AllowedPayoutModes::Any => Ok(()),
+            AllowedPayoutModes::PoolOnly => decode_declared_coinbase_tx(
+                msg.coinbase_tx_prefix.as_bytes(),
+                msg.coinbase_tx_suffix.as_bytes(),
+            )
+            .and_then(|tx| {
+                validate_pool_only_outputs(&tx.output, &self.coinbase_reward_script.script_pubkey())
+            }),
+        };
+        let result = match pool_only {
+            Ok(()) => {
+                self.job_validator
+                    .handle_declare_mining_job(client_id, msg.clone(), None)
+                    .await
+            }
+            Err(e) => {
+                warn!(
+                    client_id,
+                    request_id = msg.request_id,
+                    "Refusing DeclareMiningJob: {e}"
+                );
+                DeclareMiningJobResult::Error(ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX)
+            }
+        };
+
         // validate job
-        let response = match self
-            .job_validator
-            .handle_declare_mining_job(client_id, msg.clone(), None)
-            .await
-        {
+        let response = match result {
             // if job is valid, activate token and return DeclareMiningJobSuccess
             DeclareMiningJobResult::Success => {
                 match self.token_manager.activate(token, client_id) {

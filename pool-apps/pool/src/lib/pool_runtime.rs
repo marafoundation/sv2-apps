@@ -296,7 +296,7 @@ impl PoolRuntime<IoReady> {
             )
             .await
             {
-                Ok(jd) => jd,
+                Ok(jd) => jd.with_payout_modes(self.pool.config.payout_modes()),
                 Err(err) => return Err((PoolErrorKind::Jds(err), self)),
             };
 
