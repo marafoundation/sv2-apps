@@ -105,6 +105,8 @@ impl ServerMonitoring for ChannelManager {
         ServerInfo {
             extended_channels,
             standard_channels,
+            // the translator builds no coinbase
+            coinbase_outputs: vec![],
         }
     }
 }

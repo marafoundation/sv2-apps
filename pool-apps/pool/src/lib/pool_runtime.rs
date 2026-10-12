@@ -528,7 +528,8 @@ impl PoolRuntime<ChannelManagerReady> {
 
             let monitoring_server = match stratum_apps::monitoring::MonitoringServer::new(
                 monitoring_addr,
-                None, // Pool doesn't have channels opened with servers
+                // No upstream channels; reports the coinbase outputs the pool builds jobs from
+                Some(Arc::new(self.state.channel_manager.clone())),
                 Some(Arc::new(self.state.channel_manager.clone())), // channels opened with clients
                 std::time::Duration::from_secs(
                     self.pool

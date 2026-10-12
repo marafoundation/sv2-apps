@@ -1,11 +1,18 @@
 //! Monitoring integration for Pool
 //!
-//! This module implements the Sv2ClientsMonitoring trait on `ChannelManager`.
-//! Pool only has clients (miners connecting to it), no upstream server.
+//! This module implements the Sv2ClientsMonitoring and ServerMonitoring traits on
+//! `ChannelManager`. Pool has clients (miners connecting to it) but no upstream server, so its
+//! `ServerInfo` has no channels and only reports the coinbase outputs the pool pays.
 
-use stratum_apps::monitoring::client::{
-    ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientsMonitoring,
+use stratum_apps::{
+    monitoring::{
+        client::{ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientsMonitoring},
+        server::{CoinbaseOutputInfo, ServerInfo, ServerMonitoring},
+    },
+    stratum_core::channels_sv2::outputs::deserialize_outputs,
 };
+
+use std::sync::atomic::Ordering;
 
 use crate::{channel_manager::ChannelManager, downstream::Downstream};
 
@@ -109,5 +116,39 @@ impl Sv2ClientsMonitoring for ChannelManager {
         self.downstreams.with(&client_id, |downstream| {
             downstream_to_sv2_client_info(downstream)
         })?
+    }
+}
+
+impl ServerMonitoring for ChannelManager {
+    /// The scripts the pool's jobs pay: its loaded coinbase outputs, used for clients without a
+    /// payout mode, and the outputs of each connected client's payout mode. This is the state
+    /// jobs are built from, not a record of each job sent: outputs in custom jobs declared by JD
+    /// clients are not included, and a client whose channels use different payout modes reports
+    /// only the mode of its latest channel.
+    fn get_server(&self) -> ServerInfo {
+        let mut scripts: Vec<_> = deserialize_outputs(self.coinbase_outputs.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|output| output.script_pubkey)
+            .collect();
+        self.downstreams.for_each(|_, downstream| {
+            // the pool builds no jobs for these clients (see `handle_new_template`)
+            if downstream.requires_custom_work.load(Ordering::SeqCst) {
+                return;
+            }
+            // a poisoned lock only drops this client's scripts from one refresh
+            let _ = downstream.payout_mode.with(|payout_mode| {
+                if let Some(payout_mode) = payout_mode {
+                    // the value is irrelevant: only the scripts are reported
+                    let outputs = payout_mode.coinbase_outputs(0, &self.coinbase_reward_script);
+                    scripts.extend(outputs.into_iter().map(|output| output.script_pubkey));
+                }
+            });
+        });
+        ServerInfo {
+            extended_channels: vec![],
+            standard_channels: vec![],
+            coinbase_outputs: CoinbaseOutputInfo::from_scripts(scripts, self.network),
+        }
     }
 }
