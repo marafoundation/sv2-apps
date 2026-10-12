@@ -165,14 +165,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     ));
                 };
 
-                let payout_mode = match PayoutMode::try_from(user_identity.as_str()) {
+                let payout_mode = match PayoutMode::try_from(user_identity.as_str())
+                    .and_then(|mode| self.payout_modes.check(mode))
+                {
                     Ok(mode) => mode,
                     Err(PayoutModeError::NoPayoutMode(_)) => PayoutMode::FullDonation,
-                    Err(_) => {
-                        error!(
-                            "Invalid user_identity '{}': does not match any supported identity format",
-                            user_identity
-                        );
+                    Err(e) => {
+                        error!("Invalid user_identity '{}': {}", user_identity, e);
                         let open_standard_mining_channel_error = OpenMiningChannelErrorOwned {
                             request_id,
                             error_code: ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY
@@ -438,14 +437,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     }
                 };
 
-                let payout_mode = match PayoutMode::try_from(user_identity.as_str()) {
+                let payout_mode = match PayoutMode::try_from(user_identity.as_str())
+                    .and_then(|mode| self.payout_modes.check(mode))
+                {
                     Ok(mode) => mode,
                     Err(PayoutModeError::NoPayoutMode(_)) => PayoutMode::FullDonation,
-                    Err(_) => {
-                        error!(
-                            "Invalid user_identity '{}': does not match any supported identity format",
-                            user_identity
-                        );
+                    Err(e) => {
+                        error!("Invalid user_identity '{}': {}", user_identity, e);
                         let open_extended_mining_channel_error = OpenMiningChannelErrorOwned {
                             request_id,
                             error_code: ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY

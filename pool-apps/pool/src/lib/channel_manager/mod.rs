@@ -19,6 +19,7 @@ use stratum_apps::{
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
+    payout::AllowedPayoutModes,
     stratum_core::{
         bitcoin::{Amount, Network, TxOut},
         channels_sv2::{
@@ -118,6 +119,8 @@ pub struct ChannelManager {
     /// monitoring. `None` when the template provider config does not name it (Sv2Tp).
     #[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
     pub(crate) network: Option<Network>,
+    /// Which payout modes a channel's `user_identity` may select.
+    payout_modes: AllowedPayoutModes,
     /// Protocol extensions that the pool supports (will accept if requested by clients).
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).
@@ -196,6 +199,7 @@ impl ChannelManager {
             Some(n) if n > 0 => info!(max_past_jobs = n, "past-jobs retention cap configured"),
             _ => info!("past-jobs retention cap: using channels_sv2 default"),
         }
+        info!(payout_modes = ?config.payout_modes(), "user_identity payout modes accepted");
 
         let channel_manager = ChannelManager {
             downstreams: SharedMap::new(),
@@ -212,6 +216,7 @@ impl ChannelManager {
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
             network: config.template_provider_type().network(),
+            payout_modes: config.payout_modes(),
             supported_extensions: config.supported_extensions().to_vec(),
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,
