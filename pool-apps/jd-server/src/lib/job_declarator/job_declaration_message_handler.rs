@@ -193,6 +193,7 @@ impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
         };
         let result = match pool_only {
             Ok(()) => {
+                // validate job
                 self.job_validator
                     .handle_declare_mining_job(client_id, msg.clone(), None)
                     .await
@@ -207,7 +208,6 @@ impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
             }
         };
 
-        // validate job
         let response = match result {
             // if job is valid, activate token and return DeclareMiningJobSuccess
             DeclareMiningJobResult::Success => {
