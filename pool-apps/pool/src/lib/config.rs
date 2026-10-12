@@ -27,6 +27,7 @@ use crate::error::PoolErrorKind;
 
 /// Configuration for the Pool, including connection, authority, and coinbase settings.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     listen_address: SocketAddr,
     template_provider_type: TemplateProviderType,
@@ -280,13 +281,17 @@ impl ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_apps::config_helpers::load_config;
+    use stratum_apps::config_helpers::{ConfigError, load_config};
 
     /// Writes a minimal pool config with `extra` spliced in, so each test varies exactly
     /// one thing, and loads it through the SAME loader the binary uses — not a bare
     /// `toml::from_str`. That way the test covers serde attributes, the env-override layer
     /// and the enum handling, rather than just the struct definition.
     fn load_with(extra: &str, name: &str) -> PoolConfig {
+        try_load_with(extra, name).expect("config loads")
+    }
+
+    fn try_load_with(extra: &str, name: &str) -> Result<PoolConfig, ConfigError> {
         let path = std::env::temp_dir().join(format!("pool-config-{name}.toml"));
         std::fs::write(
             &path,
@@ -308,8 +313,7 @@ address = "127.0.0.1:8442"
             ),
         )
         .expect("write temp config");
-        let cfg = load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"])
-            .expect("config loads");
+        let cfg = load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"]);
         let _ = std::fs::remove_file(&path);
         cfg
     }
@@ -358,28 +362,23 @@ address = "127.0.0.1:8442"
     #[test]
     fn payout_modes_rejects_unknown_values() {
         // A typo must not silently fall back to the permissive default.
-        let path = std::env::temp_dir().join("pool-config-payout-typo.toml");
-        std::fs::write(
-            &path,
-            r#"
-listen_address = "0.0.0.0:34254"
-authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
-authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
-cert_validity_sec = 3600
-coinbase_reward_script = "addr(tb1qa0sm0hxzj0x25rh8gw5xlzwlsfvvyz8u96w3p8)"
-pool_signature = "test"
-shares_per_minute = 6.0
-share_batch_size = 10
-payout_modes = "pool-only"
+        assert!(try_load_with("payout_modes = \"pool-only\"", "payout-typo").is_err());
+    }
 
-[template_provider_type.Sv2Tp]
-address = "127.0.0.1:8442"
-"#,
+    #[test]
+    fn unknown_keys_are_rejected() {
+        // A misspelled key must not be dropped, leaving its field at the default (for
+        // `payout_mode`, the permissive `any`).
+        let err = try_load_with("payout_mode = \"pool_only\"", "unknown-key")
+            .expect_err("misspelled key must not load")
+            .to_string();
+        assert!(err.contains("unknown field `payout_mode`"), "{err}");
+        let err = try_load_with(
+            "[jds]\nlisten_address = \"0.0.0.0:3334\"\nlisten_adress = \"0.0.0.0:3334\"",
+            "unknown-jds-key",
         )
-        .expect("write temp config");
-        let loaded: Result<PoolConfig, _> =
-            load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"]);
-        let _ = std::fs::remove_file(&path);
-        assert!(loaded.is_err());
+        .expect_err("misspelled [jds] key must not load")
+        .to_string();
+        assert!(err.contains("unknown field `listen_adress`"), "{err}");
     }
 }
