@@ -1,7 +1,7 @@
 pub mod common_message_handler;
 
 use crate::{
-    config::TranslatorConfig,
+    config::{TcpKeepaliveConfig, TranslatorConfig},
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     io_task::spawn_io_tasks,
     utils::UpstreamEntry,
@@ -29,6 +29,7 @@ use stratum_apps::{
     },
 };
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -75,14 +76,44 @@ impl UpstreamIo {
 pub struct UpstreamConnectOptions {
     /// How long to wait for the upstream to answer `SetupConnection`.
     pub setup_connection_timeout: Duration,
+    /// TCP keepalive for the upstream socket, `None` to leave it off.
+    pub tcp_keepalive: Option<TcpKeepaliveConfig>,
 }
 
 impl From<&TranslatorConfig> for UpstreamConnectOptions {
     fn from(config: &TranslatorConfig) -> Self {
         Self {
             setup_connection_timeout: config.setup_connection_timeout(),
+            tcp_keepalive: config.upstream_tcp_keepalive(),
         }
     }
+}
+
+/// Enables TCP keepalive on `socket` so the kernel detects a peer that vanished without closing
+/// the connection.
+///
+/// The interval and probe count are only applied on platforms that support them.
+fn apply_tcp_keepalive(socket: &TcpStream, config: &TcpKeepaliveConfig) -> std::io::Result<()> {
+    let mut keepalive = TcpKeepalive::new().with_time(config.idle);
+    // The targets on which socket2 0.6 provides `with_interval` and `with_retries`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "windows"
+    ))]
+    {
+        if let Some(interval) = config.interval {
+            keepalive = keepalive.with_interval(interval);
+        }
+        if let Some(probes) = config.probes {
+            keepalive = keepalive.with_retries(probes);
+        }
+    }
+    SockRef::from(socket).set_tcp_keepalive(&keepalive)
 }
 
 /// Manages the upstream SV2 connection to a mining pool or proxy.
@@ -232,6 +263,12 @@ impl Upstream {
             Ok(socket) => {
                 let resolved_addr = socket.peer_addr().map_err(TproxyError::fallback)?;
                 info!("Connected to upstream at {}", resolved_addr);
+
+                if let Some(keepalive) = &options.tcp_keepalive {
+                    if let Err(e) = apply_tcp_keepalive(&socket, keepalive) {
+                        warn!("Failed to enable TCP keepalive on upstream socket: {e}");
+                    }
+                }
 
                 tokio::select! {
                     biased;
@@ -630,6 +667,34 @@ mod tests {
     use super::*;
 
     const TIMEOUT: Duration = Duration::from_secs(7);
+
+    #[tokio::test]
+    async fn tcp_keepalive_is_applied_to_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let config = TcpKeepaliveConfig {
+            idle: Duration::from_secs(41),
+            interval: Some(Duration::from_secs(7)),
+            probes: Some(4),
+        };
+        assert!(!SockRef::from(&socket).keepalive().unwrap());
+
+        apply_tcp_keepalive(&socket, &config).unwrap();
+
+        let sock = SockRef::from(&socket);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), config.idle);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                Duration::from_secs(7)
+            );
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), 4);
+        }
+    }
 
     /// An `Upstream` whose peer never sends anything. The returned receiver shows what the
     /// translator sent and the returned sender keeps the peer's channel open.
