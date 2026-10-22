@@ -23,7 +23,7 @@ use crate::{
     TranslatorSv2,
     error::{TproxyError, TproxyErrorKind},
     sv1::Sv1Server,
-    sv2::{ChannelManager, Upstream},
+    sv2::{ChannelManager, Upstream, UpstreamConnectOptions},
     upstream_walk::UpstreamWalk,
     utils::{TproxyMode, UpstreamEntry},
 };
@@ -416,6 +416,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
             self.fallback_coordinator.clone(),
             self.task_manager.clone(),
             self.translator.config.required_extensions.clone(),
+            UpstreamConnectOptions::from(&self.translator.config),
         )
         .await?;
 

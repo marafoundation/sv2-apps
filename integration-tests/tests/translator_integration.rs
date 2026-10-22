@@ -2928,6 +2928,99 @@ async fn tproxy_per_upstream_user_identity_switches_on_fallback() {
     shutdown_all!(translator);
 }
 
+// An upstream that completes the Noise handshake but never answers SetupConnection must not
+// stall the translator: after the configured timeout it moves on to the next upstream.
+#[tokio::test]
+async fn translator_falls_back_when_setup_connection_is_never_answered() {
+    use translator_sv2::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+
+    start_tracing();
+    let silent_addr = get_available_address();
+    let _silent_upstream = MockUpstream::new(silent_addr, WithSetup::no())
+        .start()
+        .await;
+    let (silent_sniffer, silent_sniffer_addr) =
+        start_sniffer("silent", silent_addr, false, vec![], None);
+
+    let answering_addr = get_available_address();
+    let _answering_upstream = MockUpstream::new(
+        answering_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let (answering_sniffer, answering_sniffer_addr) =
+        start_sniffer("answering", answering_addr, false, vec![], None);
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        [silent_sniffer_addr, answering_sniffer_addr]
+            .iter()
+            .map(|addr| {
+                Upstream::new(
+                    addr.ip().to_string(),
+                    addr.port(),
+                    authority_pubkey,
+                    "user_identity".to_string(),
+                )
+            })
+            .collect(),
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        true,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    let timeout = Duration::from_secs(2);
+    config.setup_connection_timeout_secs = Some(timeout.as_secs());
+    let translator = translator_sv2::TranslatorSv2::new(config);
+    let started = tokio::time::Instant::now();
+    tokio::spawn({
+        let translator = translator.clone();
+        async move {
+            let _ = translator.start().await;
+        }
+    });
+
+    silent_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    answering_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    answering_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    // The first attempt on the silent upstream times out; the mock only accepts one connection,
+    // so the retries are refused quickly and the second upstream is tried a few seconds later.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= timeout,
+        "fell back after {elapsed:?}, before the {timeout:?} timeout elapsed"
+    );
+    assert!(
+        elapsed < timeout + Duration::from_secs(10),
+        "fallback took {elapsed:?}, far longer than the {timeout:?} timeout"
+    );
+
+    shutdown_all!(translator);
+}
+
 // Draining closes the SV1 listener, then disconnects the connected miners one at a time across
 // the drain window rather than all at once, and the translator shuts down once they are gone.
 #[tokio::test]
