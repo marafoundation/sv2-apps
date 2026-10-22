@@ -22,21 +22,29 @@ use tracing::{error, info, warn};
 use crate::{
     TranslatorSv2,
     error::{TproxyError, TproxyErrorKind},
-    sv1::Sv1Server,
+    sv1::{GenerationEvent, Sv1Server},
     sv2::{ChannelManager, Upstream, UpstreamConnectOptions},
     upstream_walk::UpstreamWalk,
     utils::{TproxyMode, UpstreamEntry},
 };
 
+/// Channels between the [`ChannelManager`] and the [`Upstream`] of one upstream generation.
 struct Io {
     channel_manager_to_upstream_sender: Sender<OutboundFrame>,
     channel_manager_to_upstream_receiver: Receiver<OutboundFrame>,
     upstream_to_channel_manager_sender: Sender<InboundFrame>,
     upstream_to_channel_manager_receiver: Receiver<InboundFrame>,
+}
+
+/// The SV1 server and its channels to the channel manager, which outlive upstream generations:
+/// every [`ChannelManager`] is built on the same pair of channels, and the server learns about
+/// generation boundaries through `generation_events`.
+struct Sv1Side {
+    server: Arc<Sv1Server>,
     channel_manager_to_sv1_server_sender: Sender<MiningOwned>,
-    channel_manager_to_sv1_server_receiver: Receiver<MiningOwned>,
-    sv1_server_to_channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
     sv1_server_to_channel_manager_receiver: Receiver<(MiningOwned, Option<String>)>,
+    generation_events: Sender<GenerationEvent>,
+    started: bool,
 }
 
 /// The core coordinator of the Translator runtime, parameterized by its current bootstrap `State`.
@@ -50,6 +58,7 @@ pub(super) struct TranslatorRuntime<State> {
     translator: TranslatorSv2,
     upstreams: UpstreamWalk,
     listen_addr: SocketAddr,
+    sv1: Sv1Side,
     state: State,
 }
 
@@ -59,19 +68,12 @@ struct IoReady {
     io: Io,
 }
 
-struct ChannelManagerReady {
+pub(super) struct ChannelManagerReady {
     io: Io,
     channel_manager: Arc<ChannelManager>,
-}
-
-pub(super) struct Sv1ServerReady {
-    io: Io,
-    channel_manager: Arc<ChannelManager>,
-    sv1_server: Arc<Sv1Server>,
 }
 
 pub(super) struct UpstreamReady {
-    sv1_server: Arc<Sv1Server>,
     channel_manager: Arc<ChannelManager>,
 }
 
@@ -109,6 +111,7 @@ impl<State> TranslatorRuntime<State> {
             translator: self.translator,
             upstreams: self.upstreams,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: Failed,
         }
     }
@@ -198,6 +201,27 @@ impl TranslatorRuntime<Init> {
             translator.config.fallback_window(),
         );
 
+        let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
+            unbounded();
+        let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
+            unbounded();
+        let (generation_events, generation_events_receiver) = unbounded();
+        let server = Arc::new(
+            Sv1Server::new(
+                listen_addr,
+                channel_manager_to_sv1_server_receiver,
+                sv1_server_to_channel_manager_sender,
+                translator.config.clone(),
+                tproxy_mode,
+            )
+            .with_generation_control(
+                generation_events_receiver,
+                sv1_server_to_channel_manager_receiver.clone(),
+            ),
+        );
+        #[cfg(feature = "monitoring")]
+        translator.current_generation.set_sv1_server(server.clone());
+
         Ok(TranslatorRuntime {
             tproxy_mode,
             fallback_coordinator: FallbackCoordinator::new(),
@@ -205,6 +229,13 @@ impl TranslatorRuntime<Init> {
             translator,
             upstreams,
             listen_addr,
+            sv1: Sv1Side {
+                server,
+                channel_manager_to_sv1_server_sender,
+                sv1_server_to_channel_manager_receiver,
+                generation_events,
+                started: false,
+            },
             state: Init,
         })
     }
@@ -217,7 +248,6 @@ impl TranslatorRuntime<Init> {
     pub(super) async fn bootstrap(self) -> Result<TranslatorRuntime<Running>, BootstrapError> {
         let runtime = self.bootstrap_io();
         let runtime = runtime.bootstrap_channel_manager();
-        let runtime = runtime.bootstrap_sv1_server();
         #[cfg(feature = "monitoring")]
         if let Err(e) = runtime.start_monitoring_server() {
             error!("Failed to initialize monitoring server: {e}");
@@ -232,10 +262,6 @@ impl TranslatorRuntime<Init> {
             unbounded();
         let (upstream_to_channel_manager_sender, upstream_to_channel_manager_receiver) =
             unbounded();
-        let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
-            unbounded();
-        let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
-            unbounded();
 
         TranslatorRuntime {
             tproxy_mode: self.tproxy_mode,
@@ -244,16 +270,13 @@ impl TranslatorRuntime<Init> {
             translator: self.translator,
             upstreams: self.upstreams,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: IoReady {
                 io: Io {
                     channel_manager_to_upstream_sender,
                     channel_manager_to_upstream_receiver,
                     upstream_to_channel_manager_sender,
                     upstream_to_channel_manager_receiver,
-                    channel_manager_to_sv1_server_sender,
-                    channel_manager_to_sv1_server_receiver,
-                    sv1_server_to_channel_manager_sender,
-                    sv1_server_to_channel_manager_receiver,
                 },
             },
         }
@@ -265,8 +288,8 @@ impl TranslatorRuntime<IoReady> {
         let channel_manager = Arc::new(ChannelManager::new(
             self.state.io.channel_manager_to_upstream_sender.clone(),
             self.state.io.upstream_to_channel_manager_receiver.clone(),
-            self.state.io.channel_manager_to_sv1_server_sender.clone(),
-            self.state.io.sv1_server_to_channel_manager_receiver.clone(),
+            self.sv1.channel_manager_to_sv1_server_sender.clone(),
+            self.sv1.sv1_server_to_channel_manager_receiver.clone(),
             self.translator.config.supported_extensions.clone(),
             self.translator.config.required_extensions.clone(),
             self.tproxy_mode,
@@ -285,6 +308,7 @@ impl TranslatorRuntime<IoReady> {
             translator: self.translator,
             upstreams: self.upstreams,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: ChannelManagerReady {
                 io: self.state.io,
                 channel_manager,
@@ -294,32 +318,6 @@ impl TranslatorRuntime<IoReady> {
 }
 
 impl TranslatorRuntime<ChannelManagerReady> {
-    fn bootstrap_sv1_server(self) -> TranslatorRuntime<Sv1ServerReady> {
-        let sv1_server = Arc::new(Sv1Server::new(
-            self.listen_addr,
-            self.state.io.channel_manager_to_sv1_server_receiver.clone(),
-            self.state.io.sv1_server_to_channel_manager_sender.clone(),
-            self.translator.config.clone(),
-            self.tproxy_mode,
-        ));
-
-        TranslatorRuntime {
-            tproxy_mode: self.tproxy_mode,
-            fallback_coordinator: self.fallback_coordinator,
-            task_manager: self.task_manager,
-            translator: self.translator,
-            upstreams: self.upstreams,
-            listen_addr: self.listen_addr,
-            state: Sv1ServerReady {
-                io: self.state.io,
-                channel_manager: self.state.channel_manager,
-                sv1_server,
-            },
-        }
-    }
-}
-
-impl TranslatorRuntime<Sv1ServerReady> {
     pub(super) async fn try_upstream(
         mut self,
     ) -> Result<TranslatorRuntime<UpstreamReady>, BootstrapError> {
@@ -334,8 +332,8 @@ impl TranslatorRuntime<Sv1ServerReady> {
             translator: self.translator,
             upstreams: self.upstreams,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: UpstreamReady {
-                sv1_server: self.state.sv1_server,
                 channel_manager: self.state.channel_manager,
             },
         })
@@ -372,7 +370,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
                         self.state
                             .channel_manager
                             .set_expected_payout_distribution(payout_mode);
-                        self.state.sv1_server.set_user_identity(user_identity);
+                        self.sv1.server.set_user_identity(user_identity);
 
                         self.upstreams.mark_connected(i);
                         return Ok(());
@@ -439,23 +437,35 @@ impl TranslatorRuntime<Sv1ServerReady> {
 impl TranslatorRuntime<UpstreamReady> {
     /// Activates the background execution loops of the SV1 server, [`ChannelManager`], and
     /// monitoring server, transitioning the runtime to [`Running`].
-    pub(super) async fn start_services(self) -> Result<TranslatorRuntime<Running>, BootstrapError> {
-        info!("Launching SV1 server...");
-        if let Err(e) = self
-            .state
-            .sv1_server
-            .clone()
-            .start_with_drain(
-                self.translator.cancellation_token.clone(),
-                self.translator.drain_token.clone(),
-                self.fallback_coordinator.clone(),
-                self.task_manager.clone(),
-            )
-            .await
-        {
-            error!("SV1 server startup failed: {e:?}");
-            return Err(BootstrapError::from((e.kind, self)));
+    pub(super) async fn start_services(
+        mut self,
+    ) -> Result<TranslatorRuntime<Running>, BootstrapError> {
+        if !self.sv1.started {
+            info!("Launching SV1 server...");
+            if let Err(e) = self
+                .sv1
+                .server
+                .clone()
+                .start_with_drain(
+                    self.translator.cancellation_token.clone(),
+                    self.translator.drain_token.clone(),
+                    self.task_manager.clone(),
+                )
+                .await
+            {
+                error!("SV1 server startup failed: {e:?}");
+                return Err(BootstrapError::from((e.kind, self)));
+            }
+            self.sv1.started = true;
         }
+
+        // Queued ahead of anything the new channel manager sends the SV1 server.
+        let _ = self
+            .sv1
+            .generation_events
+            .try_send(GenerationEvent::Connected {
+                fallback_token: self.fallback_coordinator.token(),
+            });
 
         info!("Launching ChannelManager tasks...");
         ChannelManager::run_channel_manager_tasks(
@@ -468,10 +478,9 @@ impl TranslatorRuntime<UpstreamReady> {
 
         #[cfg(feature = "monitoring")]
         {
-            self.translator.current_generation.set(
-                self.state.channel_manager.clone(),
-                self.state.sv1_server.clone(),
-            );
+            self.translator
+                .current_generation
+                .set_channel_manager(self.state.channel_manager.clone());
             if self.translator.config.monitoring_address().is_some() {
                 self.start_miner_telemetry();
             }
@@ -484,6 +493,7 @@ impl TranslatorRuntime<UpstreamReady> {
             translator: self.translator,
             upstreams: self.upstreams,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: Running,
         })
     }
@@ -494,7 +504,7 @@ impl TranslatorRuntime<UpstreamReady> {
         let telemetry_fallback = self.fallback_coordinator.clone();
         self.task_manager.spawn({
             let cancellation_token = self.translator.cancellation_token.clone();
-            let sv1_server = self.state.sv1_server.clone();
+            let sv1_server = self.sv1.server.clone();
             async move {
                 let fallback_token = telemetry_fallback.token();
                 let fallback_handler = telemetry_fallback.register();
@@ -597,13 +607,15 @@ impl TranslatorRuntime<Running> {
     /// budget; the caller then shuts the translator down.
     pub(super) async fn cleanup_for_fallback(
         mut self,
-    ) -> Result<TranslatorRuntime<Sv1ServerReady>, BootstrapError> {
+    ) -> Result<TranslatorRuntime<ChannelManagerReady>, BootstrapError> {
         info!("Preparing fallback");
         let fallback_budget = self.upstreams.record_fallback(Instant::now());
         #[cfg(feature = "monitoring")]
-        self.translator.current_generation.clear();
+        self.translator.current_generation.clear_channel_manager();
         self.fallback_coordinator.trigger_fallback_and_wait().await;
         info!("All components finished fallback cleanup");
+        // The old channel manager has exited, so this lands behind everything it sent.
+        let _ = self.sv1.generation_events.try_send(GenerationEvent::Ended);
 
         if let Err(fallbacks) = fallback_budget {
             let window_secs = self.translator.config.fallback_window().as_secs();
@@ -629,10 +641,10 @@ impl TranslatorRuntime<Running> {
             translator: self.translator,
             upstreams: self.upstreams,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: Init,
         }
         .bootstrap_io()
-        .bootstrap_channel_manager()
-        .bootstrap_sv1_server())
+        .bootstrap_channel_manager())
     }
 }

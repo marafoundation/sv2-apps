@@ -334,9 +334,7 @@ impl Sv1Server {
             all_updates.len()
         );
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((MiningOwned::UpdateChannel(update_channel), None))
+        self.send_to_channel_manager((MiningOwned::UpdateChannel(update_channel), None))
             .await
             .map_err(|e| {
                 error!("Failed to send aggregated UpdateChannel: {:?}", e);
@@ -360,9 +358,7 @@ impl Sv1Server {
                 downstream_id, channel_id, new_hashrate, new_target
             );
 
-            self.sv1_server_io
-                .channel_manager_sender
-                .send((MiningOwned::UpdateChannel(update_channel), None))
+            self.send_to_channel_manager((MiningOwned::UpdateChannel(update_channel), None))
                 .await
                 .map_err(|e| {
                     error!(
@@ -660,9 +656,7 @@ impl Sv1Server {
             }
         };
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((MiningOwned::UpdateChannel(update), None))
+        self.send_to_channel_manager((MiningOwned::UpdateChannel(update), None))
             .await
             .map_err(|e| {
                 error!(

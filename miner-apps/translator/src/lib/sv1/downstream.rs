@@ -9,7 +9,6 @@ use std::net::IpAddr;
 use std::{collections::VecDeque, future::Future, sync::Arc, time::Instant};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
-    fallback_coordinator::FallbackCoordinator,
     stratum_core::{
         bitcoin::{BlockHash, Target},
         channels_sv2::client::MAX_SEEN_SHARES,
@@ -372,22 +371,12 @@ impl Downstream {
         context: &str,
         e: &TproxyError<error::Downstream>,
         cancellation_token: &CancellationToken,
-        fallback_token: &CancellationToken,
     ) -> LoopControl {
         if cancellation_token.is_cancelled() {
             debug!(
                 downstream_id = self.downstream_id,
                 error_kind = ?e.kind,
                 "{context} returned an error after shutdown was requested"
-            );
-            return LoopControl::Continue;
-        }
-
-        if fallback_token.is_cancelled() {
-            debug!(
-                downstream_id = self.downstream_id,
-                error_kind = ?e.kind,
-                "{context} returned an error during fallback"
             );
             return LoopControl::Continue;
         }
@@ -470,7 +459,7 @@ impl Downstream {
     ///
     /// This method creates an async task that handles all communication for this
     /// downstream connection. The task runs a select loop that processes:
-    /// - Cancellation signals (global via cancellation_token or fallback)
+    /// - The global cancellation signal. A downstream outlives upstream fallbacks.
     /// - Messages from the miner (subscribe, authorize, submit)
     /// - Messages from the SV1 server (notify, set_difficulty, etc.)
     ///
@@ -480,7 +469,6 @@ impl Downstream {
     pub(super) fn start<F, Fut>(
         self,
         cancellation_token: CancellationToken,
-        fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
         on_disconnect: F,
     ) where
@@ -489,22 +477,11 @@ impl Downstream {
     {
         let downstream_id = self.downstream_id;
         task_manager.spawn(async move {
-            // we just spawned a new task that's relevant to fallback coordination
-            // so register it with the fallback coordinator
-            let fallback_handler = fallback_coordinator.register();
-
-            // get the cancellation token that signals fallback
-            let fallback_token = fallback_coordinator.token();
-
             loop {
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {
                         info!("Downstream {downstream_id}: received app shutdown signal");
-                        break;
-                    }
-                    _ = fallback_token.cancelled() => {
-                        info!("Downstream {downstream_id}: fallback triggered");
                         break;
                     }
                     // Handle downstream -> server message
@@ -515,7 +492,6 @@ impl Downstream {
                                 "Downstream::handle_downstream_message",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ) {
                                 break;
                             }
@@ -530,7 +506,6 @@ impl Downstream {
                                 "Downstream::handle_sv1_server_message",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ) {
                                 break;
                             }
@@ -548,8 +523,6 @@ impl Downstream {
             self.downstream_cancellation_token.cancel();
             self.downstream_io.close();
             on_disconnect().await;
-            // signal fallback coordinator that this task has completed its cleanup
-            fallback_handler.done();
         });
     }
 
