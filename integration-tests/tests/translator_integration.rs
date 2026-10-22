@@ -3,6 +3,7 @@ use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwn
 use integration_tests_sv2::{
     interceptor::{IgnoreMessage, MessageDirection, ReplaceMessage},
     mock_roles::{MockUpstream, WithSetup},
+    sniffer::Sniffer,
     start_sv2_translator_with_user_identities,
     sv1_sniffer::SV1MessageFilter,
     template_provider::DifficultyLevel,
@@ -2641,6 +2642,122 @@ async fn test_translator_fallback_during_abrupt_disconnection() {
         )
         .await;
     shutdown_all!(translator, pool_2);
+}
+
+/// A translator with a single upstream reconnects to it after the connection drops, instead of
+/// treating the upstream it was just using as spent and exiting.
+#[tokio::test]
+async fn translator_reconnects_to_its_only_upstream_after_it_drops() {
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let _first_session = MockUpstream::new(
+        upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .disconnect_after_setup_connection_success(Duration::from_secs(1))
+    .start()
+    .await;
+
+    let (translator, _tproxy_addr, _) =
+        start_sv2_translator(&[upstream_addr], false, vec![], vec![], None, false).await;
+
+    // The mock stops listening once the translator connects; the restarted upstream is a fresh
+    // mock behind a sniffer bound to the same address.
+    loop {
+        match TcpListener::bind(upstream_addr).await {
+            Ok(listener) => {
+                drop(listener);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let restarted_addr = get_available_address();
+    let _second_session = MockUpstream::new(
+        restarted_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let restarted_sniffer = Sniffer::new(
+        "restarted",
+        upstream_addr,
+        restarted_addr,
+        false,
+        vec![],
+        None,
+    );
+    restarted_sniffer.start();
+
+    restarted_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    restarted_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+    translator.shutdown().await;
+}
+
+/// With `max_fallbacks = 0` the first fallback is fatal: `start()` returns `FallbackLoop`
+/// instead of reconnecting.
+#[tokio::test]
+async fn translator_exits_when_fallbacks_exceed_the_budget() {
+    use translator_sv2::{
+        config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream},
+        error::TproxyErrorKind,
+    };
+
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let _session = MockUpstream::new(
+        upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .disconnect_after_setup_connection_success(Duration::from_secs(1))
+    .start()
+    .await;
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        vec![Upstream::new(
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            authority_pubkey,
+            "user_identity".to_string(),
+        )],
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        true,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    config.max_fallbacks = 0;
+    let translator = translator_sv2::TranslatorSv2::new(config);
+
+    let result = tokio::time::timeout(Duration::from_secs(30), translator.start())
+        .await
+        .expect("translator should exit on the first fallback");
+    assert!(
+        matches!(
+            result,
+            Err(TproxyErrorKind::FallbackLoop { fallbacks: 1, .. })
+        ),
+        "unexpected result: {result:?}"
+    );
 }
 
 #[tokio::test]

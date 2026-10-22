@@ -260,6 +260,8 @@ pub enum TproxyErrorKind {
     DownstreamNotPresent(DownstreamId),
     /// Coinbase payout verification failed for a solo/donation user identity
     PayoutVerificationFailed(String),
+    /// More fallbacks than allowed happened within the configured window
+    FallbackLoop { fallbacks: usize, window_secs: u64 },
 }
 
 impl std::error::Error for TproxyErrorKind {}
@@ -369,6 +371,13 @@ impl fmt::Display for TproxyErrorKind {
                 "downstream not found with downstream_id: {downstream_id}"
             ),
             PayoutVerificationFailed(e) => write!(f, "Payout verification failed: {e}"),
+            FallbackLoop {
+                fallbacks,
+                window_secs,
+            } => write!(
+                f,
+                "{fallbacks} upstream fallbacks within {window_secs}s, giving up"
+            ),
         }
     }
 }

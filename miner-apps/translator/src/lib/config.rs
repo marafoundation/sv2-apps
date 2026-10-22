@@ -83,6 +83,23 @@ pub struct TranslatorConfig {
     /// host and port") to each miner just before closing its connection during a drain.
     #[serde(default)]
     pub drain_send_reconnect: bool,
+    /// Fallbacks tolerated within `fallback_window_secs` before the translator gives up and
+    /// exits. Upstreams that served miners stay eligible for later fallbacks, so this bounds an
+    /// upstream that accepts the connection and then keeps failing. `0` exits on the first
+    /// fallback.
+    #[serde(default = "default_max_fallbacks")]
+    pub max_fallbacks: usize,
+    /// Window, in seconds, over which `max_fallbacks` is counted.
+    #[serde(default = "default_fallback_window_secs")]
+    pub fallback_window_secs: u64,
+}
+
+fn default_max_fallbacks() -> usize {
+    5
+}
+
+fn default_fallback_window_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -130,6 +147,11 @@ impl TranslatorConfig {
         std::time::Duration::from_secs(self.drain_seconds.min(86_400))
     }
 
+    /// `fallback_window_secs` as a window, capped at one day like [`Self::drain_window`].
+    pub fn fallback_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.fallback_window_secs.min(86_400))
+    }
+
     /// Creates a new `TranslatorConfig` instance with the specified upstream and downstream
     /// configurations and version constraints.
     #[allow(clippy::too_many_arguments)]
@@ -169,6 +191,8 @@ impl TranslatorConfig {
             miner_telemetry: MinerTelemetryConfig::default(),
             drain_seconds: 0,
             drain_send_reconnect: false,
+            max_fallbacks: default_max_fallbacks(),
+            fallback_window_secs: default_fallback_window_secs(),
         }
     }
 
@@ -607,6 +631,43 @@ mod tests {
         assert_eq!(config.upstreams[0].user_identity, "sri/solo/bc1qprimary");
         assert_eq!(config.upstreams[1].user_identity, "bc1qbackup.worker");
         assert!(!config.verify_payout);
+        assert_eq!(config.max_fallbacks, 5);
+        assert_eq!(config.fallback_window_secs, 600);
+    }
+
+    #[test]
+    fn test_fallback_budget_toml() {
+        let pubkey = "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan";
+        let toml = format!(
+            r#"
+            downstream_address = "0.0.0.0"
+            downstream_port = 34255
+            max_supported_version = 2
+            min_supported_version = 2
+            downstream_extranonce2_size = 8
+            aggregate_channels = false
+            max_fallbacks = 0
+            fallback_window_secs = 120
+
+            [downstream_difficulty_config]
+            min_individual_miner_hashrate = 10000000.0
+            shares_per_minute = 6.0
+            enable_vardiff = false
+            job_keepalive_interval_secs = 60
+
+            [[upstreams]]
+            address = "127.0.0.1"
+            port = 3333
+            authority_pubkey = "{pubkey}"
+            user_identity = "user"
+            "#
+        );
+        let config: TranslatorConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(config.max_fallbacks, 0);
+        assert_eq!(
+            config.fallback_window(),
+            std::time::Duration::from_secs(120)
+        );
     }
 }
 

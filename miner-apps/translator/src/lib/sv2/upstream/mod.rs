@@ -157,10 +157,7 @@ impl Upstream {
     ///
     /// # Arguments
     /// * `upstreams` - A single `UpstreamEntry` representing the upstream candidate currently being
-    ///   attempted. The `tried_or_flagged` is set once the upstream has either been connected to
-    ///   successfully or marked as malicious. Because `new` is only called from
-    ///   `try_initialize_upstream`, we can treat this flag as the definitive state for that
-    ///   upstream.
+    ///   attempted.
     /// * `channel_manager_sender` - Channel to send messages to the channel manager
     /// * `channel_manager_receiver` - Channel to receive messages from the channel manager
     /// * `cancellation_token` - Global application cancellation token

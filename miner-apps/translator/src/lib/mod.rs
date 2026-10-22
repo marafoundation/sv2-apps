@@ -35,6 +35,7 @@ mod monitoring;
 pub mod sv1;
 pub mod sv2;
 mod translator_runtime;
+mod upstream_walk;
 pub mod utils;
 
 /// The main struct that manages the SV1/SV2 translator.
@@ -113,7 +114,15 @@ impl TranslatorSv2 {
                     return Ok(());
                 }
                 RuntimeEvent::Fallback => {
-                    let sv1_ready_runtime = running.cleanup_for_fallback().await;
+                    let sv1_ready_runtime = match running.cleanup_for_fallback().await {
+                        Ok(runtime) => runtime,
+                        Err(bootstrap_err) => {
+                            let (kind, runtime) = bootstrap_err.into_parts();
+                            error!(?kind, "Giving up on upstream fallbacks");
+                            runtime.shutdown().await;
+                            return Err(kind);
+                        }
+                    };
 
                     running = match sv1_ready_runtime.try_upstream().await {
                         Ok(new_running) => match new_running.start_services().await {

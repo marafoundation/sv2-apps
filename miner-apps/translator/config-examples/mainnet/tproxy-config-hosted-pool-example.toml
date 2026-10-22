@@ -49,6 +49,12 @@ monitoring_cache_refresh_secs = 15
 # Send `client.reconnect` to each miner before closing its connection during the drain.
 # drain_send_reconnect = false
 
+# Upstreams that served miners stay eligible for later fallbacks. To stop an upstream that accepts
+# connections and then keeps failing from looping forever, more than `max_fallbacks` fallbacks
+# within `fallback_window_secs` makes the translator exit (0 exits on the first fallback).
+# max_fallbacks = 5
+# fallback_window_secs = 600
+
 # LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
 [miner_telemetry]
 cidrs = ["192.168.1.0/24"]
