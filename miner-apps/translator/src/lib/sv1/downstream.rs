@@ -1,17 +1,29 @@
 use crate::{
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     sv1::job_store::Sv1JobStore,
-    utils::SubmitShareWithChannelId,
+    utils::{
+        KEEPALIVE_JOB_ID_DELIMITER, MAX_FUTURE_BLOCK_TIME,
+        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING, SubmitShareWithChannelId,
+    },
 };
 use async_channel::{Receiver, Sender};
 #[cfg(feature = "monitoring")]
 use std::net::IpAddr;
-use std::{collections::VecDeque, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     stratum_core::{
         bitcoin::{BlockHash, Target},
         channels_sv2::client::MAX_SEEN_SHARES,
+        stratum_translation::sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
         sv1_api::{
             json_rpc,
             methods::Client2Server,
@@ -43,6 +55,28 @@ pub(super) enum Sv1ServerEvent {
         notify_miner: bool,
     },
     SetupComplete,
+    /// The upstream generation ended and this miner is held: everything queued before this
+    /// event belonged to it.
+    Hold,
+    /// Keeps a held miner busy: its last job, nTime rolled by `interval_secs`, as job `#counter`.
+    /// Never valid for share submission.
+    HoldKeepalive {
+        counter: u32,
+        interval_secs: u32,
+    },
+    /// A held miner has a channel on the new upstream with this extranonce.
+    Reattach {
+        extranonce1: Extranonce,
+        extranonce2_len: usize,
+    },
+}
+
+/// How a held miner was moved onto a new upstream.
+#[derive(Debug, Default)]
+pub(super) struct ReattachCounters {
+    pub(super) unchanged: AtomicU64,
+    pub(super) set_extranonce: AtomicU64,
+    pub(super) reconnect: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +218,9 @@ impl Sv1AcceptedShareCache {
 #[derive(Debug)]
 pub struct DownstreamData {
     pub channel_id: Option<ChannelId>,
+    /// Upstream generation epoch `channel_id` was assigned under; only that generation's
+    /// channel manager knows the channel.
+    pub channel_epoch: u64,
     pub extranonce1: Extranonce,
     pub extranonce2_len: usize,
     // Current SV1 share-validation target. This follows the advertised
@@ -226,6 +263,16 @@ pub struct DownstreamData {
     /// activates it.
     pub keepalive_timer_anchor: Option<Instant>,
     pub(super) supports_set_extranonce: bool,
+    /// Kept connected while no upstream generation serves it; cleared once it has a channel
+    /// on the next one.
+    pub(super) held: bool,
+    /// The next job sent to the miner tells it to drop all previous work.
+    pub(super) force_clean_jobs: bool,
+    /// Suffix of the `.minerN` user identity, kept so a re-opened channel uses the same one.
+    pub(super) miner_id: Option<u32>,
+    /// The last job sent to the miner and the nTime of the upstream job it derives from, the
+    /// base for keep-alive jobs while it is held. Kept across upstream generations.
+    pub(super) last_job: Option<(server_to_client::Notify, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,6 +290,7 @@ impl DownstreamData {
     ) -> Self {
         DownstreamData {
             channel_id: None,
+            channel_epoch: 0,
             extranonce1: vec![0; 8]
                 .try_into()
                 .expect("8-byte extranonce is always valid"),
@@ -270,7 +318,50 @@ impl DownstreamData {
             upstream_target: None,
             keepalive_timer_anchor: None,
             supports_set_extranonce: false,
+            held: false,
+            force_clean_jobs: false,
+            miner_id: None,
+            last_job: None,
         }
+    }
+
+    fn record_last_job(&mut self, notify: &server_to_client::Notify) {
+        let base_time = match &self.last_job {
+            Some((_, base_time)) if notify.job_id.contains(KEEPALIVE_JOB_ID_DELIMITER) => {
+                *base_time
+            }
+            _ => notify.time.0,
+        };
+        self.last_job = Some((notify.clone(), base_time));
+    }
+
+    /// The next keep-alive job for a held, ready miner: its last job as job `{original}#counter`
+    /// with nTime rolled forward by `interval_secs`, at most to Bitcoin Core's future-time limit
+    /// from the upstream job it derives from. Past that limit only the job id changes, which is
+    /// still new work to firmware.
+    fn next_hold_keepalive(
+        &mut self,
+        counter: u32,
+        interval_secs: u32,
+    ) -> Option<server_to_client::Notify> {
+        if !self.held || !self.session_state.is_ready() {
+            return None;
+        }
+        let (last, base_time) = self.last_job.as_mut()?;
+        let original_job_id = last
+            .job_id
+            .split_once(KEEPALIVE_JOB_ID_DELIMITER)
+            .map_or(last.job_id.as_str(), |(original, _)| original)
+            .to_string();
+        last.job_id = format!("{original_job_id}{KEEPALIVE_JOB_ID_DELIMITER}{counter}");
+        last.time = HexU32Be(
+            last.time
+                .0
+                .saturating_add(interval_secs)
+                .min(base_time.saturating_add(MAX_FUTURE_BLOCK_TIME)),
+        );
+        last.clean_jobs = false;
+        Some(last.clone())
     }
 
     fn record_job_validation_context(&mut self, notify: &server_to_client::Notify) {
@@ -338,10 +429,17 @@ pub struct Downstream {
     /// Cancelled when this downstream's task loop exits, causing
     /// the associated SV1 I/O task to shut down.
     downstream_cancellation_token: CancellationToken,
+    reattach_counters: Arc<ReattachCounters>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Downstream {
+    /// Counts this miner's re-attachments in `counters`, shared with the SV1 server.
+    pub(super) fn with_reattach_counters(mut self, counters: Arc<ReattachCounters>) -> Self {
+        self.reattach_counters = counters;
+        self
+    }
+
     /// Stops this miner's connection. Its task cleanup callback removes the associated server and
     /// channel-manager state.
     pub(super) fn disconnect(&self) {
@@ -364,6 +462,12 @@ impl Downstream {
     #[cfg(test)]
     pub(super) fn is_disconnected(&self) -> bool {
         self.downstream_cancellation_token.is_cancelled()
+    }
+
+    /// Whether the miner was sent `client.reconnect`, which closes its outbound channel.
+    #[cfg(test)]
+    pub(super) fn was_asked_to_reconnect(&self) -> bool {
+        self.downstream_io.downstream_sv1_sender.is_closed()
     }
 
     fn handle_error_action(
@@ -452,6 +556,7 @@ impl Downstream {
             downstream_data,
             downstream_io: downstream_channel_io,
             downstream_cancellation_token,
+            reattach_counters: Arc::default(),
         }
     }
 
@@ -581,8 +686,115 @@ impl Downstream {
                     })
                     .map_err(TproxyError::shutdown)?;
             }
+            Sv1ServerEvent::Hold => {
+                self.downstream_data
+                    .with(|data| {
+                        data.job_validation_contexts.clear();
+                        data.accepted_share_hashes.clear();
+                        data.pending_share = None;
+                        data.cached_notify = None;
+                        data.cached_set_extranonce = None;
+                        data.pending_set_extranonce_notifications = 0;
+                        data.keepalive_timer_anchor = None;
+                        // A difficulty change waiting for the next job belongs to the ended
+                        // generation; the miner keeps the difficulty it is working at.
+                        data.cached_set_difficulty = None;
+                        data.pending_target = None;
+                        data.pending_hashrate = None;
+                    })
+                    .map_err(TproxyError::shutdown)?;
+            }
+            Sv1ServerEvent::HoldKeepalive {
+                counter,
+                interval_secs,
+            } => {
+                let keepalive = self
+                    .downstream_data
+                    .with(|data| data.next_hold_keepalive(counter, interval_secs))
+                    .map_err(TproxyError::shutdown)?;
+                if let Some(keepalive) = keepalive {
+                    self.send_to_miner(json_rpc::Message::from(keepalive))
+                        .await?;
+                }
+            }
+            Sv1ServerEvent::Reattach {
+                extranonce1,
+                extranonce2_len,
+            } => self.reattach(extranonce1, extranonce2_len)?,
         }
         Ok(())
+    }
+
+    /// Moves a held miner onto its channel with the new upstream.
+    ///
+    /// An unchanged extranonce needs nothing but fresh work. A changed one is sent with the next
+    /// job as `mining.set_extranonce` to a miner that announced support for it; any other miner
+    /// is asked to reconnect, since work it hashed with its old extranonce would be invalid.
+    #[allow(clippy::result_large_err)]
+    fn reattach(
+        &self,
+        extranonce1: Extranonce,
+        extranonce2_len: usize,
+    ) -> TproxyResult<(), error::Downstream> {
+        let reconnect = self
+            .downstream_data
+            .with(|data| {
+                data.cached_notify = None;
+                data.force_clean_jobs = true;
+                // Firmware may reset its difficulty with its session; repeat the one the miner
+                // is held at, which is also the one its shares are validated against.
+                data.cached_set_difficulty =
+                    build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                        data.target,
+                        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                    )
+                    .ok();
+                if data.extranonce1 == extranonce1 && data.extranonce2_len == extranonce2_len {
+                    self.reattach_counters
+                        .unchanged
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                if !data.supports_set_extranonce {
+                    return true;
+                }
+                data.extranonce1 = extranonce1.clone();
+                data.extranonce2_len = extranonce2_len;
+                data.cached_set_extranonce = Some(server_to_client::SetExtranonce {
+                    extra_nonce1: extranonce1,
+                    extra_nonce2_size: extranonce2_len,
+                });
+                self.reattach_counters
+                    .set_extranonce
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .map_err(TproxyError::shutdown)?;
+        if reconnect {
+            info!(
+                downstream_id = self.downstream_id,
+                "Extranonce changed on the new upstream and the miner cannot be told; asking it to reconnect"
+            );
+            self.reattach_counters
+                .reconnect
+                .fetch_add(1, Ordering::Relaxed);
+            self.reconnect();
+        }
+        Ok(())
+    }
+
+    async fn send_to_miner(
+        &self,
+        message: json_rpc::Message,
+    ) -> TproxyResult<(), error::Downstream> {
+        self.downstream_io
+            .downstream_sv1_sender
+            .send(message)
+            .await
+            .map_err(|error| {
+                error!("Down: Failed to send message to miner: {error:?}");
+                TproxyError::disconnect(TproxyErrorKind::ChannelErrorSender, self.downstream_id)
+            })
     }
 
     /// Handles messages received from the downstream SV1 miner.
@@ -642,8 +854,9 @@ impl Downstream {
     }
 
     /// Sends pending difficulty, then the required extranonce immediately before its job.
-    /// A miner that has not announced prefix-update support is disconnected without advertising
-    /// work it would hash with the wrong extranonce. No capability timeout is introduced.
+    /// A miner that has not announced prefix-update support is sent `client.reconnect` and
+    /// disconnected without advertising work it would hash with the wrong extranonce. No
+    /// capability timeout is introduced.
     async fn send_job(
         &self,
         notify: Arc<server_to_client::Notify>,
@@ -664,16 +877,24 @@ impl Downstream {
                     }
                 }
                 let extranonce = data.cached_set_extranonce.take();
+                let notify = if std::mem::take(&mut data.force_clean_jobs) && !notify.clean_jobs {
+                    let mut clean = (*notify).clone();
+                    clean.clean_jobs = true;
+                    Arc::new(clean)
+                } else {
+                    notify
+                };
                 data.record_job_validation_context(&notify);
-                Some((difficulty, extranonce))
+                data.record_last_job(&notify);
+                Some((difficulty, extranonce, notify))
             })
             .map_err(TproxyError::shutdown)?;
-        let Some((difficulty, extranonce)) = messages else {
+        let Some((difficulty, extranonce, notify)) = messages else {
             warn!(
                 downstream_id = self.downstream_id,
-                "Disconnecting SV1 miner before a job requiring unannounced mining.set_extranonce support"
+                "Asking SV1 miner to reconnect before a job requiring unannounced mining.set_extranonce support"
             );
-            self.disconnect();
+            self.reconnect();
             return Ok(());
         };
         for message in [
@@ -1225,6 +1446,216 @@ mod tests {
                 assert!(data.keepalive_timer_anchor.is_some());
             })
             .unwrap();
+    }
+
+    /// A ready, held downstream plus the miner's wire and the server's event sender.
+    fn held_downstream(
+        supports_set_extranonce: bool,
+    ) -> (Downstream, Receiver<Message>, Sender<Sv1ServerEvent>) {
+        let (downstream_sv1_sender, downstream_sv1_receiver) = unbounded();
+        let (_downstream_sender, downstream_receiver) = unbounded();
+        let (sv1_server_sender, _sv1_server_receiver) = unbounded();
+        let (events, sv1_server_receiver) = unbounded();
+        let downstream = Downstream::new(
+            1,
+            downstream_sv1_sender,
+            downstream_receiver,
+            sv1_server_sender,
+            sv1_server_receiver,
+            Target::from_le_bytes([0x11; 32]),
+            None,
+            None,
+            #[cfg(feature = "monitoring")]
+            "127.0.0.1".parse().unwrap(),
+            CancellationToken::new(),
+        );
+        downstream
+            .downstream_data
+            .with(|data| {
+                data.session_state = Sv1SessionState::Ready;
+                data.supports_set_extranonce = supports_set_extranonce;
+                data.held = true;
+            })
+            .unwrap();
+        (downstream, downstream_sv1_receiver, events)
+    }
+
+    #[tokio::test]
+    async fn hold_drops_the_ended_generations_jobs_and_keepalives_are_not_valid_work() {
+        let (downstream, wire, events) = held_downstream(true);
+        events
+            .send(Sv1ServerEvent::from(notify("old")))
+            .await
+            .unwrap();
+        downstream.handle_sv1_server_message().await.unwrap();
+        let Message::Notification(sent) = wire.try_recv().unwrap() else {
+            unreachable!();
+        };
+        let sent = server_to_client::Notify::try_from(sent).unwrap();
+        events.send(Sv1ServerEvent::Hold).await.unwrap();
+        downstream.handle_sv1_server_message().await.unwrap();
+        for counter in [1, 2] {
+            events
+                .send(Sv1ServerEvent::HoldKeepalive {
+                    counter,
+                    interval_secs: 30,
+                })
+                .await
+                .unwrap();
+            downstream.handle_sv1_server_message().await.unwrap();
+            let Message::Notification(keepalive) = wire.try_recv().unwrap() else {
+                panic!("expected a keep-alive job");
+            };
+            let keepalive = server_to_client::Notify::try_from(keepalive).unwrap();
+            assert_eq!(keepalive.job_id, format!("old#{counter}"));
+            assert_eq!(keepalive.time.0, sent.time.0 + 30 * counter);
+            assert!(!keepalive.clean_jobs);
+        }
+
+        downstream
+            .downstream_data
+            .with(|data| {
+                assert!(data.job_validation_context("old").is_none());
+                assert!(data.job_validation_context("old#1").is_none());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn hold_keepalive_stops_rolling_ntime_at_the_future_limit_but_keeps_changing_the_job() {
+        let (downstream, _wire, _events) = held_downstream(true);
+        let Message::Notification(job) = notify("job") else {
+            unreachable!();
+        };
+        let job = server_to_client::Notify::try_from(job).unwrap();
+        let base = job.time.0;
+        downstream
+            .downstream_data
+            .with(|data| {
+                data.record_last_job(&job);
+                let first = data
+                    .next_hold_keepalive(1, MAX_FUTURE_BLOCK_TIME + 60)
+                    .unwrap();
+                assert_eq!(first.time.0, base + MAX_FUTURE_BLOCK_TIME);
+                let second = data.next_hold_keepalive(2, 30).unwrap();
+                assert_eq!(second.time.0, base + MAX_FUTURE_BLOCK_TIME);
+                assert_eq!(second.job_id, "job#2");
+                data.held = false;
+                assert!(data.next_hold_keepalive(3, 30).is_none());
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reattach_with_a_new_extranonce_sends_it_before_a_clean_job() {
+        let (downstream, wire, events) = held_downstream(true);
+        let new_extranonce: Extranonce = vec![1, 2, 3, 4].try_into().unwrap();
+        events
+            .send(Sv1ServerEvent::Reattach {
+                extranonce1: new_extranonce.clone(),
+                extranonce2_len: 4,
+            })
+            .await
+            .unwrap();
+        events
+            .send(Sv1ServerEvent::from(notify_with_clean_jobs("new", false)))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            downstream.handle_sv1_server_message().await.unwrap();
+        }
+
+        let expected_difficulty =
+            build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                Target::from_le_bytes([0x11; 32]),
+                SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+            )
+            .unwrap();
+        assert_message_eq(&wire.try_recv().unwrap(), &expected_difficulty);
+        let Message::Notification(update) = wire.try_recv().unwrap() else {
+            panic!("expected mining.set_extranonce");
+        };
+        assert_eq!(update.method, "mining.set_extranonce");
+        assert_message_eq(
+            &wire.try_recv().unwrap(),
+            &notify_with_clean_jobs("new", true),
+        );
+        assert!(!downstream.is_disconnected());
+        assert_eq!(
+            downstream
+                .reattach_counters
+                .set_extranonce
+                .load(Ordering::Relaxed),
+            1
+        );
+        downstream
+            .downstream_data
+            .with(|data| {
+                assert_eq!(
+                    data.job_validation_context("new").map(|c| c.extranonce),
+                    Some(new_extranonce)
+                );
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reattach_with_the_same_extranonce_needs_only_a_clean_job() {
+        let (downstream, wire, events) = held_downstream(false);
+        let extranonce1 = downstream
+            .downstream_data
+            .with(|data| data.extranonce1.clone())
+            .unwrap();
+        events
+            .send(Sv1ServerEvent::Reattach {
+                extranonce1,
+                extranonce2_len: 4,
+            })
+            .await
+            .unwrap();
+        events
+            .send(Sv1ServerEvent::from(notify_with_clean_jobs("new", false)))
+            .await
+            .unwrap();
+        downstream.handle_sv1_server_message().await.unwrap();
+        downstream.handle_sv1_server_message().await.unwrap();
+
+        let Message::Notification(difficulty) = wire.try_recv().unwrap() else {
+            panic!("expected mining.set_difficulty");
+        };
+        assert_eq!(difficulty.method, "mining.set_difficulty");
+        assert_message_eq(
+            &wire.try_recv().unwrap(),
+            &notify_with_clean_jobs("new", true),
+        );
+        assert!(wire.try_recv().is_err());
+        assert!(!downstream.was_asked_to_reconnect());
+    }
+
+    #[tokio::test]
+    async fn reattach_asks_a_miner_that_cannot_take_a_new_extranonce_to_reconnect() {
+        let (downstream, wire, events) = held_downstream(false);
+        events
+            .send(Sv1ServerEvent::Reattach {
+                extranonce1: vec![1, 2, 3, 4].try_into().unwrap(),
+                extranonce2_len: 4,
+            })
+            .await
+            .unwrap();
+        downstream.handle_sv1_server_message().await.unwrap();
+
+        let Message::Notification(reconnect) = wire.try_recv().unwrap() else {
+            panic!("expected client.reconnect");
+        };
+        assert_eq!(reconnect.method, "client.reconnect");
+        assert!(downstream.was_asked_to_reconnect());
+        assert_eq!(
+            downstream
+                .reattach_counters
+                .reconnect
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]

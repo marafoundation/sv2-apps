@@ -255,6 +255,12 @@ pub struct SubmitShareWithChannelId {
 /// Format: `{original_job_id}#{counter}`
 pub(crate) const KEEPALIVE_JOB_ID_DELIMITER: char = '#';
 
+/// Maximum keepalive nTime offset from the original upstream job.
+pub(crate) const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
+
+/// Difficulty below which `mining.set_difficulty` is not rounded to a power of two.
+pub(crate) const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
+
 /// Derives the SV1 worker name from the full `mining.authorize` username.
 pub(crate) fn sv1_worker_name_from_sv1_username(sv1_username: &str) -> &str {
     sv1_username
