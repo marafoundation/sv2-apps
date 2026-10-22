@@ -125,6 +125,25 @@ pub async fn start_pool(
     required_extensions: Vec<u16>,
     enable_monitoring: bool,
 ) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
+    start_pool_with_server_id(
+        template_provider_config,
+        supported_extensions,
+        required_extensions,
+        enable_monitoring,
+        1,
+    )
+    .await
+}
+
+/// [`start_pool`] with an explicit `server_id`, which the pool puts in every extranonce prefix it
+/// hands out. Two pools with different ids never assign the same prefix.
+pub async fn start_pool_with_server_id(
+    template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+    server_id: u8,
+) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -160,7 +179,7 @@ pub async fn start_pool(
         coinbase_reward_script,
         SHARES_PER_MINUTE,
         share_batch_size,
-        1,
+        server_id,
         supported_extensions,
         required_extensions,
         monitoring_address,
