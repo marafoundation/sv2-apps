@@ -29,6 +29,7 @@ pub mod prometheus_metrics_assertions;
 pub mod sniffer;
 pub mod sniffer_error;
 pub mod sv1_minerd;
+pub mod sv1_mock_miner;
 pub mod sv1_sniffer;
 pub mod template_provider;
 pub mod types;
