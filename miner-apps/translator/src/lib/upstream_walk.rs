@@ -2,10 +2,51 @@
 
 use std::{
     collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use crate::utils::UpstreamEntry;
+
+const NOT_CONNECTED: usize = usize::MAX;
+
+/// Upstream connection state shared with monitoring.
+#[derive(Debug)]
+pub(crate) struct UpstreamStatus {
+    addresses: Vec<String>,
+    connected: AtomicUsize,
+    fallbacks: AtomicU64,
+}
+
+#[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
+impl UpstreamStatus {
+    fn new(addresses: Vec<String>) -> Self {
+        Self {
+            addresses,
+            connected: AtomicUsize::new(NOT_CONNECTED),
+            fallbacks: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn addresses(&self) -> &[String] {
+        &self.addresses
+    }
+
+    /// Index of the upstream the translator is serving miners through, if any.
+    pub(crate) fn connected(&self) -> Option<usize> {
+        match self.connected.load(Ordering::Acquire) {
+            NOT_CONNECTED => None,
+            index => Some(index),
+        }
+    }
+
+    pub(crate) fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(Ordering::Relaxed)
+    }
+}
 
 /// The configured upstreams plus the state that decides which one to try next.
 ///
@@ -22,6 +63,7 @@ use crate::utils::UpstreamEntry;
 #[derive(Debug)]
 pub(crate) struct UpstreamWalk {
     entries: Vec<UpstreamEntry>,
+    status: Arc<UpstreamStatus>,
     last_connected: Option<usize>,
     recent_fallbacks: VecDeque<Instant>,
     max_fallbacks: usize,
@@ -34,13 +76,23 @@ impl UpstreamWalk {
         max_fallbacks: usize,
         fallback_window: Duration,
     ) -> Self {
+        let addresses = entries
+            .iter()
+            .map(|entry| format!("{}:{}", entry.host, entry.port))
+            .collect();
         Self {
             entries,
+            status: Arc::new(UpstreamStatus::new(addresses)),
             last_connected: None,
             recent_fallbacks: VecDeque::new(),
             max_fallbacks,
             fallback_window,
         }
+    }
+
+    #[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
+    pub(crate) fn status(&self) -> Arc<UpstreamStatus> {
+        self.status.clone()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -60,12 +112,18 @@ impl UpstreamWalk {
 
     pub(crate) fn mark_connected(&mut self, index: usize) {
         self.last_connected = Some(index);
+        self.status.connected.store(index, Ordering::Release);
     }
 
     /// Records a fallback away from the connected upstream.
     ///
     /// Returns the number of fallbacks inside the window if it exceeds `max_fallbacks`.
     pub(crate) fn record_fallback(&mut self, now: Instant) -> Result<(), usize> {
+        self.status
+            .connected
+            .store(NOT_CONNECTED, Ordering::Release);
+        self.status.fallbacks.fetch_add(1, Ordering::Relaxed);
+
         while self
             .recent_fallbacks
             .front()
@@ -126,6 +184,21 @@ mod tests {
     }
 
     #[test]
+    fn status_tracks_connection_and_fallbacks() {
+        let mut walk = walk(2);
+        let status = walk.status();
+        assert_eq!(status.addresses(), ["127.0.0.1:4000", "127.0.0.1:4001"]);
+        assert_eq!(status.connected(), None);
+
+        walk.mark_connected(1);
+        assert_eq!(status.connected(), Some(1));
+
+        walk.record_fallback(Instant::now()).unwrap();
+        assert_eq!(status.connected(), None);
+        assert_eq!(status.fallbacks(), 1);
+    }
+
+    #[test]
     fn too_many_fallbacks_inside_the_window_are_rejected() {
         let mut walk = walk(2);
         let start = Instant::now();
@@ -155,5 +228,6 @@ mod tests {
             walk.record_fallback(start + Duration::from_secs(600)),
             Ok(())
         );
+        assert_eq!(walk.status().fallbacks(), 6);
     }
 }

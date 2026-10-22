@@ -4,9 +4,91 @@
 //! tProxy has server channels (upstream to pool) but no SV2 clients
 //! (SV1 clients are handled separately by the SV1 monitoring module).
 
-use stratum_apps::monitoring::server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring};
+use std::sync::{Arc, RwLock};
 
-use crate::{TproxyMode, sv2::ChannelManager, utils::AGGREGATED_CHANNEL_ID};
+use stratum_apps::monitoring::{
+    server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring},
+    upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring},
+};
+
+use crate::{
+    TproxyMode, sv1::Sv1Server, sv2::ChannelManager, upstream_walk::UpstreamStatus,
+    utils::AGGREGATED_CHANNEL_ID,
+};
+
+/// The [`ChannelManager`] and [`Sv1Server`] currently serving miners.
+///
+/// Both are rebuilt on every fallback while the monitoring server keeps running, so monitoring
+/// reads them through this handle. Between a fallback and the next upstream connection it is
+/// empty and reports no channels and no SV1 clients, which is what is being served.
+#[derive(Default)]
+pub(crate) struct CurrentGeneration {
+    inner: RwLock<Option<(Arc<ChannelManager>, Arc<Sv1Server>)>>,
+}
+
+impl CurrentGeneration {
+    pub(crate) fn set(&self, channel_manager: Arc<ChannelManager>, sv1_server: Arc<Sv1Server>) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) =
+            Some((channel_manager, sv1_server));
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.inner.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn get(&self) -> Option<(Arc<ChannelManager>, Arc<Sv1Server>)> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl ServerMonitoring for CurrentGeneration {
+    fn get_server(&self) -> ServerInfo {
+        match self.get() {
+            Some((channel_manager, _)) => channel_manager.get_server(),
+            None => ServerInfo {
+                extended_channels: vec![],
+                standard_channels: vec![],
+                coinbase_outputs: vec![],
+            },
+        }
+    }
+}
+
+impl Sv1ClientsMonitoring for CurrentGeneration {
+    fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+        self.get()
+            .map(|(_, sv1_server)| sv1_server.get_sv1_clients())
+            .unwrap_or_default()
+    }
+
+    fn get_sv1_client_by_id(&self, client_id: usize) -> Option<Sv1ClientInfo> {
+        self.get()
+            .and_then(|(_, sv1_server)| sv1_server.get_sv1_client_by_id(client_id))
+    }
+}
+
+impl UpstreamMonitoring for UpstreamStatus {
+    fn get_upstream_info(&self) -> UpstreamInfo {
+        let connected = self.connected();
+        UpstreamInfo {
+            upstreams: self
+                .addresses()
+                .iter()
+                .enumerate()
+                .map(|(index, address)| UpstreamEndpointInfo {
+                    address: address.clone(),
+                    connected: connected == Some(index),
+                })
+                .collect(),
+            fallbacks: self.fallbacks(),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected().is_some()
+    }
+}
 
 impl ServerMonitoring for ChannelManager {
     fn get_server(&self) -> ServerInfo {

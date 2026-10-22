@@ -47,6 +47,10 @@ pub struct TranslatorSv2 {
     drain_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
+    /// The upstream generation monitoring reports on; outlives fallbacks like the monitoring
+    /// server itself.
+    #[cfg(feature = "monitoring")]
+    current_generation: Arc<monitoring::CurrentGeneration>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -62,6 +66,8 @@ impl TranslatorSv2 {
             drain_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
+            #[cfg(feature = "monitoring")]
+            current_generation: Arc::default(),
         }
     }
 

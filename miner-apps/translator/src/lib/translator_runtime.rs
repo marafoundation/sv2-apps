@@ -218,6 +218,11 @@ impl TranslatorRuntime<Init> {
         let runtime = self.bootstrap_io();
         let runtime = runtime.bootstrap_channel_manager();
         let runtime = runtime.bootstrap_sv1_server();
+        #[cfg(feature = "monitoring")]
+        if let Err(e) = runtime.start_monitoring_server() {
+            error!("Failed to initialize monitoring server: {e}");
+            return Err(BootstrapError::from((e, runtime)));
+        }
         let runtime = runtime.try_upstream().await?;
         runtime.start_services().await
     }
@@ -462,11 +467,13 @@ impl TranslatorRuntime<UpstreamReady> {
         .await;
 
         #[cfg(feature = "monitoring")]
-        if let Some(monitoring_addr) = self.translator.config.monitoring_address() {
-            info!("Initializing monitoring server on http://{monitoring_addr}");
-            if let Err(e) = self.start_monitoring_tasks(monitoring_addr) {
-                error!("Failed to initialize monitoring tasks: {e}");
-                return Err(BootstrapError::from((e, self)));
+        {
+            self.translator.current_generation.set(
+                self.state.channel_manager.clone(),
+                self.state.sv1_server.clone(),
+            );
+            if self.translator.config.monitoring_address().is_some() {
+                self.start_miner_telemetry();
             }
         }
 
@@ -482,55 +489,8 @@ impl TranslatorRuntime<UpstreamReady> {
     }
 
     #[cfg(feature = "monitoring")]
-    fn start_monitoring_tasks(&self, monitoring_addr: SocketAddr) -> Result<(), TproxyErrorKind> {
-        let refresh_interval = Duration::from_secs(
-            self.translator
-                .config
-                .monitoring_cache_refresh_secs()
-                .unwrap_or(15),
-        );
-
-        let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
-            monitoring_addr,
-            Some(self.state.channel_manager.clone()),
-            None,
-            refresh_interval,
-        )
-        .map_err(|e| {
-            TproxyErrorKind::General(format!("failed to initialize monitoring server: {e}"))
-        })?
-        .with_sv1_monitoring(self.state.sv1_server.clone())
-        .map_err(|e| TproxyErrorKind::General(format!("failed to add SV1 monitoring: {e}")))?;
-
-        let cancellation_token_clone = self.translator.cancellation_token.clone();
-        let fallback_coordinator_token = self.fallback_coordinator.token();
-        let shutdown_signal = async move {
-            tokio::select! {
-                _ = cancellation_token_clone.cancelled() => {
-                    info!("Monitoring server: received shutdown signal.");
-                }
-                _ = fallback_coordinator_token.cancelled() => {
-                    info!("Monitoring server: fallback triggered.");
-                }
-            }
-        };
-
-        let monitoring_fallback = self.fallback_coordinator.clone();
-        self.task_manager.spawn({
-            let cancellation_token = self.translator.cancellation_token.clone();
-            async move {
-                let fallback_handler = monitoring_fallback.register();
-
-                if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                    error!("Monitoring server error: {:?}", e);
-                    cancellation_token.cancel();
-                }
-
-                fallback_handler.done();
-                info!("Monitoring server task exited and signaled fallback coordinator");
-            }
-        });
-
+    fn start_miner_telemetry(&self) {
+        let refresh_interval = self.monitoring_refresh_interval();
         let telemetry_fallback = self.fallback_coordinator.clone();
         self.task_manager.spawn({
             let cancellation_token = self.translator.cancellation_token.clone();
@@ -546,6 +506,68 @@ impl TranslatorRuntime<UpstreamReady> {
                 fallback_handler.done();
                 info!("SV1 miner telemetry task exited and signaled fallback coordinator");
             }
+        });
+    }
+}
+
+impl<State> TranslatorRuntime<State> {
+    #[cfg(feature = "monitoring")]
+    fn monitoring_refresh_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.translator
+                .config
+                .monitoring_cache_refresh_secs()
+                .unwrap_or(15),
+        )
+    }
+
+    /// Starts the monitoring HTTP server for the lifetime of the process.
+    ///
+    /// It runs before the first upstream connection and across fallbacks, reporting the
+    /// upstream generation through [`crate::monitoring::CurrentGeneration`]. `/api/v1/health`
+    /// returns 503 whenever no upstream is connected, so a load balancer stops routing miners to
+    /// a translator that cannot serve them.
+    ///
+    /// "Connected" means the upstream accepted `SetupConnection`. Health does not prove that a
+    /// mining channel is open (an upstream that never answers `OpenExtendedMiningChannel` keeps
+    /// it at 200), nor that the SV1 listener accepts miners: it stays 200 while draining.
+    #[cfg(feature = "monitoring")]
+    fn start_monitoring_server(&self) -> Result<(), TproxyErrorKind> {
+        let Some(monitoring_addr) = self.translator.config.monitoring_address() else {
+            return Ok(());
+        };
+        info!("Initializing monitoring server on http://{monitoring_addr}");
+        let refresh_interval = self.monitoring_refresh_interval();
+        let current_generation = self.translator.current_generation.clone();
+
+        let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
+            monitoring_addr,
+            Some(current_generation.clone()),
+            None,
+            refresh_interval,
+        )
+        .map_err(|e| {
+            TproxyErrorKind::General(format!("failed to initialize monitoring server: {e}"))
+        })?
+        .with_sv1_monitoring(current_generation)
+        .map_err(|e| TproxyErrorKind::General(format!("failed to add SV1 monitoring: {e}")))?
+        .with_upstream_monitoring(self.upstreams.status())
+        .map_err(|e| TproxyErrorKind::General(format!("failed to add upstream monitoring: {e}")))?;
+
+        let cancellation_token = self.translator.cancellation_token.clone();
+        self.task_manager.spawn(async move {
+            let shutdown_signal = {
+                let cancellation_token = cancellation_token.clone();
+                async move {
+                    cancellation_token.cancelled().await;
+                    info!("Monitoring server: received shutdown signal.");
+                }
+            };
+            if let Err(e) = monitoring_server.run(shutdown_signal).await {
+                error!("Monitoring server error: {:?}", e);
+                cancellation_token.cancel();
+            }
+            info!("Monitoring server task exited");
         });
 
         Ok(())
@@ -577,10 +599,13 @@ impl TranslatorRuntime<Running> {
         mut self,
     ) -> Result<TranslatorRuntime<Sv1ServerReady>, BootstrapError> {
         info!("Preparing fallback");
+        let fallback_budget = self.upstreams.record_fallback(Instant::now());
+        #[cfg(feature = "monitoring")]
+        self.translator.current_generation.clear();
         self.fallback_coordinator.trigger_fallback_and_wait().await;
         info!("All components finished fallback cleanup");
 
-        if let Err(fallbacks) = self.upstreams.record_fallback(Instant::now()) {
+        if let Err(fallbacks) = fallback_budget {
             let window_secs = self.translator.config.fallback_window().as_secs();
             error!(
                 "{fallbacks} fallbacks within {window_secs}s exceed max_fallbacks = {}",

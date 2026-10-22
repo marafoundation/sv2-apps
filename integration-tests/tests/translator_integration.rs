@@ -2760,6 +2760,123 @@ async fn translator_exits_when_fallbacks_exceed_the_budget() {
     );
 }
 
+/// HTTP status of the translator's `/api/v1/health`, or `None` while nothing listens.
+async fn health_status(monitoring_addr: std::net::SocketAddr) -> Option<i32> {
+    let url = format!("http://{monitoring_addr}/api/v1/health");
+    tokio::task::spawn_blocking(move || minreq::get(url).with_timeout(1).send().ok())
+        .await
+        .unwrap()
+        .map(|response| response.status_code)
+}
+
+async fn wait_for_health_status(monitoring_addr: std::net::SocketAddr, expected: i32) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while health_status(monitoring_addr).await != Some(expected) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("/api/v1/health never returned {expected}"));
+}
+
+async fn wait_for_metric_line(monitoring_addr: std::net::SocketAddr, line: &str) {
+    let api = integration_tests_sv2::prometheus_metrics_assertions::MonitoringApi::builder(
+        monitoring_addr,
+    )
+    .build();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !api.fetch_metrics().await.lines().any(|l| l == line) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("/metrics never contained `{line}`"));
+}
+
+/// The monitoring server runs before the first upstream connection and across fallbacks, and
+/// `/api/v1/health` reports whether an upstream is connected.
+///
+/// Each upstream session is a sniffer bound to the translator's single upstream address, in front
+/// of a mock. A sniffer completes the Noise handshake as soon as the translator connects and only
+/// forwards `SetupConnection` once its own upstream is reachable, so the translator waits there
+/// (up to the SetupConnection timeout) instead of exhausting its connection attempts.
+#[tokio::test]
+async fn translator_health_follows_upstream_connection() {
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let first_mock_addr = get_available_address();
+    let first_session = Sniffer::new(
+        "first-session",
+        upstream_addr,
+        first_mock_addr,
+        false,
+        vec![],
+        None,
+    );
+    first_session.start();
+
+    let (translator, _tproxy_addr, monitoring_addr) =
+        start_sv2_translator(&[upstream_addr], false, vec![], vec![], None, true).await;
+    let monitoring_addr = monitoring_addr.expect("monitoring should be enabled");
+
+    // Connected to the sniffer, but no upstream has answered SetupConnection yet.
+    wait_for_health_status(monitoring_addr, 503).await;
+
+    let send_to_tproxy = MockUpstream::new(
+        first_mock_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    wait_for_health_status(monitoring_addr, 200).await;
+    wait_for_metric_line(
+        monitoring_addr,
+        &format!("sv2_upstream_connected{{pool_address=\"{upstream_addr}\"}} 1"),
+    )
+    .await;
+    wait_for_metric_line(monitoring_addr, "sv2_upstream_fallbacks_total 0").await;
+
+    // The first sniffer stopped listening once the translator connected, so the next session can
+    // bind the same address before the first one fails.
+    let second_mock_addr = get_available_address();
+    let _second_mock = MockUpstream::new(
+        second_mock_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let second_session = Sniffer::new(
+        "second-session",
+        upstream_addr,
+        second_mock_addr,
+        false,
+        vec![],
+        None,
+    );
+    second_session.start();
+
+    send_to_tproxy
+        .send(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionError(SetupConnectionErrorOwned {
+                flags: 0,
+                error_code: "health-test-fallback".try_into().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    second_session
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+    wait_for_metric_line(monitoring_addr, "sv2_upstream_fallbacks_total 1").await;
+    wait_for_health_status(monitoring_addr, 200).await;
+
+    translator.shutdown().await;
+}
+
 #[tokio::test]
 async fn tproxy_sends_per_upstream_user_identity() {
     start_tracing();
