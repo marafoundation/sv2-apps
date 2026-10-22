@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -19,6 +19,8 @@ pub(crate) struct UpstreamStatus {
     addresses: Vec<String>,
     connected: AtomicUsize,
     fallbacks: AtomicU64,
+    /// End of the window during which miners are held while no upstream is connected.
+    holding_until: Mutex<Option<Instant>>,
 }
 
 #[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
@@ -28,6 +30,7 @@ impl UpstreamStatus {
             addresses,
             connected: AtomicUsize::new(NOT_CONNECTED),
             fallbacks: AtomicU64::new(0),
+            holding_until: Mutex::new(None),
         }
     }
 
@@ -45,6 +48,18 @@ impl UpstreamStatus {
 
     pub(crate) fn fallbacks(&self) -> u64 {
         self.fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Whether miners are being held, at `now`, for an upstream to reconnect.
+    pub(crate) fn holding(&self, now: Instant) -> bool {
+        self.holding_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| now < until)
+    }
+
+    fn set_holding_until(&self, until: Option<Instant>) {
+        *self.holding_until.lock().unwrap_or_else(|e| e.into_inner()) = until;
     }
 }
 
@@ -113,6 +128,25 @@ impl UpstreamWalk {
     pub(crate) fn mark_connected(&mut self, index: usize) {
         self.last_connected = Some(index);
         self.status.connected.store(index, Ordering::Release);
+        self.status.set_holding_until(None);
+    }
+
+    /// Records that miners are held until `until` while no upstream is connected.
+    pub(crate) fn hold_until(&self, until: Instant) {
+        self.status.set_holding_until(Some(until));
+    }
+
+    /// End of the current hold window, if miners are held.
+    pub(crate) fn holding_until(&self) -> Option<Instant> {
+        *self
+            .status
+            .holding_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn stop_holding(&self) {
+        self.status.set_holding_until(None);
     }
 
     /// Records a fallback away from the connected upstream.
@@ -196,6 +230,18 @@ mod tests {
         walk.record_fallback(Instant::now()).unwrap();
         assert_eq!(status.connected(), None);
         assert_eq!(status.fallbacks(), 1);
+    }
+
+    #[test]
+    fn holding_lasts_until_the_window_ends_or_an_upstream_connects() {
+        let mut walk = walk(1);
+        let status = walk.status();
+        let now = Instant::now();
+        walk.hold_until(now + Duration::from_secs(30));
+        assert!(status.holding(now));
+        assert!(!status.holding(now + Duration::from_secs(30)));
+        walk.mark_connected(0);
+        assert!(!status.holding(now));
     }
 
     #[test]

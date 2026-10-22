@@ -172,6 +172,45 @@ impl<State> TranslatorRuntime<State> {
     }
 }
 
+impl<State> TranslatorRuntime<State> {
+    /// Asks every held miner to reconnect, spread over the drain window, and waits for them to
+    /// leave. Called before shutting down because no upstream connected within the hold window.
+    pub(super) async fn release_held_miners(&self) {
+        let was_holding = self.upstreams.holding_until().is_some();
+        self.upstreams.stop_holding();
+        if !was_holding || !self.sv1.started {
+            return;
+        }
+        let _ = self
+            .sv1
+            .generation_events
+            .try_send(GenerationEvent::Released);
+        let wait = self.translator.config.drain_window() + Duration::from_secs(2);
+        let server = self.sv1.server.clone();
+        if tokio::time::timeout(wait, async move {
+            while !server.downstreams.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            warn!("Held miners did not all leave within {wait:?}");
+        }
+    }
+}
+
+/// `pause` scaled by a random factor in [0.8, 1.2), so translators that lost the same upstream
+/// do not retry in lockstep.
+fn jittered(pause: Duration) -> Duration {
+    let unit = (std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        Instant::now(),
+    ) >> 11) as f64
+        / (1u64 << 53) as f64;
+    pause.mul_f64(0.8 + 0.4 * unit)
+}
+
 impl TranslatorRuntime<Init> {
     pub(super) fn new(translator: TranslatorSv2) -> Result<Self, TproxyErrorKind> {
         let tproxy_mode = TproxyMode::from(translator.config.aggregate_channels);
@@ -344,7 +383,38 @@ impl TranslatorRuntime<ChannelManagerReady> {
     /// Each entry gets a fixed number of attempts before the walk moves on. See [`UpstreamWalk`]
     /// for the order entries are visited in. Returns
     /// [`TproxyErrorKind::CouldNotInitiateSystem`] once every entry has been tried in this walk.
+    ///
+    /// While miners are held after a fallback, walks repeat with a growing pause (1 s doubling to
+    /// 16 s, with jitter) until one connects or the hold window would end before the next walk.
     async fn initialize_upstream(&mut self) -> Result<(), TproxyErrorKind> {
+        const MAX_WALK_PAUSE: Duration = Duration::from_secs(16);
+        let mut pause = Duration::from_secs(1);
+        loop {
+            if self.walk_upstreams().await? {
+                return Ok(());
+            }
+            let Some(until) = self.upstreams.holding_until() else {
+                break;
+            };
+            let delay = jittered(pause);
+            if Instant::now() + delay >= until {
+                break;
+            }
+            warn!("No upstream accepted the connection; holding miners, next attempt in {delay:?}");
+            tokio::select! {
+                _ = self.translator.cancellation_token.cancelled() => {
+                    return Err(TproxyErrorKind::CouldNotInitiateSystem);
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            pause = (pause * 2).min(MAX_WALK_PAUSE);
+        }
+        tracing::error!("All upstreams failed");
+        Err(TproxyErrorKind::CouldNotInitiateSystem)
+    }
+
+    /// One walk over the configured upstreams. Returns whether one connected.
+    async fn walk_upstreams(&mut self) -> Result<bool, TproxyErrorKind> {
         const MAX_RETRIES: usize = 3;
         let upstream_len = self.upstreams.len();
 
@@ -373,7 +443,7 @@ impl TranslatorRuntime<ChannelManagerReady> {
                         self.sv1.server.set_user_identity(user_identity);
 
                         self.upstreams.mark_connected(i);
-                        return Ok(());
+                        return Ok(true);
                     }
                     Err(e) => {
                         if e.action.is_shutdown() {
@@ -401,8 +471,8 @@ impl TranslatorRuntime<ChannelManagerReady> {
             }
         }
 
-        tracing::error!("All upstreams failed after {} retries each", MAX_RETRIES);
-        Err(TproxyErrorKind::CouldNotInitiateSystem)
+        warn!("All upstreams failed after {} retries each", MAX_RETRIES);
+        Ok(false)
     }
 
     // Attempts to initialize a single upstream.
@@ -610,12 +680,29 @@ impl TranslatorRuntime<Running> {
     ) -> Result<TranslatorRuntime<ChannelManagerReady>, BootstrapError> {
         info!("Preparing fallback");
         let fallback_budget = self.upstreams.record_fallback(Instant::now());
+        // Set before the teardown so health does not report the held miners' pod as down.
+        if let Some(hold) = self.translator.config.upstream_loss_hold() {
+            info!("Holding SV1 miners for up to {}s", hold.as_secs());
+            self.upstreams.hold_until(Instant::now() + hold);
+        }
         #[cfg(feature = "monitoring")]
         self.translator.current_generation.clear_channel_manager();
         self.fallback_coordinator.trigger_fallback_and_wait().await;
         info!("All components finished fallback cleanup");
-        // The old channel manager has exited, so this lands behind everything it sent.
-        let _ = self.sv1.generation_events.try_send(GenerationEvent::Ended);
+        // The old channel manager has exited, so this lands behind everything it sent. The next
+        // channel manager must not start before the SV1 server has discarded what is left of
+        // this generation in the queue they share.
+        let (drained, drained_receiver) = tokio::sync::oneshot::channel();
+        let _ = self.sv1.generation_events.try_send(GenerationEvent::Ended {
+            drained: Some(drained),
+        });
+        if self.sv1.started
+            && tokio::time::timeout(Duration::from_secs(5), drained_receiver)
+                .await
+                .is_err()
+        {
+            warn!("SV1 server did not acknowledge the end of the upstream generation");
+        }
 
         if let Err(fallbacks) = fallback_budget {
             let window_secs = self.translator.config.fallback_window().as_secs();

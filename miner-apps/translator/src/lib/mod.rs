@@ -126,6 +126,7 @@ impl TranslatorSv2 {
                         Err(bootstrap_err) => {
                             let (kind, runtime) = bootstrap_err.into_parts();
                             error!(?kind, "Giving up on upstream fallbacks");
+                            runtime.release_held_miners().await;
                             runtime.shutdown().await;
                             return Err(kind);
                         }
@@ -137,6 +138,7 @@ impl TranslatorSv2 {
                             Err(bootstrap_err) => {
                                 let (kind, runtime) = bootstrap_err.into_parts();
                                 error!(?kind, "Failed to start services for Translator Proxy");
+                                runtime.release_held_miners().await;
                                 runtime.shutdown().await;
                                 return Err(kind);
                             }
@@ -144,6 +146,7 @@ impl TranslatorSv2 {
                         Err(bootstrap_err) => {
                             let (kind, runtime) = bootstrap_err.into_parts();
                             error!(?kind, "Failed to reconnect Translator Proxy");
+                            runtime.release_held_miners().await;
                             runtime.shutdown().await;
                             return Err(kind);
                         }

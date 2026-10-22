@@ -106,8 +106,10 @@ impl UpstreamMonitoring for UpstreamStatus {
         }
     }
 
+    /// Reports a translator holding its miners within the hold window as connected, so a load
+    /// balancer does not deregister it and cut the connections it is keeping open.
     fn is_connected(&self) -> bool {
-        self.connected().is_some()
+        self.connected().is_some() || self.holding(std::time::Instant::now())
     }
 }
 

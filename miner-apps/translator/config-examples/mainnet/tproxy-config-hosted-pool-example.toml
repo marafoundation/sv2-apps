@@ -68,6 +68,15 @@ monitoring_cache_refresh_secs = 15
 # max_fallbacks = 5
 # fallback_window_secs = 600
 
+# Keep SV1 miners connected for up to this many seconds after the upstream is lost, while the
+# translator looks for another one (0, the default, disconnects them at once). Held miners get a
+# keep-alive job every `hold_keepalive_notify_secs` and their shares are rejected as stale. On
+# reconnect each miner moves to the new upstream in place: `mining.set_extranonce` if it sent
+# `mining.extranonce.subscribe`, `client.reconnect` otherwise. Size the window above one walk of
+# the upstream list (3 attempts per entry, each up to about 31 seconds).
+# upstream_loss_hold_secs = 0
+# hold_keepalive_notify_secs = 30
+
 # LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
 [miner_telemetry]
 cidrs = ["192.168.1.0/24"]
