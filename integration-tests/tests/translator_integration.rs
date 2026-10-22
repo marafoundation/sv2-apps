@@ -3256,3 +3256,232 @@ async fn translator_drains_sv1_downstreams_gradually() {
         "shutdown should follow the last disconnect"
     );
 }
+
+// The hold tests stop a pool while frames from it may still be queued in the translator. The
+// reader task that owned that connection then drops its buffer pool, whose `Drop` spins until
+// every frame is released, so the tests run on a multi-threaded runtime like the translator
+// binary does; on a current-thread runtime the spin would starve the task holding the frames.
+
+/// A translator that holds miners for `hold_secs` after losing its upstream.
+async fn start_holding_translator(
+    upstreams: &[std::net::SocketAddr],
+    aggregate_channels: bool,
+    hold_secs: u64,
+    hold_keepalive_notify_secs: u64,
+) -> HoldingTranslator {
+    use translator_sv2::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let monitoring_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        upstreams
+            .iter()
+            .map(|addr| {
+                Upstream::new(
+                    addr.ip().to_string(),
+                    addr.port(),
+                    authority_pubkey,
+                    "user_identity".to_string(),
+                )
+            })
+            .collect(),
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        aggregate_channels,
+        vec![],
+        vec![],
+        Some(monitoring_addr),
+        Some(1),
+    );
+    config.upstream_loss_hold_secs = hold_secs;
+    config.hold_keepalive_notify_secs = hold_keepalive_notify_secs;
+    let translator = translator_sv2::TranslatorSv2::new(config);
+    let run = tokio::spawn({
+        let translator = translator.clone();
+        async move { translator.start().await }
+    });
+    HoldingTranslator {
+        translator,
+        listen_addr,
+        monitoring_addr,
+        run,
+    }
+}
+
+struct HoldingTranslator {
+    translator: translator_sv2::TranslatorSv2,
+    listen_addr: std::net::SocketAddr,
+    monitoring_addr: std::net::SocketAddr,
+    run: tokio::task::JoinHandle<Result<(), translator_sv2::error::TproxyErrorKind>>,
+}
+
+/// The miner's connection survives the loss of its pool: it is moved onto the next pool in
+/// place, with `mining.set_extranonce` because the new pool hands out another prefix, and gets a
+/// clean job from it.
+async fn held_miner_is_reattached_to_the_next_pool(aggregate_channels: bool) {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_a, pool_a_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 1).await;
+    let (pool_b, pool_b_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 2).await;
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        ..
+    } = start_holding_translator(&[pool_a_addr, pool_b_addr], aggregate_channels, 60, 30).await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            extranonce_subscribe: true,
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let local_addr = miner.local_addr();
+    let (first_extranonce, _) = miner.extranonce();
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool_a.shutdown().await;
+
+    miner
+        .wait_for_method("mining.set_extranonce", Duration::from_secs(60))
+        .await;
+    let clean_job = miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+    assert_eq!(clean_job[8], serde_json::json!(true), "{clean_job}");
+    assert_ne!(miner.extranonce().0, first_extranonce);
+    assert!(!miner.is_closed());
+    assert_eq!(
+        miner.local_addr(),
+        local_addr,
+        "the same connection was kept"
+    );
+
+    shutdown_all!(translator, pool_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_reattached_to_the_next_pool_non_aggregated() {
+    held_miner_is_reattached_to_the_next_pool(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_reattached_to_the_next_pool_aggregated() {
+    held_miner_is_reattached_to_the_next_pool(true).await;
+}
+
+/// A held miner that never announced `mining.extranonce.subscribe` cannot be given the new
+/// pool's prefix, so it is asked to reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_without_extranonce_support_is_asked_to_reconnect() {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_a, pool_a_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 1).await;
+    let (pool_b, pool_b_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 2).await;
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        ..
+    } = start_holding_translator(&[pool_a_addr, pool_b_addr], false, 60, 30).await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool_a.shutdown().await;
+
+    miner
+        .wait_for_method("client.reconnect", Duration::from_secs(60))
+        .await;
+    assert!(miner.wait_closed(Duration::from_secs(10)).await);
+
+    shutdown_all!(translator, pool_b);
+}
+
+/// With no upstream to go to, a held miner keeps receiving keep-alive jobs, has its shares
+/// rejected as stale, and is asked to reconnect when the hold window ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_released_when_no_upstream_returns() {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        monitoring_addr,
+        run,
+    } = start_holding_translator(&[pool_addr], false, 8, 1).await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            extranonce_subscribe: true,
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool.shutdown().await;
+
+    let keepalive = miner
+        .wait_for_method("mining.notify", Duration::from_secs(10))
+        .await;
+    let keepalive_job_id = keepalive[0].as_str().unwrap().to_string();
+    assert!(keepalive_job_id.contains('#'), "{keepalive}");
+    let response = miner
+        .submit(&keepalive_job_id, Duration::from_secs(10))
+        .await;
+    assert_eq!(response["error"][0], serde_json::json!(21), "{response}");
+    assert!(!miner.is_closed());
+    assert_eq!(
+        health_status(monitoring_addr).await,
+        Some(200),
+        "a translator holding its miners stays in the load balancer"
+    );
+
+    miner
+        .wait_for_method("client.reconnect", Duration::from_secs(30))
+        .await;
+    assert!(miner.wait_closed(Duration::from_secs(10)).await);
+    let result = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the translator exits once the hold window ends")
+        .unwrap();
+    assert!(result.is_err(), "{result:?}");
+    translator.shutdown().await;
+}
