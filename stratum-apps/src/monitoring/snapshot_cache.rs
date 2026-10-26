@@ -56,6 +56,7 @@ use super::{
     prometheus_metrics::PrometheusMetrics,
     server::{ServerInfo, ServerMonitoring, ServerSummary},
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
+    upstream::{UpstreamInfo, UpstreamMonitoring},
 };
 
 /// All `SubmitSharesError.error_code` values defined by `mining_sv2`.
@@ -86,6 +87,8 @@ struct PreviousPrometheusLabelSets {
     server_rejected_share_labels: HashSet<[String; 3]>,
     /// Labels for the coinbase output GaugeVec: [script_hex, address]
     coinbase_output_labels: HashSet<[String; 2]>,
+    /// Labels for the upstream connected GaugeVec: [pool_address]
+    upstream_labels: HashSet<[String; 1]>,
     /// Labels for client per-channel GaugeVecs: [client_id, channel_id, user_identity]
     client_channel_labels: HashSet<[String; 3]>,
     /// Labels for client per-rejection GaugeVecs: [client_id, channel_id, user_identity,
@@ -106,6 +109,7 @@ pub struct MonitoringSnapshot {
     pub sv2_clients_summary: Option<Sv2ClientsSummary>,
     pub sv1_clients: Option<Vec<Sv1ClientInfo>>,
     pub sv1_clients_summary: Option<Sv1ClientsSummary>,
+    pub upstream_info: Option<UpstreamInfo>,
 }
 
 /// A cache that holds monitoring snapshots and refreshes them periodically.
@@ -120,6 +124,7 @@ pub struct SnapshotCache {
     server_source: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
     sv2_clients_source: Option<Arc<dyn Sv2ClientsMonitoring + Send + Sync>>,
     sv1_clients_source: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync>>,
+    upstream_source: Option<Arc<dyn UpstreamMonitoring + Send + Sync>>,
     metrics: Option<PrometheusMetrics>,
     previous_metrics_labels: Mutex<PreviousPrometheusLabelSets>,
 }
@@ -146,6 +151,7 @@ impl Clone for SnapshotCache {
             server_source: self.server_source.clone(),
             sv2_clients_source: self.sv2_clients_source.clone(),
             sv1_clients_source: self.sv1_clients_source.clone(),
+            upstream_source: self.upstream_source.clone(),
             metrics: self.metrics.clone(),
             previous_metrics_labels: Mutex::new(PreviousPrometheusLabelSets {
                 server_channel_labels: previous_metrics_labels.server_channel_labels.clone(),
@@ -153,6 +159,7 @@ impl Clone for SnapshotCache {
                     .server_rejected_share_labels
                     .clone(),
                 coinbase_output_labels: previous_metrics_labels.coinbase_output_labels.clone(),
+                upstream_labels: previous_metrics_labels.upstream_labels.clone(),
                 client_channel_labels: previous_metrics_labels.client_channel_labels.clone(),
                 client_rejected_share_labels: previous_metrics_labels
                     .client_rejected_share_labels
@@ -181,6 +188,7 @@ impl SnapshotCache {
             server_source,
             sv2_clients_source,
             sv1_clients_source: None,
+            upstream_source: None,
             metrics: None,
             previous_metrics_labels: Mutex::new(PreviousPrometheusLabelSets::default()),
         }
@@ -195,10 +203,26 @@ impl SnapshotCache {
         self
     }
 
+    /// Add upstream monitoring source
+    pub fn with_upstream_source(
+        mut self,
+        upstream_source: Arc<dyn UpstreamMonitoring + Send + Sync>,
+    ) -> Self {
+        self.upstream_source = Some(upstream_source);
+        self
+    }
+
+    /// The upstream monitoring source, for callers that need its live state rather than the
+    /// (possibly stale) snapshot.
+    pub fn upstream_source(&self) -> Option<&Arc<dyn UpstreamMonitoring + Send + Sync>> {
+        self.upstream_source.as_ref()
+    }
+
     /// Attach (or replace) Prometheus metrics so they are updated during each `refresh()`.
     ///
     /// This is called once in `MonitoringServer::new` and may be called again in
-    /// `with_sv1_monitoring` which re-creates the metrics with SV1 gauges enabled.
+    /// `with_sv1_monitoring` and `with_upstream_monitoring`, which re-create the metrics with
+    /// the SV1 or upstream gauges enabled.
     pub fn with_metrics(mut self, metrics: PrometheusMetrics) -> Self {
         self.metrics = Some(metrics);
         self
@@ -244,6 +268,11 @@ impl SnapshotCache {
             new_snapshot.sv1_clients_summary = Some(source.get_sv1_clients_summary());
         }
 
+        // Collect upstream data
+        if let Some(ref source) = self.upstream_source {
+            new_snapshot.upstream_info = Some(source.get_upstream_info());
+        }
+
         // Update Prometheus gauges from the new snapshot data
         if let Some(ref metrics) = self.metrics {
             self.update_metrics(metrics, &new_snapshot);
@@ -259,6 +288,7 @@ impl SnapshotCache {
         let mut current_server_labels: HashSet<[String; 2]> = HashSet::new();
         let mut current_server_rejected_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_coinbase_output_labels: HashSet<[String; 2]> = HashSet::new();
+        let mut current_upstream_labels: HashSet<[String; 1]> = HashSet::new();
         let mut current_client_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_client_rejected_labels: HashSet<[String; 4]> = HashSet::new();
 
@@ -499,6 +529,20 @@ impl SnapshotCache {
             }
         }
 
+        // Upstream metrics
+        if let Some(ref upstream) = snapshot.upstream_info {
+            if let Some(ref m) = metrics.sv2_upstream_connected {
+                for endpoint in &upstream.upstreams {
+                    m.with_label_values(&[&endpoint.address])
+                        .set(if endpoint.connected { 1.0 } else { 0.0 });
+                    current_upstream_labels.insert([endpoint.address.clone()]);
+                }
+            }
+            if let Some(ref m) = metrics.sv2_upstream_fallbacks_total {
+                m.set(upstream.fallbacks as f64);
+            }
+        }
+
         // Remove stale label combinations that are no longer in the snapshot
         let mut previous_metrics_labels = self
             .previous_metrics_labels
@@ -547,6 +591,18 @@ impl SnapshotCache {
         }
 
         for stale in previous_metrics_labels
+            .upstream_labels
+            .difference(&current_upstream_labels)
+        {
+            let label_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            if let Some(ref m) = metrics.sv2_upstream_connected {
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale upstream label");
+                }
+            }
+        }
+
+        for stale in previous_metrics_labels
             .client_channel_labels
             .difference(&current_client_labels)
         {
@@ -578,6 +634,7 @@ impl SnapshotCache {
         previous_metrics_labels.server_channel_labels = current_server_labels;
         previous_metrics_labels.server_rejected_share_labels = current_server_rejected_labels;
         previous_metrics_labels.coinbase_output_labels = current_coinbase_output_labels;
+        previous_metrics_labels.upstream_labels = current_upstream_labels;
         previous_metrics_labels.client_channel_labels = current_client_labels;
         previous_metrics_labels.client_rejected_share_labels = current_client_rejected_labels;
     }
@@ -806,7 +863,7 @@ mod tests {
             output("a914aa87", "3pool"),
             output("0014bb", "bc1miner"),
         ])));
-        let metrics = PrometheusMetrics::new(true, false, false).unwrap();
+        let metrics = PrometheusMetrics::new(true, false, false, false).unwrap();
         let cache = SnapshotCache::new(Duration::from_secs(5), Some(source.clone()), None)
             .with_metrics(metrics.clone());
 
@@ -818,5 +875,88 @@ mod tests {
         *source.0.lock().unwrap() = vec![output("a914aa87", "3pool")];
         cache.refresh();
         assert_eq!(series(&metrics), ["3pool=a914aa87"]);
+    }
+
+    struct MutableUpstream(Mutex<UpstreamInfo>);
+    impl UpstreamMonitoring for MutableUpstream {
+        fn get_upstream_info(&self) -> UpstreamInfo {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn is_connected(&self) -> bool {
+            self.0.lock().unwrap().upstreams.iter().any(|u| u.connected)
+        }
+    }
+
+    #[test]
+    fn upstream_gauges_follow_upstream_info() {
+        use super::super::upstream::UpstreamEndpointInfo;
+        let endpoint = |address: &str, connected: bool| UpstreamEndpointInfo {
+            address: address.to_string(),
+            connected,
+        };
+        let series = |metrics: &PrometheusMetrics| -> Vec<String> {
+            let m = metrics.sv2_upstream_connected.as_ref().unwrap();
+            let mut series: Vec<String> = prometheus::core::Collector::collect(m)[0]
+                .get_metric()
+                .iter()
+                .map(|metric| {
+                    format!(
+                        "{}={}",
+                        metric.get_label()[0].get_value(),
+                        metric.get_gauge().get_value()
+                    )
+                })
+                .collect();
+            series.sort();
+            series
+        };
+        let source = Arc::new(MutableUpstream(Mutex::new(UpstreamInfo {
+            upstreams: vec![endpoint("a:1", true), endpoint("b:2", false)],
+            fallbacks: 0,
+        })));
+        let metrics = PrometheusMetrics::new(false, false, false, true).unwrap();
+        let cache = SnapshotCache::new(Duration::from_secs(5), None, None)
+            .with_upstream_source(source.clone())
+            .with_metrics(metrics.clone());
+
+        cache.refresh();
+        assert_eq!(series(&metrics), ["a:1=1", "b:2=0"]);
+        assert_eq!(
+            metrics.sv2_upstream_fallbacks_total.as_ref().unwrap().get(),
+            0.0
+        );
+        assert_eq!(
+            cache.get_snapshot().upstream_info,
+            Some(source.get_upstream_info())
+        );
+
+        // fallback to the second endpoint
+        *source.0.lock().unwrap() = UpstreamInfo {
+            upstreams: vec![endpoint("a:1", false), endpoint("b:2", true)],
+            fallbacks: 1,
+        };
+        cache.refresh();
+        assert_eq!(series(&metrics), ["a:1=0", "b:2=1"]);
+        assert_eq!(
+            metrics.sv2_upstream_fallbacks_total.as_ref().unwrap().get(),
+            1.0
+        );
+
+        // no upstream connected: every configured endpoint still has a series
+        *source.0.lock().unwrap() = UpstreamInfo {
+            upstreams: vec![endpoint("a:1", false), endpoint("b:2", false)],
+            fallbacks: 2,
+        };
+        cache.refresh();
+        assert_eq!(series(&metrics), ["a:1=0", "b:2=0"]);
+
+        // an endpoint that is no longer configured loses its series
+        *source.0.lock().unwrap() = UpstreamInfo {
+            upstreams: vec![endpoint("a:1", true)],
+            fallbacks: 2,
+        };
+        cache.refresh();
+        assert_eq!(series(&metrics), ["a:1=1"]);
     }
 }

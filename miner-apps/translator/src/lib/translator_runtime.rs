@@ -3,7 +3,11 @@
 //! Provides [`TranslatorRuntime`], a structured state-machine orchestrating the translator proxy's
 //! initialization, bootstrap stages, background service loops, and graceful teardown or fallback.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_channel::{Receiver, Sender, unbounded};
 use stratum_apps::{
@@ -13,13 +17,14 @@ use stratum_apps::{
     task_manager::TaskManager,
     utils::types::{GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, InboundFrame, OutboundFrame},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     TranslatorSv2,
     error::{TproxyError, TproxyErrorKind},
     sv1::Sv1Server,
-    sv2::{ChannelManager, Upstream},
+    sv2::{ChannelManager, Upstream, UpstreamConnectOptions},
+    upstream_walk::UpstreamWalk,
     utils::{TproxyMode, UpstreamEntry},
 };
 
@@ -43,7 +48,7 @@ pub(super) struct TranslatorRuntime<State> {
     fallback_coordinator: FallbackCoordinator,
     task_manager: Arc<TaskManager>,
     translator: TranslatorSv2,
-    upstream_addresses: Vec<UpstreamEntry>,
+    upstreams: UpstreamWalk,
     listen_addr: SocketAddr,
     state: State,
 }
@@ -102,7 +107,7 @@ impl<State> TranslatorRuntime<State> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: Failed,
         }
@@ -176,7 +181,7 @@ impl TranslatorRuntime<Init> {
 
         let listen_addr = SocketAddr::new(downstream_addr_ip, translator.config.downstream_port);
 
-        let upstream_addresses = translator
+        let upstream_entries = translator
             .config
             .upstreams
             .iter()
@@ -184,17 +189,21 @@ impl TranslatorRuntime<Init> {
                 host: u.address.clone(),
                 port: u.port,
                 authority_pubkey: u.authority_pubkey,
-                tried_or_flagged: false,
                 user_identity: u.user_identity.clone(),
             })
             .collect();
+        let upstreams = UpstreamWalk::new(
+            upstream_entries,
+            translator.config.max_fallbacks,
+            translator.config.fallback_window(),
+        );
 
         Ok(TranslatorRuntime {
             tproxy_mode,
             fallback_coordinator: FallbackCoordinator::new(),
             task_manager: Arc::new(TaskManager::new()),
             translator,
-            upstream_addresses,
+            upstreams,
             listen_addr,
             state: Init,
         })
@@ -209,6 +218,11 @@ impl TranslatorRuntime<Init> {
         let runtime = self.bootstrap_io();
         let runtime = runtime.bootstrap_channel_manager();
         let runtime = runtime.bootstrap_sv1_server();
+        #[cfg(feature = "monitoring")]
+        if let Err(e) = runtime.start_monitoring_server() {
+            error!("Failed to initialize monitoring server: {e}");
+            return Err(BootstrapError::from((e, runtime)));
+        }
         let runtime = runtime.try_upstream().await?;
         runtime.start_services().await
     }
@@ -228,7 +242,7 @@ impl TranslatorRuntime<Init> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: IoReady {
                 io: Io {
@@ -269,7 +283,7 @@ impl TranslatorRuntime<IoReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: ChannelManagerReady {
                 io: self.state.io,
@@ -294,7 +308,7 @@ impl TranslatorRuntime<ChannelManagerReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: Sv1ServerReady {
                 io: self.state.io,
@@ -318,7 +332,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: UpstreamReady {
                 sv1_server: self.state.sv1_server,
@@ -327,44 +341,32 @@ impl TranslatorRuntime<Sv1ServerReady> {
         })
     }
 
-    /// Initializes the upstream connection list, handling retries, fallbacks, and flagging.
+    /// Walks the configured upstreams until one accepts the connection.
     ///
-    /// Upstreams are tried sequentially, each receiving a fixed number of retries before we
-    /// advance to the next entry. This ensures we exhaust every healthy upstream before shutting
-    /// the translator down.
-    ///
-    /// The `tried_or_flagged` flag in the `UpstreamEntry` acts as the upstream's state machine:
-    ///  `false` means "never tried", while `true` means "already connected or marked as
-    /// malicious". Once an upstream is flagged we skip it on future loops
-    /// to avoid hammering known-bad endpoints during failover.
+    /// Each entry gets a fixed number of attempts before the walk moves on. See [`UpstreamWalk`]
+    /// for the order entries are visited in. Returns
+    /// [`TproxyErrorKind::CouldNotInitiateSystem`] once every entry has been tried in this walk.
     async fn initialize_upstream(&mut self) -> Result<(), TproxyErrorKind> {
         const MAX_RETRIES: usize = 3;
-        let upstream_len = self.upstream_addresses.len();
+        let upstream_len = self.upstreams.len();
 
-        for i in 0..upstream_len {
-            if self.upstream_addresses[i].tried_or_flagged {
-                debug!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
-                );
-                continue;
-            }
-
+        for i in self.upstreams.order() {
             info!(
                 "Trying upstream {} of {}: {}:{}",
                 i + 1,
                 upstream_len,
-                self.upstream_addresses[i].host,
-                self.upstream_addresses[i].port
+                self.upstreams.entry(i).host,
+                self.upstreams.entry(i).port
             );
 
             for attempt in 1..=MAX_RETRIES {
                 info!("Connection attempt {}/{}...", attempt, MAX_RETRIES);
                 tokio::time::sleep(Duration::from_secs(1)).await;
 
-                let upstream_entry = &self.upstream_addresses[i];
+                let upstream_entry = self.upstreams.entry(i);
                 match self.try_initialize_upstream_single(upstream_entry).await {
                     Ok(()) => {
-                        let user_identity = self.upstream_addresses[i].user_identity.to_string();
+                        let user_identity = self.upstreams.entry(i).user_identity.to_string();
                         let payout_mode = self.payout_mode(&user_identity)?;
 
                         self.state
@@ -372,7 +374,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
                             .set_expected_payout_distribution(payout_mode);
                         self.state.sv1_server.set_user_identity(user_identity);
 
-                        self.upstream_addresses[i].tried_or_flagged = true;
+                        self.upstreams.mark_connected(i);
                         return Ok(());
                     }
                     Err(e) => {
@@ -385,20 +387,20 @@ impl TranslatorRuntime<Sv1ServerReady> {
                             "Attempt {}/{} failed for {}:{}: {:?}",
                             attempt,
                             MAX_RETRIES,
-                            self.upstream_addresses[i].host,
-                            self.upstream_addresses[i].port,
+                            self.upstreams.entry(i).host,
+                            self.upstreams.entry(i).port,
                             e
                         );
                         if attempt == MAX_RETRIES {
                             warn!(
                                 "Max retries reached for {}:{}, moving to next upstream",
-                                self.upstream_addresses[i].host, self.upstream_addresses[i].port
+                                self.upstreams.entry(i).host,
+                                self.upstreams.entry(i).port
                             );
                         }
                     }
                 }
             }
-            self.upstream_addresses[i].tried_or_flagged = true;
         }
 
         tracing::error!("All upstreams failed after {} retries each", MAX_RETRIES);
@@ -419,6 +421,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
             self.fallback_coordinator.clone(),
             self.task_manager.clone(),
             self.translator.config.required_extensions.clone(),
+            UpstreamConnectOptions::from(&self.translator.config),
         )
         .await?;
 
@@ -464,11 +467,13 @@ impl TranslatorRuntime<UpstreamReady> {
         .await;
 
         #[cfg(feature = "monitoring")]
-        if let Some(monitoring_addr) = self.translator.config.monitoring_address() {
-            info!("Initializing monitoring server on http://{monitoring_addr}");
-            if let Err(e) = self.start_monitoring_tasks(monitoring_addr) {
-                error!("Failed to initialize monitoring tasks: {e}");
-                return Err(BootstrapError::from((e, self)));
+        {
+            self.translator.current_generation.set(
+                self.state.channel_manager.clone(),
+                self.state.sv1_server.clone(),
+            );
+            if self.translator.config.monitoring_address().is_some() {
+                self.start_miner_telemetry();
             }
         }
 
@@ -477,62 +482,15 @@ impl TranslatorRuntime<UpstreamReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: Running,
         })
     }
 
     #[cfg(feature = "monitoring")]
-    fn start_monitoring_tasks(&self, monitoring_addr: SocketAddr) -> Result<(), TproxyErrorKind> {
-        let refresh_interval = Duration::from_secs(
-            self.translator
-                .config
-                .monitoring_cache_refresh_secs()
-                .unwrap_or(15),
-        );
-
-        let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
-            monitoring_addr,
-            Some(self.state.channel_manager.clone()),
-            None,
-            refresh_interval,
-        )
-        .map_err(|e| {
-            TproxyErrorKind::General(format!("failed to initialize monitoring server: {e}"))
-        })?
-        .with_sv1_monitoring(self.state.sv1_server.clone())
-        .map_err(|e| TproxyErrorKind::General(format!("failed to add SV1 monitoring: {e}")))?;
-
-        let cancellation_token_clone = self.translator.cancellation_token.clone();
-        let fallback_coordinator_token = self.fallback_coordinator.token();
-        let shutdown_signal = async move {
-            tokio::select! {
-                _ = cancellation_token_clone.cancelled() => {
-                    info!("Monitoring server: received shutdown signal.");
-                }
-                _ = fallback_coordinator_token.cancelled() => {
-                    info!("Monitoring server: fallback triggered.");
-                }
-            }
-        };
-
-        let monitoring_fallback = self.fallback_coordinator.clone();
-        self.task_manager.spawn({
-            let cancellation_token = self.translator.cancellation_token.clone();
-            async move {
-                let fallback_handler = monitoring_fallback.register();
-
-                if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                    error!("Monitoring server error: {:?}", e);
-                    cancellation_token.cancel();
-                }
-
-                fallback_handler.done();
-                info!("Monitoring server task exited and signaled fallback coordinator");
-            }
-        });
-
+    fn start_miner_telemetry(&self) {
+        let refresh_interval = self.monitoring_refresh_interval();
         let telemetry_fallback = self.fallback_coordinator.clone();
         self.task_manager.spawn({
             let cancellation_token = self.translator.cancellation_token.clone();
@@ -548,6 +506,68 @@ impl TranslatorRuntime<UpstreamReady> {
                 fallback_handler.done();
                 info!("SV1 miner telemetry task exited and signaled fallback coordinator");
             }
+        });
+    }
+}
+
+impl<State> TranslatorRuntime<State> {
+    #[cfg(feature = "monitoring")]
+    fn monitoring_refresh_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.translator
+                .config
+                .monitoring_cache_refresh_secs()
+                .unwrap_or(15),
+        )
+    }
+
+    /// Starts the monitoring HTTP server for the lifetime of the process.
+    ///
+    /// It runs before the first upstream connection and across fallbacks, reporting the
+    /// upstream generation through [`crate::monitoring::CurrentGeneration`]. `/api/v1/health`
+    /// returns 503 whenever no upstream is connected, so a load balancer stops routing miners to
+    /// a translator that cannot serve them.
+    ///
+    /// "Connected" means the upstream accepted `SetupConnection`. Health does not prove that a
+    /// mining channel is open (an upstream that never answers `OpenExtendedMiningChannel` keeps
+    /// it at 200), nor that the SV1 listener accepts miners: it stays 200 while draining.
+    #[cfg(feature = "monitoring")]
+    fn start_monitoring_server(&self) -> Result<(), TproxyErrorKind> {
+        let Some(monitoring_addr) = self.translator.config.monitoring_address() else {
+            return Ok(());
+        };
+        info!("Initializing monitoring server on http://{monitoring_addr}");
+        let refresh_interval = self.monitoring_refresh_interval();
+        let current_generation = self.translator.current_generation.clone();
+
+        let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
+            monitoring_addr,
+            Some(current_generation.clone()),
+            None,
+            refresh_interval,
+        )
+        .map_err(|e| {
+            TproxyErrorKind::General(format!("failed to initialize monitoring server: {e}"))
+        })?
+        .with_sv1_monitoring(current_generation)
+        .map_err(|e| TproxyErrorKind::General(format!("failed to add SV1 monitoring: {e}")))?
+        .with_upstream_monitoring(self.upstreams.status())
+        .map_err(|e| TproxyErrorKind::General(format!("failed to add upstream monitoring: {e}")))?;
+
+        let cancellation_token = self.translator.cancellation_token.clone();
+        self.task_manager.spawn(async move {
+            let shutdown_signal = {
+                let cancellation_token = cancellation_token.clone();
+                async move {
+                    cancellation_token.cancelled().await;
+                    info!("Monitoring server: received shutdown signal.");
+                }
+            };
+            if let Err(e) = monitoring_server.run(shutdown_signal).await {
+                error!("Monitoring server error: {:?}", e);
+                cancellation_token.cancel();
+            }
+            info!("Monitoring server task exited");
         });
 
         Ok(())
@@ -571,24 +591,48 @@ impl TranslatorRuntime<Running> {
         }
     }
 
-    pub(super) async fn cleanup_for_fallback(self) -> TranslatorRuntime<Sv1ServerReady> {
+    /// Tears down the current upstream generation and prepares a fresh one.
+    ///
+    /// Fails with [`TproxyErrorKind::FallbackLoop`] when this fallback exceeds the configured
+    /// budget; the caller then shuts the translator down.
+    pub(super) async fn cleanup_for_fallback(
+        mut self,
+    ) -> Result<TranslatorRuntime<Sv1ServerReady>, BootstrapError> {
         info!("Preparing fallback");
+        let fallback_budget = self.upstreams.record_fallback(Instant::now());
+        #[cfg(feature = "monitoring")]
+        self.translator.current_generation.clear();
         self.fallback_coordinator.trigger_fallback_and_wait().await;
         info!("All components finished fallback cleanup");
 
+        if let Err(fallbacks) = fallback_budget {
+            let window_secs = self.translator.config.fallback_window().as_secs();
+            error!(
+                "{fallbacks} fallbacks within {window_secs}s exceed max_fallbacks = {}",
+                self.translator.config.max_fallbacks
+            );
+            return Err(BootstrapError::from((
+                TproxyErrorKind::FallbackLoop {
+                    fallbacks,
+                    window_secs,
+                },
+                self,
+            )));
+        }
+
         let fresh_fallback_coordinator = FallbackCoordinator::new();
 
-        TranslatorRuntime {
+        Ok(TranslatorRuntime {
             tproxy_mode: self.tproxy_mode,
             fallback_coordinator: fresh_fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             listen_addr: self.listen_addr,
             state: Init,
         }
         .bootstrap_io()
         .bootstrap_channel_manager()
-        .bootstrap_sv1_server()
+        .bootstrap_sv1_server())
     }
 }

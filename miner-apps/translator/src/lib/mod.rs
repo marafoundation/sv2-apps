@@ -35,6 +35,7 @@ mod monitoring;
 pub mod sv1;
 pub mod sv2;
 mod translator_runtime;
+mod upstream_walk;
 pub mod utils;
 
 /// The main struct that manages the SV1/SV2 translator.
@@ -46,6 +47,10 @@ pub struct TranslatorSv2 {
     drain_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
+    /// The upstream generation monitoring reports on; outlives fallbacks like the monitoring
+    /// server itself.
+    #[cfg(feature = "monitoring")]
+    current_generation: Arc<monitoring::CurrentGeneration>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -61,6 +66,8 @@ impl TranslatorSv2 {
             drain_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
+            #[cfg(feature = "monitoring")]
+            current_generation: Arc::default(),
         }
     }
 
@@ -87,6 +94,7 @@ impl TranslatorSv2 {
     ///    termination.
     pub async fn start(&self) -> Result<(), TproxyErrorKind> {
         info!("Starting Translator Proxy...");
+        self.config.warn_about_ignored_settings();
 
         let runtime = match TranslatorRuntime::<Init>::new(self.clone()) {
             Ok(runtime) => runtime,
@@ -113,7 +121,15 @@ impl TranslatorSv2 {
                     return Ok(());
                 }
                 RuntimeEvent::Fallback => {
-                    let sv1_ready_runtime = running.cleanup_for_fallback().await;
+                    let sv1_ready_runtime = match running.cleanup_for_fallback().await {
+                        Ok(runtime) => runtime,
+                        Err(bootstrap_err) => {
+                            let (kind, runtime) = bootstrap_err.into_parts();
+                            error!(?kind, "Giving up on upstream fallbacks");
+                            runtime.shutdown().await;
+                            return Err(kind);
+                        }
+                    };
 
                     running = match sv1_ready_runtime.try_upstream().await {
                         Ok(new_running) => match new_running.start_services().await {

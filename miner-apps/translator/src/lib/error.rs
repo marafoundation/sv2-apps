@@ -218,6 +218,8 @@ pub enum TproxyErrorKind {
     TlvError(parsers_sv2::TlvError),
     /// Setup connection error
     SetupConnectionError,
+    /// The upstream did not answer SetupConnection within the configured timeout
+    SetupConnectionTimeout,
     /// Open mining channel error
     OpenMiningChannelError,
     /// Could not initiate subsystem
@@ -260,6 +262,8 @@ pub enum TproxyErrorKind {
     DownstreamNotPresent(DownstreamId),
     /// Coinbase payout verification failed for a solo/donation user identity
     PayoutVerificationFailed(String),
+    /// More fallbacks than allowed happened within the configured window
+    FallbackLoop { fallbacks: usize, window_secs: u64 },
 }
 
 impl std::error::Error for TproxyErrorKind {}
@@ -325,6 +329,9 @@ impl fmt::Display for TproxyErrorKind {
             TlvError(e) => write!(f, "TLV error: {e:?}"),
             OpenMiningChannelError => write!(f, "failed to open mining channel"),
             SetupConnectionError => write!(f, "failed to setup connection with upstream"),
+            SetupConnectionTimeout => {
+                write!(f, "upstream did not answer SetupConnection in time")
+            }
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             DownstreamNotFoundWithChannelId(channel_id) => {
                 write!(f, "Downstream not found with channel id: {channel_id}")
@@ -369,6 +376,13 @@ impl fmt::Display for TproxyErrorKind {
                 "downstream not found with downstream_id: {downstream_id}"
             ),
             PayoutVerificationFailed(e) => write!(f, "Payout verification failed: {e}"),
+            FallbackLoop {
+                fallbacks,
+                window_secs,
+            } => write!(
+                f,
+                "{fallbacks} upstream fallbacks within {window_secs}s, giving up"
+            ),
         }
     }
 }

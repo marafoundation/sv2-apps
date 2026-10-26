@@ -1,12 +1,13 @@
 pub mod common_message_handler;
 
 use crate::{
+    config::{TcpKeepaliveConfig, TranslatorConfig},
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     io_task::spawn_io_tasks,
     utils::UpstreamEntry,
 };
 use async_channel::{Receiver, Sender, unbounded};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
@@ -28,6 +29,7 @@ use stratum_apps::{
     },
 };
 
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -69,6 +71,51 @@ impl UpstreamIo {
     }
 }
 
+/// Per-connection settings for [`Upstream::new`], derived from the [`TranslatorConfig`].
+#[derive(Debug, Clone)]
+pub struct UpstreamConnectOptions {
+    /// How long to wait for the upstream to answer `SetupConnection`.
+    pub setup_connection_timeout: Duration,
+    /// TCP keepalive for the upstream socket, `None` to leave it off.
+    pub tcp_keepalive: Option<TcpKeepaliveConfig>,
+}
+
+impl From<&TranslatorConfig> for UpstreamConnectOptions {
+    fn from(config: &TranslatorConfig) -> Self {
+        Self {
+            setup_connection_timeout: config.setup_connection_timeout(),
+            tcp_keepalive: config.upstream_tcp_keepalive(),
+        }
+    }
+}
+
+/// Enables TCP keepalive on `socket` so the kernel detects a peer that vanished without closing
+/// the connection.
+///
+/// The interval and probe count are only applied on platforms that support them.
+fn apply_tcp_keepalive(socket: &TcpStream, config: &TcpKeepaliveConfig) -> std::io::Result<()> {
+    let mut keepalive = TcpKeepalive::new().with_time(config.idle);
+    // The targets on which socket2 0.6 provides `with_interval` and `with_retries`.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "windows"
+    ))]
+    {
+        if let Some(interval) = config.interval {
+            keepalive = keepalive.with_interval(interval);
+        }
+        if let Some(probes) = config.probes {
+            keepalive = keepalive.with_retries(probes);
+        }
+    }
+    SockRef::from(socket).set_tcp_keepalive(&keepalive)
+}
+
 /// Manages the upstream SV2 connection to a mining pool or proxy.
 ///
 /// This struct handles the SV2 protocol communication with upstream servers,
@@ -88,6 +135,10 @@ pub struct Upstream {
     /// Extensions that the translator requires (must be supported by server)
     required_extensions: Vec<u16>,
     address: SocketAddr,
+    setup_connection_timeout: Duration,
+    /// Stops the reader and writer tasks of this connection without affecting the rest of the
+    /// translator. It is cancelled when setup fails, because nothing else would wake them.
+    io_cancellation: CancellationToken,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -157,14 +208,12 @@ impl Upstream {
     ///
     /// # Arguments
     /// * `upstreams` - A single `UpstreamEntry` representing the upstream candidate currently being
-    ///   attempted. The `tried_or_flagged` is set once the upstream has either been connected to
-    ///   successfully or marked as malicious. Because `new` is only called from
-    ///   `try_initialize_upstream`, we can treat this flag as the definitive state for that
-    ///   upstream.
+    ///   attempted.
     /// * `channel_manager_sender` - Channel to send messages to the channel manager
     /// * `channel_manager_receiver` - Channel to receive messages from the channel manager
     /// * `cancellation_token` - Global application cancellation token
     /// * `fallback_coordinator` - Coordinator for upstream fallback
+    /// * `options` - Per-connection settings such as the `SetupConnection` timeout
     ///
     /// # Returns
     /// * `Ok(Upstream)` - Successfully connected to an upstream server
@@ -178,6 +227,7 @@ impl Upstream {
         fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
         required_extensions: Vec<u16>,
+        options: UpstreamConnectOptions,
     ) -> TproxyResult<Self, error::Upstream> {
         info!(
             "Trying to connect to upstream at {}:{}",
@@ -214,6 +264,12 @@ impl Upstream {
                 let resolved_addr = socket.peer_addr().map_err(TproxyError::fallback)?;
                 info!("Connected to upstream at {}", resolved_addr);
 
+                if let Some(keepalive) = &options.tcp_keepalive {
+                    if let Err(e) = apply_tcp_keepalive(&socket, keepalive) {
+                        warn!("Failed to enable TCP keepalive on upstream socket: {e}");
+                    }
+                }
+
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {
@@ -225,6 +281,7 @@ impl Upstream {
                             Ok(stream) => {
                                 let (reader, writer) = stream.into_split();
 
+                                let io_cancellation = cancellation_token.child_token();
                                 let (outbound_tx, outbound_rx) = unbounded();
                                 let (inbound_tx, inbound_rx) = unbounded();
 
@@ -234,7 +291,7 @@ impl Upstream {
                                     writer,
                                     outbound_rx,
                                     inbound_tx,
-                                    cancellation_token.clone(),
+                                    io_cancellation.clone(),
                                     fallback_coordinator.clone(),
                                 );
 
@@ -253,6 +310,8 @@ impl Upstream {
                                     upstream_io,
                                     required_extensions: required_extensions.clone(),
                                     address: resolved_addr,
+                                    setup_connection_timeout: options.setup_connection_timeout,
+                                    io_cancellation,
                                 })
                             }
                             Err(network_helpers::Error::InvalidKey) => {
@@ -313,6 +372,7 @@ impl Upstream {
             result = self.setup_connection() => {
                 if let Err(e) = result {
                     error!("Upstream: failed to set up SV2 connection: {e:?}");
+                    self.io_cancellation.cancel();
                     return Err(e);
                 }
             }
@@ -353,7 +413,20 @@ impl Upstream {
                 TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
             })?;
 
-        let mut incoming: InboundFrame = match self.upstream_io.upstream_receiver.recv().await {
+        let response = tokio::time::timeout(
+            self.setup_connection_timeout,
+            self.upstream_io.upstream_receiver.recv(),
+        )
+        .await
+        .map_err(|_| {
+            error!(
+                "Upstream {} did not answer SetupConnection within {:?}",
+                self.address, self.setup_connection_timeout
+            );
+            TproxyError::fallback(TproxyErrorKind::SetupConnectionTimeout)
+        })?;
+
+        let mut incoming: InboundFrame = match response {
             Ok(frame) => {
                 debug!("Received handshake response from upstream.");
                 frame
@@ -586,5 +659,90 @@ impl Upstream {
             firmware,
             device_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIMEOUT: Duration = Duration::from_secs(7);
+
+    #[tokio::test]
+    async fn tcp_keepalive_is_applied_to_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let config = TcpKeepaliveConfig {
+            idle: Duration::from_secs(41),
+            interval: Some(Duration::from_secs(7)),
+            probes: Some(4),
+        };
+        assert!(!SockRef::from(&socket).keepalive().unwrap());
+
+        apply_tcp_keepalive(&socket, &config).unwrap();
+
+        let sock = SockRef::from(&socket);
+        assert!(sock.keepalive().unwrap());
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), config.idle);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(
+                sock.tcp_keepalive_interval().unwrap(),
+                Duration::from_secs(7)
+            );
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), 4);
+        }
+    }
+
+    /// An `Upstream` whose peer never sends anything. The returned receiver shows what the
+    /// translator sent and the returned sender keeps the peer's channel open.
+    fn silent_upstream() -> (Upstream, Receiver<OutboundFrame>, Sender<InboundFrame>) {
+        let (outbound_tx, outbound_rx) = unbounded();
+        let (inbound_tx, inbound_rx) = unbounded::<InboundFrame>();
+        let (cm_sender, _cm_inbound) = unbounded();
+        let (_cm_outbound, cm_receiver) = unbounded();
+        let upstream = Upstream {
+            upstream_io: UpstreamIo::new(inbound_rx, outbound_tx, cm_sender, cm_receiver),
+            required_extensions: vec![],
+            address: "127.0.0.1:3333".parse().unwrap(),
+            setup_connection_timeout: TIMEOUT,
+            io_cancellation: CancellationToken::new(),
+        };
+        (upstream, outbound_rx, inbound_tx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_connection_times_out_when_upstream_stays_silent() {
+        let (mut upstream, sent, _peer) = silent_upstream();
+
+        let started = tokio::time::Instant::now();
+        let err = upstream.setup_connection().await.unwrap_err();
+
+        assert!(matches!(err.kind, TproxyErrorKind::SetupConnectionTimeout));
+        assert!(matches!(err.action, Action::Fallback));
+        assert_eq!(started.elapsed(), TIMEOUT);
+        assert!(sent.try_recv().is_ok(), "SetupConnection was not sent");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_setup_stops_the_connection_io_tasks() {
+        let (upstream, _sent, _peer) = silent_upstream();
+        let io_cancellation = upstream.io_cancellation.clone();
+        let cancellation_token = CancellationToken::new();
+        let fallback_coordinator = FallbackCoordinator::new();
+
+        let result = upstream
+            .start(
+                cancellation_token.clone(),
+                fallback_coordinator,
+                Arc::new(TaskManager::new()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(io_cancellation.is_cancelled());
+        assert!(!cancellation_token.is_cancelled());
     }
 }

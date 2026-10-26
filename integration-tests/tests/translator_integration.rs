@@ -3,6 +3,7 @@ use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwn
 use integration_tests_sv2::{
     interceptor::{IgnoreMessage, MessageDirection, ReplaceMessage},
     mock_roles::{MockUpstream, WithSetup},
+    sniffer::Sniffer,
     start_sv2_translator_with_user_identities,
     sv1_sniffer::SV1MessageFilter,
     template_provider::DifficultyLevel,
@@ -2643,6 +2644,239 @@ async fn test_translator_fallback_during_abrupt_disconnection() {
     shutdown_all!(translator, pool_2);
 }
 
+/// A translator with a single upstream reconnects to it after the connection drops, instead of
+/// treating the upstream it was just using as spent and exiting.
+#[tokio::test]
+async fn translator_reconnects_to_its_only_upstream_after_it_drops() {
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let _first_session = MockUpstream::new(
+        upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .disconnect_after_setup_connection_success(Duration::from_secs(1))
+    .start()
+    .await;
+
+    let (translator, _tproxy_addr, _) =
+        start_sv2_translator(&[upstream_addr], false, vec![], vec![], None, false).await;
+
+    // The mock stops listening once the translator connects; the restarted upstream is a fresh
+    // mock behind a sniffer bound to the same address.
+    loop {
+        match TcpListener::bind(upstream_addr).await {
+            Ok(listener) => {
+                drop(listener);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let restarted_addr = get_available_address();
+    let _second_session = MockUpstream::new(
+        restarted_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let restarted_sniffer = Sniffer::new(
+        "restarted",
+        upstream_addr,
+        restarted_addr,
+        false,
+        vec![],
+        None,
+    );
+    restarted_sniffer.start();
+
+    restarted_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    restarted_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+    translator.shutdown().await;
+}
+
+/// With `max_fallbacks = 0` the first fallback is fatal: `start()` returns `FallbackLoop`
+/// instead of reconnecting.
+#[tokio::test]
+async fn translator_exits_when_fallbacks_exceed_the_budget() {
+    use translator_sv2::{
+        config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream},
+        error::TproxyErrorKind,
+    };
+
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let _session = MockUpstream::new(
+        upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .disconnect_after_setup_connection_success(Duration::from_secs(1))
+    .start()
+    .await;
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        vec![Upstream::new(
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            authority_pubkey,
+            "user_identity".to_string(),
+        )],
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        true,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    config.max_fallbacks = 0;
+    let translator = translator_sv2::TranslatorSv2::new(config);
+
+    let result = tokio::time::timeout(Duration::from_secs(30), translator.start())
+        .await
+        .expect("translator should exit on the first fallback");
+    assert!(
+        matches!(
+            result,
+            Err(TproxyErrorKind::FallbackLoop { fallbacks: 1, .. })
+        ),
+        "unexpected result: {result:?}"
+    );
+}
+
+/// HTTP status of the translator's `/api/v1/health`, or `None` while nothing listens.
+async fn health_status(monitoring_addr: std::net::SocketAddr) -> Option<i32> {
+    let url = format!("http://{monitoring_addr}/api/v1/health");
+    tokio::task::spawn_blocking(move || minreq::get(url).with_timeout(1).send().ok())
+        .await
+        .unwrap()
+        .map(|response| response.status_code)
+}
+
+async fn wait_for_health_status(monitoring_addr: std::net::SocketAddr, expected: i32) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while health_status(monitoring_addr).await != Some(expected) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("/api/v1/health never returned {expected}"));
+}
+
+async fn wait_for_metric_line(monitoring_addr: std::net::SocketAddr, line: &str) {
+    let api = integration_tests_sv2::prometheus_metrics_assertions::MonitoringApi::builder(
+        monitoring_addr,
+    )
+    .build();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !api.fetch_metrics().await.lines().any(|l| l == line) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("/metrics never contained `{line}`"));
+}
+
+/// The monitoring server runs before the first upstream connection and across fallbacks, and
+/// `/api/v1/health` reports whether an upstream is connected.
+///
+/// Each upstream session is a sniffer bound to the translator's single upstream address, in front
+/// of a mock. A sniffer completes the Noise handshake as soon as the translator connects and only
+/// forwards `SetupConnection` once its own upstream is reachable, so the translator waits there
+/// (up to the SetupConnection timeout) instead of exhausting its connection attempts.
+#[tokio::test]
+async fn translator_health_follows_upstream_connection() {
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let first_mock_addr = get_available_address();
+    let first_session = Sniffer::new(
+        "first-session",
+        upstream_addr,
+        first_mock_addr,
+        false,
+        vec![],
+        None,
+    );
+    first_session.start();
+
+    let (translator, _tproxy_addr, monitoring_addr) =
+        start_sv2_translator(&[upstream_addr], false, vec![], vec![], None, true).await;
+    let monitoring_addr = monitoring_addr.expect("monitoring should be enabled");
+
+    // Connected to the sniffer, but no upstream has answered SetupConnection yet.
+    wait_for_health_status(monitoring_addr, 503).await;
+
+    let send_to_tproxy = MockUpstream::new(
+        first_mock_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    wait_for_health_status(monitoring_addr, 200).await;
+    wait_for_metric_line(
+        monitoring_addr,
+        &format!("sv2_upstream_connected{{pool_address=\"{upstream_addr}\"}} 1"),
+    )
+    .await;
+    wait_for_metric_line(monitoring_addr, "sv2_upstream_fallbacks_total 0").await;
+
+    // The first sniffer stopped listening once the translator connected, so the next session can
+    // bind the same address before the first one fails.
+    let second_mock_addr = get_available_address();
+    let _second_mock = MockUpstream::new(
+        second_mock_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let second_session = Sniffer::new(
+        "second-session",
+        upstream_addr,
+        second_mock_addr,
+        false,
+        vec![],
+        None,
+    );
+    second_session.start();
+
+    send_to_tproxy
+        .send(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionError(SetupConnectionErrorOwned {
+                flags: 0,
+                error_code: "health-test-fallback".try_into().unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+
+    second_session
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+    wait_for_metric_line(monitoring_addr, "sv2_upstream_fallbacks_total 1").await;
+    wait_for_health_status(monitoring_addr, 200).await;
+
+    translator.shutdown().await;
+}
+
 #[tokio::test]
 async fn tproxy_sends_per_upstream_user_identity() {
     start_tracing();
@@ -2806,6 +3040,99 @@ async fn tproxy_per_upstream_user_identity_switches_on_fallback() {
     assert_eq!(
         identity_str, expected,
         "expected fallback pool identity '{expected}', got '{identity_str}'"
+    );
+
+    shutdown_all!(translator);
+}
+
+// An upstream that completes the Noise handshake but never answers SetupConnection must not
+// stall the translator: after the configured timeout it moves on to the next upstream.
+#[tokio::test]
+async fn translator_falls_back_when_setup_connection_is_never_answered() {
+    use translator_sv2::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+
+    start_tracing();
+    let silent_addr = get_available_address();
+    let _silent_upstream = MockUpstream::new(silent_addr, WithSetup::no())
+        .start()
+        .await;
+    let (silent_sniffer, silent_sniffer_addr) =
+        start_sniffer("silent", silent_addr, false, vec![], None);
+
+    let answering_addr = get_available_address();
+    let _answering_upstream = MockUpstream::new(
+        answering_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let (answering_sniffer, answering_sniffer_addr) =
+        start_sniffer("answering", answering_addr, false, vec![], None);
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        [silent_sniffer_addr, answering_sniffer_addr]
+            .iter()
+            .map(|addr| {
+                Upstream::new(
+                    addr.ip().to_string(),
+                    addr.port(),
+                    authority_pubkey,
+                    "user_identity".to_string(),
+                )
+            })
+            .collect(),
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        true,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    let timeout = Duration::from_secs(2);
+    config.setup_connection_timeout_secs = Some(timeout.as_secs());
+    let translator = translator_sv2::TranslatorSv2::new(config);
+    let started = tokio::time::Instant::now();
+    tokio::spawn({
+        let translator = translator.clone();
+        async move {
+            let _ = translator.start().await;
+        }
+    });
+
+    silent_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    answering_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    answering_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    // The first attempt on the silent upstream times out; the mock only accepts one connection,
+    // so the retries are refused quickly and the second upstream is tried a few seconds later.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= timeout,
+        "fell back after {elapsed:?}, before the {timeout:?} timeout elapsed"
+    );
+    assert!(
+        elapsed < timeout + Duration::from_secs(10),
+        "fallback took {elapsed:?}, far longer than the {timeout:?} timeout"
     );
 
     shutdown_all!(translator);

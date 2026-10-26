@@ -42,12 +42,31 @@ monitoring_cache_refresh_secs = 15
 # channels_sv2 default of 16; set `ceil(16s / your job interval)` to reclaim ~4.5 kB per job.
 # max_past_jobs = 3
 
+# Seconds to wait for an upstream to answer SetupConnection before moving on to the next
+# attempt or upstream (optional). Unset or 0 uses the default of 10.
+# setup_connection_timeout_secs = 10
+
+# TCP keepalive on the upstream connection (optional). Without it a pool that silently stops
+# responding (e.g. a dropped route) is only noticed after the operating system gives up
+# retransmitting, around 15 minutes on Linux once data is unacknowledged, and never while the
+# connection is idle. Keepalive is on when the idle time is set; the interval and probe count
+# then override the operating system defaults and are ignored without it.
+# upstream_tcp_keepalive_idle_secs = 30
+# upstream_tcp_keepalive_interval_secs = 10
+# upstream_tcp_keepalive_probes = 3
+
 # Seconds to drain SV1 miners for on SIGTERM/SIGINT (optional). The listener closes and miners
 # are disconnected gradually across the window while the upstream stays up; 0 drops them all at
 # once. Size your supervisor stop timeout (e.g. Kubernetes terminationGracePeriodSeconds) above it.
 # drain_seconds = 0
 # Send `client.reconnect` to each miner before closing its connection during the drain.
 # drain_send_reconnect = false
+
+# Upstreams that served miners stay eligible for later fallbacks. To stop an upstream that accepts
+# connections and then keeps failing from looping forever, more than `max_fallbacks` fallbacks
+# within `fallback_window_secs` makes the translator exit (0 exits on the first fallback).
+# max_fallbacks = 5
+# fallback_window_secs = 600
 
 # LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
 [miner_telemetry]
