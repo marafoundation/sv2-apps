@@ -135,6 +135,33 @@ pub struct TranslatorConfig {
     /// Window, in seconds, over which `max_fallbacks` is counted.
     #[serde(default = "default_fallback_window_secs")]
     pub fallback_window_secs: u64,
+    /// Seconds to keep SV1 miners connected after the upstream is lost, while the translator
+    /// looks for another one.
+    ///
+    /// Held miners keep their connection and are sent keep-alive jobs (see
+    /// `hold_keepalive_notify_secs`); shares they submit meanwhile are rejected as stale. When an
+    /// upstream connects within the window every miner is moved onto it in place, receiving
+    /// `mining.set_extranonce` if it sent `mining.extranonce.subscribe` and `client.reconnect`
+    /// otherwise. Prefixes rarely match across pools or pool restarts, so a miner without
+    /// `mining.extranonce.subscribe` support almost always ends up reconnecting: the hold delays
+    /// that until an upstream exists rather than avoiding it. When the window runs out every
+    /// miner is sent `client.reconnect` and the translator exits. `0` (the default) disconnects
+    /// every miner as soon as the upstream is lost.
+    ///
+    /// Independently of this setting, a miner whose channel open goes unanswered for 10 seconds
+    /// is sent `client.reconnect`; in aggregated mode an upstream that never answers the shared
+    /// channel open therefore makes every miner reconnect.
+    #[serde(default)]
+    pub upstream_loss_hold_secs: u64,
+    /// Seconds between keep-alive jobs sent to held miners, so firmware that gives up on a pool
+    /// that sends nothing (cgminer-based firmware does after 90 seconds) stays connected. `0`
+    /// sends none.
+    #[serde(default = "default_hold_keepalive_notify_secs")]
+    pub hold_keepalive_notify_secs: u64,
+}
+
+fn default_hold_keepalive_notify_secs() -> u64 {
+    30
 }
 
 fn default_max_fallbacks() -> usize {
@@ -216,8 +243,30 @@ impl TranslatorConfig {
         })
     }
 
+    /// How long miners are held after the upstream is lost, or `None` when they are not.
+    pub fn upstream_loss_hold(&self) -> Option<Duration> {
+        (self.upstream_loss_hold_secs > 0)
+            .then(|| Duration::from_secs(self.upstream_loss_hold_secs.min(86_400)))
+    }
+
+    /// Interval between keep-alive jobs for held miners, or `None` when none are sent.
+    pub fn hold_keepalive_interval(&self) -> Option<Duration> {
+        (self.hold_keepalive_notify_secs > 0)
+            .then(|| Duration::from_secs(self.hold_keepalive_notify_secs))
+    }
+
     /// Warns about settings that are present but have no effect.
     pub(crate) fn warn_about_ignored_settings(&self) {
+        if self.upstream_loss_hold().is_some()
+            && self
+                .hold_keepalive_interval()
+                .is_none_or(|interval| interval >= Duration::from_secs(90))
+        {
+            warn!(
+                "hold_keepalive_notify_secs is 0 or at least 90: cgminer-based firmware drops a \
+                 pool that sends nothing for 90 seconds, so held miners may reconnect on their own"
+            );
+        }
         if self.upstream_tcp_keepalive().is_none()
             && (self.upstream_tcp_keepalive_interval_secs.is_some()
                 || self.upstream_tcp_keepalive_probes.is_some())
@@ -274,6 +323,8 @@ impl TranslatorConfig {
             drain_send_reconnect: false,
             max_fallbacks: default_max_fallbacks(),
             fallback_window_secs: default_fallback_window_secs(),
+            upstream_loss_hold_secs: 0,
+            hold_keepalive_notify_secs: default_hold_keepalive_notify_secs(),
         }
     }
 
@@ -847,6 +898,21 @@ mod tests {
             "#
         );
         let config: TranslatorConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(config.upstream_loss_hold(), None);
+        assert_eq!(
+            config.hold_keepalive_interval(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let held: TranslatorConfig = toml::from_str(&toml.replace(
+            "max_fallbacks = 0",
+            "max_fallbacks = 0\n            upstream_loss_hold_secs = 120\n            hold_keepalive_notify_secs = 0",
+        ))
+        .unwrap();
+        assert_eq!(
+            held.upstream_loss_hold(),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(held.hold_keepalive_interval(), None);
         assert_eq!(config.max_fallbacks, 0);
         assert_eq!(
             config.fallback_window(),

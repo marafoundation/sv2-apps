@@ -3,10 +3,8 @@ use stratum_apps::stratum_core::{mining_sv2::UpdateChannelOwned, parsers_sv2::Mi
 
 use crate::{
     error::{self, TproxyError, TproxyErrorKind, TproxyResult},
-    sv1::{
-        Sv1Server, downstream::Sv1ServerEvent,
-        sv1_server::SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
-    },
+    sv1::{Sv1Server, downstream::Sv1ServerEvent},
+    utils::SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
 };
 
 use stratum_apps::{
@@ -54,6 +52,11 @@ impl Sv1Server {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
+            // Between upstream generations miners have no channel and submit nothing that
+            // counts; adjusting then would read the gap as lost hashrate.
+            if self.current_generation().is_none() {
+                continue;
+            }
             info!("Starting vardiff loop for downstreams");
 
             self.handle_vardiff_updates().await?;
@@ -334,9 +337,7 @@ impl Sv1Server {
             all_updates.len()
         );
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((MiningOwned::UpdateChannel(update_channel), None))
+        self.send_to_channel_manager((MiningOwned::UpdateChannel(update_channel), None))
             .await
             .map_err(|e| {
                 error!("Failed to send aggregated UpdateChannel: {:?}", e);
@@ -360,9 +361,7 @@ impl Sv1Server {
                 downstream_id, channel_id, new_hashrate, new_target
             );
 
-            self.sv1_server_io
-                .channel_manager_sender
-                .send((MiningOwned::UpdateChannel(update_channel), None))
+            self.send_to_channel_manager((MiningOwned::UpdateChannel(update_channel), None))
                 .await
                 .map_err(|e| {
                     error!(
@@ -632,6 +631,16 @@ impl Sv1Server {
     pub async fn send_update_channel_on_downstream_state_change(
         &self,
     ) -> TproxyResult<(), error::Sv1Server> {
+        self.send_update_channel_on_downstream_state_change_in(self.generation_epoch())
+    }
+
+    /// [`Sv1Server::send_update_channel_on_downstream_state_change`] for the channel manager of
+    /// generation `epoch` only.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn send_update_channel_on_downstream_state_change_in(
+        &self,
+        epoch: u64,
+    ) -> TproxyResult<(), error::Sv1Server> {
         if self.mode.is_non_aggregated() {
             return Ok(());
         }
@@ -660,10 +669,7 @@ impl Sv1Server {
             }
         };
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((MiningOwned::UpdateChannel(update), None))
-            .await
+        self.send_to_channel_manager_in(epoch, (MiningOwned::UpdateChannel(update), None))
             .map_err(|e| {
                 error!(
                     "Failed to send UpdateChannel after downstream state change: {:?}",

@@ -101,12 +101,12 @@ impl ChannelManagerIo {
         }
     }
 
+    /// Closes the upstream side. The channels to the SV1 server are shared with the channel
+    /// managers of later upstream generations, so they stay open.
     fn close(&self) {
-        debug!("Dropping channel manager channels");
+        debug!("Dropping channel manager upstream channels");
         self.upstream_sender.close();
-        self.sv1_server_sender.close();
         self.upstream_receiver.close_and_drain();
-        self.sv1_server_receiver.close_and_drain();
     }
 }
 
