@@ -226,6 +226,16 @@ pub struct DownstreamDifficultyConfig {
     /// Defaults to `1.0`, i.e. round everything, so behaviour is unchanged unless it is set.
     #[serde(default = "default_min_difficulty_for_pow2_rounding")]
     pub minimum_difficulty_for_integer_power_of_two_rounding: f64,
+    /// Which vardiff controller each SV1 downstream runs: `"count-regime"` (BP-G, `CountRegimeVardiff`) or
+    /// `"classic"` (`VardiffState`). This deployment branch defaults to `"count-regime"`, because the generated slot
+    /// config doesn't carry the key.
+    #[serde(default = "default_vardiff_algorithm")]
+    pub vardiff_algorithm: String,
+}
+
+/// This branch's default controller.
+fn default_vardiff_algorithm() -> String {
+    "count-regime".to_string()
 }
 
 /// Round every difficulty, which is the behaviour before this key existed.
@@ -250,6 +260,7 @@ impl DownstreamDifficultyConfig {
             // behaviour, and an operator changing it does so through the config file.
             minimum_difficulty_for_integer_power_of_two_rounding:
                 default_min_difficulty_for_pow2_rounding(),
+            vardiff_algorithm: default_vardiff_algorithm(),
         }
     }
 }

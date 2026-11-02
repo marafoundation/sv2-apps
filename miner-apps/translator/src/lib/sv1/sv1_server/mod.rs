@@ -50,6 +50,7 @@ use stratum_apps::{
         channels_sv2::{
             Vardiff, VardiffState,
             target::{hash_rate_from_target, hash_rate_to_target},
+            vardiff::count_regime::CountRegimeVardiff,
         },
         mining_sv2::{CloseChannelOwned, SetNewPrevHashOwned, SetTargetOwned},
         parsers_sv2::MiningOwned,
@@ -192,7 +193,7 @@ pub struct Sv1Server {
     pub(crate) miner_telemetry: MinerTelemetryState,
     pub(crate) request_id_to_downstream_id: SharedMap<RequestId, DownstreamId>,
     pub(crate) channel_id_to_downstream_id: SharedMap<ChannelId, DownstreamId>,
-    pub(crate) vardiff: SharedMap<DownstreamId, VardiffState>,
+    pub(crate) vardiff: SharedMap<DownstreamId, Box<dyn Vardiff>>,
     /// HashMap to store the SetNewPrevHash for each channel
     /// Used in both aggregated and non-aggregated mode
     pub(crate) prevhashes: SharedMap<ChannelId, SetNewPrevHashOwned>,
@@ -389,6 +390,17 @@ impl Sv1Server {
         mode: TproxyMode,
     ) -> Self {
         let shares_per_minute = config.downstream_difficulty_config.shares_per_minute;
+        let dc = &config.downstream_difficulty_config;
+        match dc.vardiff_algorithm.as_str() {
+            "classic" | "count-regime" => {}
+            other => panic!("downstream_difficulty_config.vardiff_algorithm must be \"classic\" or \"count-regime\", not {other:?}"),
+        }
+        if dc.enable_vardiff {
+            info!("vardiff: {} for every SV1 downstream", dc.vardiff_algorithm);
+            if dc.vardiff_algorithm == "count-regime" && dc.minimum_difficulty_for_integer_power_of_two_rounding <= 1.0 {
+                warn!("vardiff: count-regime with minimum_difficulty_for_integer_power_of_two_rounding = {}: every difficulty is rounded down to a power of two, which inflates the share load by up to 2x; raise it above the operating difficulty for an A/B", dc.minimum_difficulty_for_integer_power_of_two_rounding);
+            }
+        }
         let sv1_server_io = Sv1ServerIo::new(channel_manager_receiver, channel_manager_sender);
         Self {
             sv1_server_io,
@@ -546,7 +558,10 @@ impl Sv1Server {
                                     // which is twelve orders of magnitude below anything this config
                                     // admits.
                                     let min_hashrate = self.config.downstream_difficulty_config.min_individual_miner_hashrate;
-                                    let vardiff = VardiffState::new_with_min(min_hashrate).expect("Failed to create vardiffstate");
+                                    let vardiff: Box<dyn Vardiff> = match self.config.downstream_difficulty_config.vardiff_algorithm.as_str() {
+                                        "classic" => Box::new(VardiffState::new_with_min(min_hashrate).expect("Failed to create vardiffstate")),
+                                        _ => Box::new(CountRegimeVardiff::new_with_min(self.shares_per_minute, min_hashrate).expect("Failed to create the count-regime vardiff")),
+                                    };
                                     self.vardiff.insert(downstream_id, vardiff);
                                 }
                                 info!("Downstream {} registered successfully (channel will be opened after first message)", downstream_id);
@@ -2399,7 +2414,7 @@ mod tests {
             - 240;
         vardiff_state.set_timestamp_of_last_update(two_minutes_ago);
         vardiff_state.set_shares_since_last_update(1);
-        server.vardiff.insert(7, vardiff_state);
+        server.vardiff.insert(7, Box::new(vardiff_state));
 
         // The UpdateChannel send fails in this harness (no channel manager task);
         // the pending-map bookkeeping we assert on happens before that.

@@ -9,7 +9,7 @@ use crate::{
 use stratum_apps::{
     stratum_core::{
         bitcoin::Target,
-        channels_sv2::{Vardiff, target::hash_rate_to_target},
+        channels_sv2::target::hash_rate_to_target,
         mining_sv2::SetTargetOwned,
         stratum_translation::sv2_to_sv1::{
             build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
