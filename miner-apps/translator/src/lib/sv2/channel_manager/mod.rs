@@ -806,7 +806,7 @@ impl ChannelManager {
                                     "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
                                 );
                             }
-                            info!(
+                            debug!(
                                 "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
                                 upstream_extended_channel_id, m.sequence_number
                             );
@@ -862,7 +862,7 @@ impl ChannelManager {
                                     "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
                                 );
                             }
-                            info!(
+                            debug!(
                                 "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
                                 m.channel_id, m.sequence_number
                             );
