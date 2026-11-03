@@ -158,6 +158,12 @@ pub struct TranslatorConfig {
     /// sends none.
     #[serde(default = "default_hold_keepalive_notify_secs")]
     pub hold_keepalive_notify_secs: u64,
+    /// Whether SIGUSR1 makes the translator return the allocator's free heap memory to the OS
+    /// and log heap usage before and after. If memory drops, it was held free by the allocator;
+    /// if not, it is in use. Only glibc builds can release memory this way. When off, SIGUSR1
+    /// keeps its default action, which terminates the process.
+    #[serde(default)]
+    pub release_heap_on_sigusr1: bool,
 }
 
 fn default_hold_keepalive_notify_secs() -> u64 {
@@ -325,6 +331,7 @@ impl TranslatorConfig {
             fallback_window_secs: default_fallback_window_secs(),
             upstream_loss_hold_secs: 0,
             hold_keepalive_notify_secs: default_hold_keepalive_notify_secs(),
+            release_heap_on_sigusr1: false,
         }
     }
 
@@ -918,6 +925,12 @@ mod tests {
             config.fallback_window(),
             std::time::Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn heap_release_on_sigusr1_is_off_unless_enabled() {
+        assert!(!parse_config("").release_heap_on_sigusr1);
+        assert!(parse_config("release_heap_on_sigusr1 = true").release_heap_on_sigusr1);
     }
 }
 
