@@ -897,7 +897,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         .as_secs()
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
-    if let Some(refreshed) = state.cache.get_snapshot().timestamp {
+    if let Some(refreshed) = state.cache.snapshot_timestamp() {
         state
             .metrics
             .sv2_monitoring_snapshot_age_seconds

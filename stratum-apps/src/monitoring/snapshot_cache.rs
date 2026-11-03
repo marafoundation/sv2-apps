@@ -239,6 +239,11 @@ impl SnapshotCache {
         self.snapshot.read().unwrap().clone()
     }
 
+    /// When the current snapshot was taken, without copying it.
+    pub fn snapshot_timestamp(&self) -> Option<Instant> {
+        self.snapshot.read().unwrap().timestamp
+    }
+
     /// Refresh the cache by reading from the data sources.
     ///
     /// This method DOES acquire the business logic locks (via the trait methods),
