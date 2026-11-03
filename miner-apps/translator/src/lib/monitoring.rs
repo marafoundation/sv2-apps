@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use stratum_apps::monitoring::{
     server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
-    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring},
+    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDrops},
     upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring},
 };
 
@@ -86,6 +86,18 @@ impl Sv1ClientsMonitoring for CurrentGeneration {
     fn get_sv1_client_by_id(&self, client_id: usize) -> Option<Sv1ClientInfo> {
         self.sv1_server()
             .and_then(|sv1_server| sv1_server.get_sv1_client_by_id(client_id))
+    }
+
+    fn get_sv1_share_totals(&self) -> Sv1ShareCounts {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_share_totals())
+            .unwrap_or_default()
+    }
+
+    fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_share_drops())
+            .unwrap_or_default()
     }
 }
 

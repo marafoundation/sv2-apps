@@ -55,7 +55,10 @@ use super::{
     client::{Sv2ClientInfo, Sv2ClientsMonitoring, Sv2ClientsSummary},
     prometheus_metrics::PrometheusMetrics,
     server::{ServerInfo, ServerMonitoring, ServerSummary},
-    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
+    sv1::{
+        Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareDropReason,
+        Sv1ShareRejection,
+    },
     upstream::{UpstreamInfo, UpstreamMonitoring},
 };
 
@@ -262,10 +265,15 @@ impl SnapshotCache {
             new_snapshot.sv2_clients_summary = Some(source.get_sv2_clients_summary());
         }
 
-        // Collect Sv1 clients data
+        // Collect Sv1 clients data, walking the clients once
         if let Some(ref source) = self.sv1_clients_source {
-            new_snapshot.sv1_clients = Some(source.get_sv1_clients());
-            new_snapshot.sv1_clients_summary = Some(source.get_sv1_clients_summary());
+            let clients = source.get_sv1_clients();
+            new_snapshot.sv1_clients_summary = Some(Sv1ClientsSummary::new(
+                &clients,
+                source.get_sv1_share_totals(),
+                source.get_sv1_share_drops(),
+            ));
+            new_snapshot.sv1_clients = Some(clients);
         }
 
         // Collect upstream data
@@ -538,6 +546,24 @@ impl SnapshotCache {
             }
             if let Some(ref m) = metrics.sv1_hashrate_total {
                 m.set(summary.total_hashrate as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_accepted_total {
+                m.set(summary.shares.accepted as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_rejected_total {
+                for rejection in Sv1ShareRejection::ALL {
+                    m.with_label_values(&[rejection.label()])
+                        .set(summary.shares.rejected(rejection) as f64);
+                }
+            }
+            if let Some(ref m) = metrics.sv1_shares_below_upstream_target_total {
+                m.set(summary.dropped.below_upstream_target as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_dropped_total {
+                for reason in Sv1ShareDropReason::ALL {
+                    m.with_label_values(&[reason.label()])
+                        .set(summary.dropped.dropped(reason) as f64);
+                }
             }
         }
 

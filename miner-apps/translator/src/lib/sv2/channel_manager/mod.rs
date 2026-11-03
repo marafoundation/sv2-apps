@@ -193,6 +193,10 @@ pub struct ChannelManager {
     /// Required to show or not show hashrate on monitoring.
     #[cfg(feature = "monitoring")]
     pub(crate) report_hashrate: bool,
+    /// Where accepted shares this channel manager does not send upstream are counted; outlives
+    /// it.
+    #[cfg(feature = "monitoring")]
+    pub(crate) share_drops: Arc<std::sync::Mutex<stratum_apps::monitoring::Sv1ShareDrops>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -469,6 +473,45 @@ impl ChannelManager {
             mode: tproxy_mode,
             #[cfg(feature = "monitoring")]
             report_hashrate,
+            #[cfg(feature = "monitoring")]
+            share_drops: Default::default(),
+        }
+    }
+
+    /// Counts accepted shares it does not send upstream in `share_drops` rather than on its own.
+    #[cfg(feature = "monitoring")]
+    pub(crate) fn with_share_drops(
+        mut self,
+        share_drops: Arc<std::sync::Mutex<stratum_apps::monitoring::Sv1ShareDrops>>,
+    ) -> Self {
+        self.share_drops = share_drops;
+        self
+    }
+
+    /// Counts a share accepted from an SV1 miner that is not sent upstream: below the upstream
+    /// channel's target, or rejected by its validation for `error`, or for an unknown channel.
+    #[cfg_attr(not(feature = "monitoring"), allow(unused_variables))]
+    fn count_dropped_share(&self, error: Option<&ShareValidationError>) {
+        #[cfg(feature = "monitoring")]
+        {
+            use stratum_apps::monitoring::Sv1ShareDropReason as Reason;
+            let reason = match error {
+                Some(ShareValidationError::DoesNotMeetTarget(_)) => None,
+                Some(ShareValidationError::Stale(_)) => Some(Reason::Stale),
+                Some(ShareValidationError::InvalidJobId(_)) => Some(Reason::InvalidJobId),
+                Some(ShareValidationError::Invalid(_)) => Some(Reason::Invalid),
+                Some(ShareValidationError::DuplicateShare(_)) => Some(Reason::Duplicate),
+                Some(ShareValidationError::BadExtranonceSize(_)) => Some(Reason::BadExtranonceSize),
+                Some(ShareValidationError::VersionRollingNotAllowed(_)) => {
+                    Some(Reason::VersionRollingNotAllowed)
+                }
+                Some(ShareValidationError::NoChainTip) => Some(Reason::NoChainTip),
+                None => Some(Reason::UnknownChannel),
+            };
+            self.share_drops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(reason);
         }
     }
 
@@ -773,7 +816,8 @@ impl ChannelManager {
                             m.sequence_number =
                                 self.next_share_sequence_number(upstream_extended_channel_id);
                         }
-                        Some(Err(ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                        Some(Err(error @ ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                            self.count_dropped_share(Some(&error));
                             // Per-miner vardiff can intentionally be easier than the aggregated
                             // upstream target, so these locally accepted shares are expected to be
                             // filtered here.
@@ -785,6 +829,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         Some(Err(validation_error)) => {
+                            self.count_dropped_share(Some(&validation_error));
                             warn!(
                                 channel_id = upstream_extended_channel_id,
                                 ?validation_error,
@@ -793,6 +838,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         None => {
+                            self.count_dropped_share(None);
                             warn!(
                                 channel_id = upstream_extended_channel_id,
                                 "SubmitSharesExtended references an unknown upstream channel"
@@ -842,7 +888,8 @@ impl ChannelManager {
                                     new_extranonce.try_into().map_err(TproxyError::shutdown)?;
                             }
                         }
-                        Some(Err(ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                        Some(Err(error @ ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                            self.count_dropped_share(Some(&error));
                             // A downstream vardiff target can intentionally be easier than its
                             // upstream channel target, so these locally accepted shares are
                             // expected to be filtered here.
@@ -854,6 +901,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         Some(Err(validation_error)) => {
+                            self.count_dropped_share(Some(&validation_error));
                             warn!(
                                 channel_id = m.channel_id,
                                 ?validation_error,
@@ -862,6 +910,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         None => {
+                            self.count_dropped_share(None);
                             warn!(
                                 channel_id = m.channel_id,
                                 "SubmitSharesExtended references an unknown upstream channel"
@@ -2611,5 +2660,66 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn accepted_shares_not_sent_upstream_are_counted_by_reason() {
+        let (mut manager, _receiver) = create_connected_aggregated_channel_manager();
+        manager
+            .extended_channels
+            .with_mut(&AGGREGATED_CHANNEL_ID, |channel| {
+                // The smallest target, which no share meets, set before the job that takes it.
+                let mut target = [0; 32];
+                target[0] = 1;
+                channel.set_target(Target::from_le_bytes(target)).unwrap();
+                channel
+                    .on_new_extended_mining_job(test_extended_job(42, 1))
+                    .unwrap();
+                channel
+                    .on_set_new_prev_hash(SetNewPrevHashOwned {
+                        channel_id: 42,
+                        job_id: 1,
+                        prev_hash: vec![0; 32].try_into().unwrap(),
+                        min_ntime: 0,
+                        nbits: 0x207fffff,
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+        let rollable = manager
+            .extended_channels
+            .with(&AGGREGATED_CHANNEL_ID, |c| c.get_rollable_extranonce_size())
+            .unwrap() as usize;
+        let share = |job_id| SubmitSharesExtendedOwned {
+            channel_id: 99,
+            sequence_number: 0,
+            job_id,
+            nonce: 0,
+            ntime: 1,
+            version: 0x20000000,
+            extranonce: vec![0x11; rollable].try_into().unwrap(),
+        };
+        let (to_manager, from_sv1) = unbounded();
+        manager.channel_manager_io.sv1_server_receiver = from_sv1;
+        let drops = manager.share_drops.clone();
+        let manager = Arc::new(manager);
+        for job_id in [1, 7] {
+            to_manager
+                .send((MiningOwned::SubmitSharesExtended(share(job_id)), None))
+                .await
+                .unwrap();
+            manager.clone().handle_downstream_message().await.unwrap();
+        }
+
+        let drops = *drops.lock().unwrap();
+        assert_eq!(
+            drops,
+            stratum_apps::monitoring::Sv1ShareDrops {
+                below_upstream_target: 1,
+                invalid_job_id: 1,
+                ..Default::default()
+            }
+        );
     }
 }

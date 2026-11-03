@@ -41,7 +41,10 @@ pub use server::{
     ServerStandardChannelInfo, ServerSummary,
 };
 pub use snapshot_cache::{MonitoringSnapshot, SnapshotCache};
-pub use sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary};
+pub use sv1::{
+    Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareCounts, Sv1ShareDropReason,
+    Sv1ShareDrops, Sv1ShareRejection,
+};
 pub use upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring};
 
 use serde::{Deserialize, Serialize};

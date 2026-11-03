@@ -1078,6 +1078,7 @@ mod tests {
             extranonce2_len: 8,
             version_rolling_mask: Some("ffffffff".into()),
             version_rolling_min_bit: Some("00000000".into()),
+            shares: Default::default(),
         }
     }
 
@@ -1851,6 +1852,55 @@ mod tests {
         assert!(body.contains("sv2_uptime_seconds"));
         assert!(body.contains("sv2_server_channels"));
         assert!(body.contains("sv2_clients_total"));
+    }
+
+    use crate::monitoring::sv1::{Sv1ShareCounts, Sv1ShareDrops};
+
+    struct MockSv1Shares(Sv1ShareCounts, Sv1ShareDrops);
+    impl Sv1ClientsMonitoring for MockSv1Shares {
+        fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+            vec![]
+        }
+
+        fn get_sv1_share_totals(&self) -> Sv1ShareCounts {
+            self.0
+        }
+
+        fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_sv1_share_outcomes_by_reason() {
+        let shares = Sv1ShareCounts {
+            accepted: 7,
+            rejected_job_not_found: 3,
+            rejected_low_difficulty: 2,
+            ..Default::default()
+        };
+        let app = build_test_app(
+            None,
+            None,
+            Some(Arc::new(MockSv1Shares(
+                shares,
+                Sv1ShareDrops {
+                    below_upstream_target: 40,
+                    stale: 4,
+                    ..Default::default()
+                },
+            ))
+                as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        assert!(body.contains("sv1_shares_accepted_total 7"), "{body}");
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="job-not-found"} 3"#));
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="low-difficulty"} 2"#));
+        // Reasons nobody has hit yet are exported too.
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="duplicate"} 0"#));
+        assert!(body.contains("sv1_shares_below_upstream_target_total 40"));
+        assert!(body.contains(r#"sv1_shares_dropped_total{reason="stale"} 4"#));
+        assert!(body.contains(r#"sv1_shares_dropped_total{reason="unknown-channel"} 0"#));
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

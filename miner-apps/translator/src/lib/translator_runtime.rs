@@ -336,7 +336,7 @@ impl TranslatorRuntime<Init> {
 
 impl TranslatorRuntime<IoReady> {
     fn bootstrap_channel_manager(self) -> TranslatorRuntime<ChannelManagerReady> {
-        let channel_manager = Arc::new(ChannelManager::new(
+        let channel_manager = ChannelManager::new(
             self.state.io.channel_manager_to_upstream_sender.clone(),
             self.state.io.upstream_to_channel_manager_receiver.clone(),
             self.sv1.channel_manager_to_sv1_server_sender.clone(),
@@ -350,7 +350,11 @@ impl TranslatorRuntime<IoReady> {
                 .config
                 .downstream_difficulty_config
                 .enable_vardiff,
-        ));
+        );
+        // Dropped shares are counted across channel managers, like the SV1 server reporting them.
+        #[cfg(feature = "monitoring")]
+        let channel_manager = channel_manager.with_share_drops(self.sv1.server.share_drops.clone());
+        let channel_manager = Arc::new(channel_manager);
 
         TranslatorRuntime {
             tproxy_mode: self.tproxy_mode,
