@@ -1853,6 +1853,20 @@ mod tests {
         assert!(body.contains("sv2_clients_total"));
     }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn metrics_endpoint_exports_heap_usage() {
+        let app = build_test_app(None, None, None);
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        for name in [
+            "sv2_heap_in_use_bytes",
+            "sv2_heap_free_bytes",
+            "sv2_heap_mapped_bytes",
+        ] {
+            assert!(body.contains(name), "{name} missing from {body}");
+        }
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_with_no_sources() {
         let app = build_test_app(None, None, None);

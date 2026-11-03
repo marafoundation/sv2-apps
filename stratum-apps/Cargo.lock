@@ -3377,6 +3377,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "hyper",
+ "libc",
  "miniscript",
  "prometheus",
  "rand 0.8.6",

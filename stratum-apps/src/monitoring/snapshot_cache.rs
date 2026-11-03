@@ -519,6 +519,18 @@ impl SnapshotCache {
             }
         }
 
+        if let Some(heap) = super::heap::heap_stats() {
+            for (gauge, bytes) in [
+                (&metrics.sv2_heap_in_use_bytes, heap.in_use),
+                (&metrics.sv2_heap_free_bytes, heap.free),
+                (&metrics.sv2_heap_mapped_bytes, heap.mapped),
+            ] {
+                if let Some(gauge) = gauge {
+                    gauge.set(bytes as f64);
+                }
+            }
+        }
+
         // SV1 client metrics
         if let Some(ref summary) = snapshot.sv1_clients_summary {
             if let Some(ref m) = metrics.sv1_clients_total {

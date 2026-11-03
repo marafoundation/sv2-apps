@@ -4364,6 +4364,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "futures",
+ "libc",
  "miniscript",
  "prometheus",
  "rand 0.8.6",
