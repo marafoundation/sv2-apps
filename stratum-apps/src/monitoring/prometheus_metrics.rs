@@ -39,6 +39,9 @@ pub struct PrometheusMetrics {
     pub sv1_shares_rejected_total: Option<GaugeVec>,
     pub sv1_shares_below_upstream_target_total: Option<Gauge>,
     pub sv1_shares_dropped_total: Option<GaugeVec>,
+    /// One series per recent block-finding share, valued at the Unix time it was submitted.
+    pub sv1_block_found_info: Option<GaugeVec>,
+    pub sv1_blocks_found_total: Option<Gauge>,
     // Upstream metrics
     pub sv2_upstream_connected: Option<GaugeVec>,
     pub sv2_upstream_fallbacks_total: Option<Gauge>,
@@ -241,6 +244,8 @@ impl PrometheusMetrics {
             sv1_shares_rejected_total,
             sv1_shares_below_upstream_target_total,
             sv1_shares_dropped_total,
+            sv1_block_found_info,
+            sv1_blocks_found_total,
         ) = if enable_sv1_metrics {
             let clients = Gauge::new("sv1_clients_total", "Total number of SV1 clients")?;
             registry.register(Box::new(clients.clone()))?;
@@ -266,6 +271,29 @@ impl PrometheusMetrics {
             for rejection in Sv1ShareRejection::ALL {
                 rejected.with_label_values(&[rejection.label()]).set(0.0);
             }
+
+            let block_found = GaugeVec::new(
+                Opts::new(
+                    "sv1_block_found_info",
+                    "Recent SV1 shares that met the network target (block candidates, before the \
+                     pool confirms them), valued at the Unix time they were submitted",
+                ),
+                &[
+                    "sv1_username",
+                    "worker",
+                    "user_identity",
+                    "share_hash",
+                    "height",
+                ],
+            )?;
+            registry.register(Box::new(block_found.clone()))?;
+
+            let blocks_found = Gauge::new(
+                "sv1_blocks_found_total",
+                "SV1 shares that met the network target since the process started (block \
+                 candidates, before the pool confirms them)",
+            )?;
+            registry.register(Box::new(blocks_found.clone()))?;
 
             let below_target = Gauge::new(
                 "sv1_shares_below_upstream_target_total",
@@ -294,9 +322,11 @@ impl PrometheusMetrics {
                 Some(rejected),
                 Some(below_target),
                 Some(dropped),
+                Some(block_found),
+                Some(blocks_found),
             )
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
 
         // Upstream metrics
@@ -348,6 +378,8 @@ impl PrometheusMetrics {
             sv1_shares_rejected_total,
             sv1_shares_below_upstream_target_total,
             sv1_shares_dropped_total,
+            sv1_block_found_info,
+            sv1_blocks_found_total,
             sv2_upstream_connected,
             sv2_upstream_fallbacks_total,
         })

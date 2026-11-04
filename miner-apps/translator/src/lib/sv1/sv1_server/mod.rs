@@ -27,7 +27,8 @@ use crate::{
     },
     utils::{
         AGGREGATED_CHANNEL_ID, KEEPALIVE_JOB_ID_DELIMITER, MAX_FUTURE_BLOCK_TIME,
-        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING, SubmitShareWithChannelId, TproxyMode,
+        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING, ShareOrigin,
+        SubmitShareWithChannelId, TproxyMode,
     },
 };
 use async_channel::{Receiver, Sender, unbounded};
@@ -116,15 +117,15 @@ struct Sv1ServerIo {
     downstream_to_sv1_server_sender: Sender<(DownstreamId, json_rpc::Message)>,
     downstream_to_sv1_server_receiver: Receiver<(DownstreamId, json_rpc::Message)>,
     channel_manager_receiver: Receiver<MiningOwned>,
-    // Option<String> carries non-empty sv1_worker_name metadata for SubmitSharesExtended.
-    channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+    // Where a SubmitSharesExtended came from; `None` for every other message.
+    channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1ServerIo {
     fn new(
         channel_manager_receiver: Receiver<MiningOwned>,
-        channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+        channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
     ) -> Self {
         let (downstream_to_sv1_server_sender, downstream_to_sv1_server_receiver) = unbounded();
 
@@ -252,6 +253,9 @@ pub struct Sv1Server {
     /// Accepted shares the channel managers did not send upstream, since the process started.
     #[cfg(feature = "monitoring")]
     pub(crate) share_drops: Arc<Mutex<stratum_apps::monitoring::Sv1ShareDrops>>,
+    /// Recent shares that found a block, recorded by the channel managers.
+    #[cfg(feature = "monitoring")]
+    pub(crate) blocks_found: crate::monitoring::BlocksFound,
 }
 
 /// Miners kept connected between upstream generations, and their move onto the next one.
@@ -324,7 +328,7 @@ struct GenerationControl {
     events: Receiver<GenerationEvent>,
     /// The receiving end of the server's own channel-manager queue, used to discard requests
     /// meant for a generation that has ended.
-    to_channel_manager: Receiver<(MiningOwned, Option<String>)>,
+    to_channel_manager: Receiver<(MiningOwned, Option<ShareOrigin>)>,
 }
 
 fn drain_queue<T>(receiver: &Receiver<T>) -> usize {
@@ -537,7 +541,7 @@ impl Sv1Server {
     pub fn new(
         listener_addr: SocketAddr,
         channel_manager_receiver: Receiver<MiningOwned>,
-        channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+        channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
         config: TranslatorConfig,
         mode: TproxyMode,
     ) -> Self {
@@ -576,6 +580,8 @@ impl Sv1Server {
             share_totals: Default::default(),
             #[cfg(feature = "monitoring")]
             share_drops: Default::default(),
+            #[cfg(feature = "monitoring")]
+            blocks_found: Default::default(),
         }
     }
 
@@ -588,7 +594,7 @@ impl Sv1Server {
     pub(crate) fn with_generation_control(
         mut self,
         events: Receiver<GenerationEvent>,
-        to_channel_manager: Receiver<(MiningOwned, Option<String>)>,
+        to_channel_manager: Receiver<(MiningOwned, Option<ShareOrigin>)>,
     ) -> Self {
         self.generation = Arc::new(Mutex::new(GenerationSlot::default()));
         self.generation_control = Some(GenerationControl {
@@ -627,7 +633,7 @@ impl Sv1Server {
     /// [`Sv1Server::send_to_channel_manager_in`].
     async fn send_to_channel_manager(
         &self,
-        message: (MiningOwned, Option<String>),
+        message: (MiningOwned, Option<ShareOrigin>),
     ) -> Result<(), ()> {
         self.send_to_channel_manager_in(self.generation_epoch(), message)
     }
@@ -648,7 +654,7 @@ impl Sv1Server {
     fn send_to_channel_manager_in(
         &self,
         epoch: u64,
-        message: (MiningOwned, Option<String>),
+        message: (MiningOwned, Option<ShareOrigin>),
     ) -> Result<(), ()> {
         let slot = self.generation_slot();
         let live = slot
@@ -1605,16 +1611,16 @@ impl Sv1Server {
         )
         .map_err(TproxyError::shutdown)?;
 
-        let worker_name = match self.with_registered_downstream(
+        let (sv1_username, worker_name) = match self.with_registered_downstream(
             message.downstream_id,
             |downstream| {
                 downstream
                     .downstream_data
-                    .with(|data| data.sv1_worker_name.clone())
+                    .with(|data| (data.sv1_username.clone(), data.sv1_worker_name.clone()))
                     .map_err(TproxyError::shutdown)
             },
         ) {
-            Ok(worker_name) => worker_name,
+            Ok(names) => names,
             Err(e) if matches!(e.kind, TproxyErrorKind::DownstreamNotPresent(_)) => {
                 warn!(
                     "Downstream {} disconnected before its share could be forwarded; dropping share",
@@ -1624,11 +1630,15 @@ impl Sv1Server {
             }
             Err(e) => return Err(e),
         };
-        let sv1_worker_name = (!worker_name.is_empty()).then_some(worker_name);
+        let origin = ShareOrigin {
+            downstream_id: message.downstream_id,
+            sv1_username,
+            worker: (!worker_name.is_empty()).then_some(worker_name),
+        };
 
         self.send_to_channel_manager((
             MiningOwned::SubmitSharesExtended(submit_share_extended),
-            sv1_worker_name,
+            Some(origin),
         ))
         .await
         .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
@@ -5129,7 +5139,7 @@ mod tests {
     type TestChannels = (
         Sv1Server,
         Sender<MiningOwned>,
-        Receiver<(MiningOwned, Option<String>)>,
+        Receiver<(MiningOwned, Option<ShareOrigin>)>,
     );
 
     pub(super) fn server_with_channels(aggregated: bool) -> TestChannels {
@@ -5528,7 +5538,7 @@ mod tests {
         server: &Sv1Server,
         downstream_id: usize,
         responses: &Receiver<json_rpc::Message>,
-        forwarded: &Receiver<(MiningOwned, Option<String>)>,
+        forwarded: &Receiver<(MiningOwned, Option<ShareOrigin>)>,
         nonce: u32,
         expected_error: Option<i32>,
     ) {
@@ -5672,7 +5682,7 @@ mod tests {
     type GenerationTestChannels = (
         Sv1Server,
         Sender<MiningOwned>,
-        Receiver<(MiningOwned, Option<String>)>,
+        Receiver<(MiningOwned, Option<ShareOrigin>)>,
         Sender<GenerationEvent>,
     );
 

@@ -12,7 +12,8 @@ use stratum_apps::{
         DiscoveredMiner, MinerTelemetry, MinerTelemetryCollector, MinerTelemetryStatus,
         match_discovered_miners_to_downstreams_by_worker_and_port,
         sv1::{
-            Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDrops, Sv1ShareRejection,
+            Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDrops,
+            Sv1ShareRejection,
         },
     },
     stratum_core::sv1_api::json_rpc,
@@ -102,6 +103,14 @@ impl Sv1ClientsMonitoring for Sv1Server {
 
     fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
         *self.share_drops.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get_sv1_blocks_found(&self) -> Vec<Sv1BlockFound> {
+        self.blocks_found.recent()
+    }
+
+    fn get_sv1_blocks_found_total(&self) -> u64 {
+        self.blocks_found.total()
     }
 }
 

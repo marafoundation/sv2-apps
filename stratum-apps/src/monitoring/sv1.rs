@@ -55,6 +55,25 @@ pub struct Sv1ClientsSummary {
     pub dropped: Sv1ShareDrops,
 }
 
+/// An SV1 share that met the network target as the translator saw it: a block candidate,
+/// recorded before the pool has confirmed the block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sv1BlockFound {
+    /// Full SV1 username of the miner that submitted the share, e.g. `account.worker`, which
+    /// tells apart devices whose worker names collide across accounts.
+    pub sv1_username: String,
+    /// SV1 worker name of the miner that submitted the share.
+    pub worker: String,
+    /// User identity of that miner's channel to the upstream.
+    pub user_identity: String,
+    /// Hash of the block header the share completed.
+    pub share_hash: String,
+    /// Height of the block, from its coinbase, if it could be read.
+    pub height: Option<u32>,
+    /// When the share was submitted, in seconds since the Unix epoch.
+    pub found_at_unix_secs: u64,
+}
+
 /// Why the translator dropped a share it had accepted from an SV1 miner instead of sending it
 /// upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +309,17 @@ pub trait Sv1ClientsMonitoring: Send + Sync {
     /// Accepted shares not sent upstream since the process started.
     fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
         Sv1ShareDrops::default()
+    }
+
+    /// The most recent shares that found a block, oldest first. Implementations keep only a
+    /// bounded number.
+    fn get_sv1_blocks_found(&self) -> Vec<Sv1BlockFound> {
+        Vec::new()
+    }
+
+    /// How many shares found a block since the process started.
+    fn get_sv1_blocks_found_total(&self) -> u64 {
+        0
     }
 
     /// Get summary of SV1 clients
