@@ -135,6 +135,19 @@ async fn inner_main() {
     });
 
     init_logging(proxy_config.log_dir());
+    #[cfg(all(
+        feature = "jemalloc",
+        not(feature = "hotpath-alloc"),
+        target_os = "linux"
+    ))]
+    jemalloc::check_transparent_hugepages();
+    #[cfg(all(
+        feature = "jemalloc",
+        feature = "monitoring",
+        not(feature = "hotpath-alloc"),
+        target_os = "linux"
+    ))]
+    jemalloc::check_page_size();
 
     if proxy_config.release_heap_on_sigusr1 {
         #[cfg(all(unix, feature = "monitoring"))]

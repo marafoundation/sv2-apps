@@ -104,8 +104,84 @@ fn release_free_heap() -> bool {
     status == 0
 }
 
+#[cfg(target_os = "linux")]
+const TRANSPARENT_HUGEPAGE_FILE: &str = "/sys/kernel/mm/transparent_hugepage/enabled";
+
+/// Logs a warning if the kernel backs all memory with transparent huge pages. jemalloc's own
+/// memory is opted out by the built-in `thp:never`, but other allocations and the kernel's
+/// khugepaged can still use huge pages. Says nothing if the setting cannot be read.
+#[cfg(target_os = "linux")]
+pub fn check_transparent_hugepages() {
+    let Ok(setting) = std::fs::read_to_string(TRANSPARENT_HUGEPAGE_FILE) else {
+        return;
+    };
+    if transparent_hugepages_always(&setting) {
+        tracing::warn!(
+            "{TRANSPARENT_HUGEPAGE_FILE} is set to always. jemalloc's own memory is opted out of \
+             transparent huge pages (thp:never), but other allocations and the kernel's \
+             khugepaged can still use them, which can keep memory from being returned to the OS. \
+             madvise is recommended, as described in the \"Memory allocator\" section of the \
+             translator README"
+        );
+    }
+}
+
+/// Logs a warning if jemalloc's pages are larger than the kernel's, as with an aarch64 build on
+/// a kernel with 4 KiB pages: the heap `free` and `mapped` gauges then count the untouched parts
+/// of partly used pages too, and overstate.
+#[cfg(all(target_os = "linux", feature = "monitoring"))]
+pub fn check_page_size() {
+    // SAFETY: `arenas.page` is a `size_t`.
+    let Ok(jemalloc) = (unsafe { tikv_jemalloc_ctl::raw::read::<usize>(b"arenas.page\0") }) else {
+        return;
+    };
+    // SAFETY: sysconf only reads a system constant.
+    let Ok(kernel) = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) else {
+        return;
+    };
+    if jemalloc_pages_larger(jemalloc, kernel) {
+        tracing::warn!(
+            "jemalloc uses {jemalloc}-byte pages and the kernel {kernel}-byte pages, so the \
+             sv2_heap_free_bytes and sv2_heap_mapped_bytes gauges overstate; sv2_heap_in_use_bytes \
+             is exact"
+        );
+    }
+}
+
+/// Whether jemalloc's pages are larger than the kernel's.
+#[cfg(all(target_os = "linux", feature = "monitoring"))]
+fn jemalloc_pages_larger(jemalloc: usize, kernel: usize) -> bool {
+    jemalloc > kernel
+}
+
+/// Whether the contents of the transparent huge pages file select `always`, which the kernel
+/// marks by bracketing it among the options, as in `always [madvise] never`.
+#[cfg(target_os = "linux")]
+fn transparent_hugepages_always(setting: &str) -> bool {
+    setting.split_whitespace().any(|mode| mode == "[always]")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[cfg(all(target_os = "linux", feature = "monitoring"))]
+    #[test]
+    fn a_larger_jemalloc_page_is_flagged() {
+        assert!(super::jemalloc_pages_larger(65536, 4096));
+        assert!(!super::jemalloc_pages_larger(4096, 4096));
+        assert!(!super::jemalloc_pages_larger(4096, 16384));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_the_selected_transparent_hugepage_mode_counts() {
+        use super::transparent_hugepages_always;
+
+        assert!(transparent_hugepages_always("[always] madvise never\n"));
+        assert!(!transparent_hugepages_always("always [madvise] never\n"));
+        assert!(!transparent_hugepages_always("always madvise [never]\n"));
+        assert!(!transparent_hugepages_always(""));
+    }
+
     #[test]
     fn malloc_conf_is_applied() {
         #[cfg(target_os = "linux")]
