@@ -77,7 +77,15 @@ tokio::spawn(async move {
 
 **System:**
 - `sv2_uptime_seconds` - Server uptime
-- `sv2_heap_in_use_bytes`, `sv2_heap_free_bytes`, `sv2_heap_mapped_bytes` - Heap memory still in use, freed but held by the allocator, and obtained from the OS (glibc builds only, which then need glibc 2.33 or later to start). Resident memory that grows while `in_use` stays flat is allocator retention, not a leak.
+- `sv2_heap_in_use_bytes`, `sv2_heap_free_bytes`, `sv2_heap_mapped_bytes` - Heap memory still in use, held by the allocator but not in use, and held from the OS, in use or free. `free` is memory the allocator has freed; where the allocator cannot tell that from fragmentation inside pages it still uses, `free` includes the fragmentation, so releasing returns at most that much. Where the allocator cannot measure `mapped`, it is an estimate. Resident memory that grows while `in_use` stays flat is allocator retention, not a leak.
+- `sv2_heap_retained_bytes` - Address space the allocator has returned to the OS but keeps mapped. It is not resident and not part of `mapped`. Only allocators that report it export it.
+- `sv2_heap_allocator_info{allocator}` - 1 for the allocator behind the heap gauges. The gauges are exported only if the allocator reports them, and what they count differs slightly by allocator:
+
+| `allocator` | `in_use` | `free` | `mapped` | `retained` |
+|-------------|----------|--------|----------|------------|
+| `glibc` (default on Linux glibc builds, which need glibc 2.33 or later to start) | `uordblks` + `hblkhd` of `mallinfo2` | `fordblks` | `arena` + `hblkhd` | not exported |
+
+An application can report another allocator's figures, and release its free memory, by registering a `heap::HeapAllocator` with `heap::use_allocator` before it starts the monitoring server.
 
 **Server:**
 - `sv2_server_channels{channel_type}` - Server channels by type (extended/standard)

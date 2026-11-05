@@ -1970,9 +1970,11 @@ mod tests {
             "sv2_heap_in_use_bytes",
             "sv2_heap_free_bytes",
             "sv2_heap_mapped_bytes",
+            r#"sv2_heap_allocator_info{allocator="glibc"} 1"#,
         ] {
             assert!(body.contains(name), "{name} missing from {body}");
         }
+        assert!(!body.contains("sv2_heap_retained_bytes"));
     }
 
     #[tokio::test]

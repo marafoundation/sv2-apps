@@ -551,6 +551,9 @@ impl SnapshotCache {
                     gauge.set(bytes as f64);
                 }
             }
+            if let (Some(gauge), Some(bytes)) = (&metrics.sv2_heap_retained_bytes, heap.retained) {
+                gauge.set(bytes as f64);
+            }
         }
 
         // SV1 client metrics
