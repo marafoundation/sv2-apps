@@ -84,6 +84,7 @@ tokio::spawn(async move {
 | `allocator` | `in_use` | `free` | `mapped` | `retained` |
 |-------------|----------|--------|----------|------------|
 | `glibc` (default on Linux glibc builds, which need glibc 2.33 or later to start) | `uordblks` + `hblkhd` of `mallinfo2` | `fordblks` | `arena` + `hblkhd` | not exported |
+| `jemalloc` (translator built with `--features jemalloc`) | `stats.allocated` | (`stats.active` − `stats.allocated`) + dirty + muzzy: fragmentation inside active pages, plus freed pages not yet returned to the OS. Dirty and muzzy are `stats.arenas.4096.pdirty` and `pmuzzy` times `arenas.page` | `stats.active` + dirty + muzzy + `stats.metadata`, an estimate of what jemalloc keeps resident (`stats.resident` with metadata counted as allocated rather than as touched). Pages are jemalloc's, so this should match where jemalloc and the kernel share a page size, as on x86_64 (not yet measured); on aarch64 (64 KiB jemalloc pages) on a 4 KiB-page kernel, `free` and `mapped` overstate | `stats.retained` |
 
 An application can report another allocator's figures, and release its free memory, by registering a `heap::HeapAllocator` with `heap::use_allocator` before it starts the monitoring server.
 

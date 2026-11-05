@@ -1,4 +1,10 @@
 mod args;
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "hotpath-alloc"),
+    not(target_env = "msvc")
+))]
+mod jemalloc;
 use stratum_apps::config_helpers::logging::init_logging;
 pub use translator_sv2::{TranslatorSv2, config, error, sv1, sv2};
 
@@ -84,8 +90,9 @@ fn release_heap_on_sigusr1() {
             })
             .await;
             match report {
-                // Resident memory is logged too: the release can lower it without changing the
-                // heap figures, which only move when the heap itself shrinks.
+                // Resident memory is what shows the effect: the release can lower it without
+                // changing the heap figures, which only move when the heap itself shrinks, and
+                // `released` may mean only that the release ran.
                 Ok(((Some(before), rss_before), released, (Some(after), rss_after))) => {
                     tracing::info!(
                         released,
@@ -97,7 +104,8 @@ fn release_heap_on_sigusr1() {
                         free_after = after.free,
                         mapped_before = before.mapped,
                         mapped_after = after.mapped,
-                        "SIGUSR1: returned free heap memory to the OS"
+                        "SIGUSR1: asked the allocator to return free heap memory to the OS; compare \
+                         resident_before and resident_after for what it returned"
                     )
                 }
                 Ok(_) => tracing::warn!(
@@ -115,6 +123,12 @@ fn release_heap_on_sigusr1() {
 /// defined in `translator_sv2::TranslatorSv2`. Errors during startup are logged.
 #[cfg_attr(not(test), hotpath::main(limit = 0))]
 async fn inner_main() {
+    #[cfg(all(
+        feature = "jemalloc",
+        not(feature = "hotpath-alloc"),
+        not(target_env = "msvc")
+    ))]
+    jemalloc::register_heap_allocator();
     let proxy_config = process_cli_args().unwrap_or_else(|e| {
         eprintln!("Translator proxy config error: {e}");
         std::process::exit(1);
@@ -128,6 +142,9 @@ async fn inner_main() {
         #[cfg(not(all(unix, feature = "monitoring")))]
         tracing::warn!("release_heap_on_sigusr1 needs a Unix build with the monitoring feature");
     }
+
+    #[cfg(all(feature = "jemalloc", feature = "hotpath-alloc"))]
+    tracing::warn!("hotpath-alloc installs its own allocator, so this build does not use jemalloc");
 
     let drain = !proxy_config.drain_window().is_zero();
     let translator = TranslatorSv2::new(proxy_config);
