@@ -78,6 +78,7 @@ tokio::spawn(async move {
 **System:**
 - `sv2_uptime_seconds` - Server uptime
 - `sv2_heap_in_use_bytes`, `sv2_heap_free_bytes`, `sv2_heap_mapped_bytes` - Heap memory still in use, freed but held by the allocator, and obtained from the OS (glibc builds only, which then need glibc 2.33 or later to start). Resident memory that grows while `in_use` stays flat is allocator retention, not a leak.
+- The heap gauges are absent when an application registers a non-glibc allocator without statistics (`heap::use_allocator` with a `stats` that returns `None`), as the translator does when built with `--features jemalloc`.
 
 **Server:**
 - `sv2_server_channels{channel_type}` - Server channels by type (extended/standard)
