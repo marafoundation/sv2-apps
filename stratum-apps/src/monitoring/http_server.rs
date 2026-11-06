@@ -897,7 +897,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         .as_secs()
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
-    if let Some(refreshed) = state.cache.get_snapshot().timestamp {
+    if let Some(refreshed) = state.cache.snapshot_timestamp() {
         state
             .metrics
             .sv2_monitoring_snapshot_age_seconds
@@ -1078,6 +1078,7 @@ mod tests {
             extranonce2_len: 8,
             version_rolling_mask: Some("ffffffff".into()),
             version_rolling_min_bit: Some("00000000".into()),
+            shares: Default::default(),
         }
     }
 
@@ -1851,6 +1852,127 @@ mod tests {
         assert!(body.contains("sv2_uptime_seconds"));
         assert!(body.contains("sv2_server_channels"));
         assert!(body.contains("sv2_clients_total"));
+    }
+
+    use crate::monitoring::sv1::{Sv1BlockFound, Sv1ShareCounts, Sv1ShareDrops};
+
+    struct MockSv1Shares(Sv1ShareCounts, Sv1ShareDrops);
+    impl Sv1ClientsMonitoring for MockSv1Shares {
+        fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+            vec![]
+        }
+
+        fn get_sv1_share_totals(&self) -> Sv1ShareCounts {
+            self.0
+        }
+
+        fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_sv1_share_outcomes_by_reason() {
+        let shares = Sv1ShareCounts {
+            accepted: 7,
+            rejected_job_not_found: 3,
+            rejected_low_difficulty: 2,
+            ..Default::default()
+        };
+        let app = build_test_app(
+            None,
+            None,
+            Some(Arc::new(MockSv1Shares(
+                shares,
+                Sv1ShareDrops {
+                    below_upstream_target: 40,
+                    stale: 4,
+                    ..Default::default()
+                },
+            ))
+                as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        assert!(body.contains("sv1_shares_accepted_total 7"), "{body}");
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="job-not-found"} 3"#));
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="low-difficulty"} 2"#));
+        // Reasons nobody has hit yet are exported too.
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="duplicate"} 0"#));
+        assert!(body.contains("sv1_shares_below_upstream_target_total 40"));
+        assert!(body.contains(r#"sv1_shares_dropped_total{reason="stale"} 4"#));
+        assert!(body.contains(r#"sv1_shares_dropped_total{reason="unknown-channel"} 0"#));
+    }
+
+    struct MockSv1Blocks(Vec<Sv1BlockFound>);
+    impl Sv1ClientsMonitoring for MockSv1Blocks {
+        fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+            vec![]
+        }
+
+        fn get_sv1_blocks_found(&self) -> Vec<Sv1BlockFound> {
+            self.0.clone()
+        }
+
+        fn get_sv1_blocks_found_total(&self) -> u64 {
+            40
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_blocks_found_with_their_miner() {
+        let block = |worker: &str, height| Sv1BlockFound {
+            sv1_username: format!("acct.{worker}"),
+            worker: worker.to_string(),
+            user_identity: format!("pool.{worker}"),
+            share_hash: format!("{worker}-hash"),
+            height,
+            found_at_unix_secs: 1_700_000_000,
+        };
+        let app = build_test_app(
+            None,
+            None,
+            Some(Arc::new(MockSv1Blocks(vec![
+                block("rig1", Some(900_000)),
+                block("rig2", None),
+            ]))
+                as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        let line = |worker: &str| {
+            body.lines()
+                .find(|l| l.starts_with("sv1_block_found_info{") && l.contains(worker))
+                .unwrap_or_else(|| panic!("no block-found series for {worker} in {body}"))
+                .to_string()
+        };
+        let rig1 = line("rig1");
+        for label in [
+            r#"sv1_username="acct.rig1""#,
+            r#"worker="rig1""#,
+            r#"user_identity="pool.rig1""#,
+            r#"share_hash="rig1-hash""#,
+            r#"height="900000""#,
+        ] {
+            assert!(rig1.contains(label), "{label} missing from {rig1}");
+        }
+        assert!(rig1.ends_with(" 1700000000"), "{rig1}");
+        // An unknown height is an empty label.
+        assert!(line("rig2").contains(r#"height="""#));
+        // The total keeps counting past the blocks still listed.
+        assert!(body.contains("sv1_blocks_found_total 40"), "{body}");
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn metrics_endpoint_exports_heap_usage() {
+        let app = build_test_app(None, None, None);
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        for name in [
+            "sv2_heap_in_use_bytes",
+            "sv2_heap_free_bytes",
+            "sv2_heap_mapped_bytes",
+        ] {
+            assert!(body.contains(name), "{name} missing from {body}");
+        }
     }
 
     #[tokio::test]

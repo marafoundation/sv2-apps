@@ -11,8 +11,12 @@ use stratum_apps::{
     monitoring::{
         DiscoveredMiner, MinerTelemetry, MinerTelemetryCollector, MinerTelemetryStatus,
         match_discovered_miners_to_downstreams_by_worker_and_port,
-        sv1::{Sv1ClientInfo, Sv1ClientsMonitoring},
+        sv1::{
+            Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDrops,
+            Sv1ShareRejection,
+        },
     },
+    stratum_core::sv1_api::json_rpc,
     utils::types::DownstreamId,
 };
 use tokio_util::sync::CancellationToken;
@@ -45,6 +49,7 @@ fn downstream_to_sv1_client_info(
             stable_hashrate: dd.stable_hashrate,
             extranonce1_hex: hex::encode(&dd.extranonce1),
             extranonce2_len: dd.extranonce2_len,
+            shares: dd.shares,
             version_rolling_mask: dd
                 .version_rolling_mask
                 .as_ref()
@@ -91,9 +96,52 @@ impl Sv1ClientsMonitoring for Sv1Server {
             })
             .flatten()
     }
+
+    fn get_sv1_share_totals(&self) -> Sv1ShareCounts {
+        *self.share_totals.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
+        *self.share_drops.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get_sv1_blocks_found(&self) -> Vec<Sv1BlockFound> {
+        self.blocks_found.recent()
+    }
+
+    fn get_sv1_blocks_found_total(&self) -> u64 {
+        self.blocks_found.total()
+    }
+}
+
+/// How the SV1 server answered a `mining.submit`: `None` if it accepted the share.
+fn share_rejection(response: &json_rpc::Response) -> Option<Sv1ShareRejection> {
+    match &response.error {
+        Some(error) => Some(Sv1ShareRejection::from_code(error.code)),
+        None if response.result == serde_json::Value::Bool(true) => None,
+        None => Some(Sv1ShareRejection::Other),
+    }
 }
 
 impl Sv1Server {
+    /// Counts how a share from `downstream_id` was answered, for the miner and in total.
+    pub(super) fn record_share_outcome(
+        &self,
+        downstream_id: DownstreamId,
+        response: &json_rpc::Response,
+    ) {
+        let rejection = share_rejection(response);
+        self.share_totals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(rejection);
+        self.downstreams.with(&downstream_id, |downstream| {
+            let _ = downstream
+                .downstream_data
+                .with(|data| data.shares.record(rejection));
+        });
+    }
+
     pub(crate) fn miner_telemetry_for(
         &self,
         downstream_id: DownstreamId,

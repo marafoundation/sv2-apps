@@ -27,7 +27,8 @@ use crate::{
     },
     utils::{
         AGGREGATED_CHANNEL_ID, KEEPALIVE_JOB_ID_DELIMITER, MAX_FUTURE_BLOCK_TIME,
-        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING, SubmitShareWithChannelId, TproxyMode,
+        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING, ShareOrigin,
+        SubmitShareWithChannelId, TproxyMode,
     },
 };
 use async_channel::{Receiver, Sender, unbounded};
@@ -116,15 +117,15 @@ struct Sv1ServerIo {
     downstream_to_sv1_server_sender: Sender<(DownstreamId, json_rpc::Message)>,
     downstream_to_sv1_server_receiver: Receiver<(DownstreamId, json_rpc::Message)>,
     channel_manager_receiver: Receiver<MiningOwned>,
-    // Option<String> carries non-empty sv1_worker_name metadata for SubmitSharesExtended.
-    channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+    // Where a SubmitSharesExtended came from; `None` for every other message.
+    channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1ServerIo {
     fn new(
         channel_manager_receiver: Receiver<MiningOwned>,
-        channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+        channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
     ) -> Self {
         let (downstream_to_sv1_server_sender, downstream_to_sv1_server_receiver) = unbounded();
 
@@ -246,6 +247,15 @@ pub struct Sv1Server {
     generation: Arc<Mutex<GenerationSlot>>,
     generation_control: Option<GenerationControl>,
     hold: HoldState,
+    /// Outcomes of every share answered since the process started.
+    #[cfg(feature = "monitoring")]
+    pub(crate) share_totals: Arc<Mutex<stratum_apps::monitoring::Sv1ShareCounts>>,
+    /// Accepted shares the channel managers did not send upstream, since the process started.
+    #[cfg(feature = "monitoring")]
+    pub(crate) share_drops: Arc<Mutex<stratum_apps::monitoring::Sv1ShareDrops>>,
+    /// Recent shares that found a block, recorded by the channel managers.
+    #[cfg(feature = "monitoring")]
+    pub(crate) blocks_found: crate::monitoring::BlocksFound,
 }
 
 /// Miners kept connected between upstream generations, and their move onto the next one.
@@ -318,7 +328,7 @@ struct GenerationControl {
     events: Receiver<GenerationEvent>,
     /// The receiving end of the server's own channel-manager queue, used to discard requests
     /// meant for a generation that has ended.
-    to_channel_manager: Receiver<(MiningOwned, Option<String>)>,
+    to_channel_manager: Receiver<(MiningOwned, Option<ShareOrigin>)>,
 }
 
 fn drain_queue<T>(receiver: &Receiver<T>) -> usize {
@@ -531,7 +541,7 @@ impl Sv1Server {
     pub fn new(
         listener_addr: SocketAddr,
         channel_manager_receiver: Receiver<MiningOwned>,
-        channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+        channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
         config: TranslatorConfig,
         mode: TproxyMode,
     ) -> Self {
@@ -566,6 +576,12 @@ impl Sv1Server {
             })),
             generation_control: None,
             hold: HoldState::default(),
+            #[cfg(feature = "monitoring")]
+            share_totals: Default::default(),
+            #[cfg(feature = "monitoring")]
+            share_drops: Default::default(),
+            #[cfg(feature = "monitoring")]
+            blocks_found: Default::default(),
         }
     }
 
@@ -578,7 +594,7 @@ impl Sv1Server {
     pub(crate) fn with_generation_control(
         mut self,
         events: Receiver<GenerationEvent>,
-        to_channel_manager: Receiver<(MiningOwned, Option<String>)>,
+        to_channel_manager: Receiver<(MiningOwned, Option<ShareOrigin>)>,
     ) -> Self {
         self.generation = Arc::new(Mutex::new(GenerationSlot::default()));
         self.generation_control = Some(GenerationControl {
@@ -617,9 +633,19 @@ impl Sv1Server {
     /// [`Sv1Server::send_to_channel_manager_in`].
     async fn send_to_channel_manager(
         &self,
-        message: (MiningOwned, Option<String>),
+        message: (MiningOwned, Option<ShareOrigin>),
     ) -> Result<(), ()> {
         self.send_to_channel_manager_in(self.generation_epoch(), message)
+    }
+
+    /// Counts accepted shares that will never be sent upstream because their generation ended.
+    #[cfg_attr(not(feature = "monitoring"), allow(unused_variables))]
+    fn count_shares_upstream_gone(&self, shares: u64) {
+        #[cfg(feature = "monitoring")]
+        if shares > 0 {
+            let mut drops = self.share_drops.lock().unwrap_or_else(|e| e.into_inner());
+            drops.upstream_gone = drops.upstream_gone.saturating_add(shares);
+        }
     }
 
     /// Sends to the channel manager only if generation `epoch` is still current and connected,
@@ -628,7 +654,7 @@ impl Sv1Server {
     fn send_to_channel_manager_in(
         &self,
         epoch: u64,
-        message: (MiningOwned, Option<String>),
+        message: (MiningOwned, Option<ShareOrigin>),
     ) -> Result<(), ()> {
         let slot = self.generation_slot();
         let live = slot
@@ -636,10 +662,14 @@ impl Sv1Server {
             .as_ref()
             .is_some_and(|token| !token.is_cancelled());
         if slot.epoch != epoch || !live {
+            drop(slot);
             debug!(
                 "Dropping {} for the channel manager of generation {epoch}",
                 message.0
             );
+            if matches!(message.0, MiningOwned::SubmitSharesExtended(_)) {
+                self.count_shares_upstream_gone(1);
+            }
             return Ok(());
         }
         // Unbounded, so this never waits while the lock is held.
@@ -667,10 +697,18 @@ impl Sv1Server {
                     slot.fallback_token = None;
                 }
                 let discarded_from = drain_queue(&self.sv1_server_io.channel_manager_receiver);
-                let discarded_to = self
-                    .generation_control
-                    .as_ref()
-                    .map_or(0, |control| drain_queue(&control.to_channel_manager));
+                let discarded_to = self.generation_control.as_ref().map_or(0, |control| {
+                    let mut discarded = 0;
+                    let mut shares = 0;
+                    while let Ok((message, _)) = control.to_channel_manager.try_recv() {
+                        discarded += 1;
+                        if matches!(message, MiningOwned::SubmitSharesExtended(_)) {
+                            shares += 1;
+                        }
+                    }
+                    self.count_shares_upstream_gone(shares);
+                    discarded
+                });
                 if let Some(drained) = drained {
                     let _ = drained.send(());
                 }
@@ -1337,6 +1375,8 @@ impl Sv1Server {
                 let response = submit
                     .clone()
                     .respond(SubmitOutcome::Rejected(SubmitError::NotSubscribed));
+                #[cfg(feature = "monitoring")]
+                self.record_share_outcome(downstream_id, &response);
                 let downstream_sender = self
                     .with_registered_downstream(downstream_id, |downstream| {
                         Ok(downstream.downstream_io.downstream_sv1_sender.clone())
@@ -1362,6 +1402,8 @@ impl Sv1Server {
                 let response = submit
                     .clone()
                     .respond(SubmitOutcome::Rejected(SubmitError::JobNotFound));
+                #[cfg(feature = "monitoring")]
+                self.record_share_outcome(downstream_id, &response);
                 let downstream_sender = self
                     .with_registered_downstream(downstream_id, |downstream| {
                         Ok(downstream.downstream_io.downstream_sv1_sender.clone())
@@ -1433,6 +1475,8 @@ impl Sv1Server {
             Client2Server::Authorize(_) => Some(Sv1SetupRequest::Authorize),
             _ => None,
         };
+        #[cfg(feature = "monitoring")]
+        let is_submit = matches!(downstream_message, Client2Server::Submit(_));
         let response = self
             .clone()
             .handle_parsed_request(Some(downstream_id), downstream_message)
@@ -1441,6 +1485,12 @@ impl Sv1Server {
         match response {
             Ok(Some(response_msg)) => {
                 debug!("Down: Sending Sv1 message to downstream: {}", response_msg);
+                // Counted here, where the answer is final: sv1_api rejects some submits (an
+                // unauthorized worker, a wrong extranonce2 size) before they reach this server.
+                #[cfg(feature = "monitoring")]
+                if is_submit {
+                    self.record_share_outcome(downstream_id, &response_msg);
+                }
                 let downstream_sender = self
                     .with_registered_downstream(downstream_id, |downstream| {
                         Ok(downstream.downstream_io.downstream_sv1_sender.clone())
@@ -1561,16 +1611,16 @@ impl Sv1Server {
         )
         .map_err(TproxyError::shutdown)?;
 
-        let worker_name = match self.with_registered_downstream(
+        let (sv1_username, worker_name) = match self.with_registered_downstream(
             message.downstream_id,
             |downstream| {
                 downstream
                     .downstream_data
-                    .with(|data| data.sv1_worker_name.clone())
+                    .with(|data| (data.sv1_username.clone(), data.sv1_worker_name.clone()))
                     .map_err(TproxyError::shutdown)
             },
         ) {
-            Ok(worker_name) => worker_name,
+            Ok(names) => names,
             Err(e) if matches!(e.kind, TproxyErrorKind::DownstreamNotPresent(_)) => {
                 warn!(
                     "Downstream {} disconnected before its share could be forwarded; dropping share",
@@ -1580,11 +1630,15 @@ impl Sv1Server {
             }
             Err(e) => return Err(e),
         };
-        let sv1_worker_name = (!worker_name.is_empty()).then_some(worker_name);
+        let origin = ShareOrigin {
+            downstream_id: message.downstream_id,
+            sv1_username,
+            worker: (!worker_name.is_empty()).then_some(worker_name),
+        };
 
         self.send_to_channel_manager((
             MiningOwned::SubmitSharesExtended(submit_share_extended),
-            sv1_worker_name,
+            Some(origin),
         ))
         .await
         .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
@@ -5085,7 +5139,7 @@ mod tests {
     type TestChannels = (
         Sv1Server,
         Sender<MiningOwned>,
-        Receiver<(MiningOwned, Option<String>)>,
+        Receiver<(MiningOwned, Option<ShareOrigin>)>,
     );
 
     pub(super) fn server_with_channels(aggregated: bool) -> TestChannels {
@@ -5256,6 +5310,12 @@ mod tests {
         assert_eq!(response.error.unwrap().code, 25);
         assert!(from_server.is_empty());
         assert!(server.request_id_to_downstream_id.is_empty());
+        #[cfg(feature = "monitoring")]
+        assert_eq!(
+            stratum_apps::monitoring::Sv1ClientsMonitoring::get_sv1_share_totals(&server)
+                .rejected_not_subscribed,
+            1
+        );
         server
             .downstreams
             .with(&7, |downstream| {
@@ -5478,7 +5538,7 @@ mod tests {
         server: &Sv1Server,
         downstream_id: usize,
         responses: &Receiver<json_rpc::Message>,
-        forwarded: &Receiver<(MiningOwned, Option<String>)>,
+        forwarded: &Receiver<(MiningOwned, Option<ShareOrigin>)>,
         nonce: u32,
         expected_error: Option<i32>,
     ) {
@@ -5622,7 +5682,7 @@ mod tests {
     type GenerationTestChannels = (
         Sv1Server,
         Sender<MiningOwned>,
-        Receiver<(MiningOwned, Option<String>)>,
+        Receiver<(MiningOwned, Option<ShareOrigin>)>,
         Sender<GenerationEvent>,
     );
 
@@ -5834,6 +5894,12 @@ mod tests {
             assert!(
                 from_server.is_empty(),
                 "held shares never reach a channel manager"
+            );
+            #[cfg(feature = "monitoring")]
+            assert_eq!(
+                stratum_apps::monitoring::Sv1ClientsMonitoring::get_sv1_share_totals(&server)
+                    .rejected_job_not_found,
+                1
             );
             assert!(
                 !downstream.is_disconnected(),
@@ -6159,5 +6225,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.channel_id_to_downstream_id.get_cloned(&9), Some(8));
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn share_outcomes_are_counted_per_miner_and_since_start() {
+        use stratum_apps::monitoring::{Sv1ClientsMonitoring, Sv1ShareCounts};
+
+        let (server, _to_server, _from_server) = server_with_channels(true);
+        let (_events, wire) = ready_miner_with_job(&server, 9, "1");
+        server
+            .downstreams
+            .with(&7, |downstream| {
+                downstream
+                    .downstream_data
+                    .with(|data| {
+                        data.sv1_username = "worker".to_string();
+                        data.extranonce2_len = 16;
+                        data.job_validation_contexts.activate(
+                            "1".to_string(),
+                            Sv1JobValidationContext {
+                                extranonce: vec![1, 2, 3, 4].try_into().unwrap(),
+                                extranonce2_len: 16,
+                                // Any hash meets it.
+                                target: Target::from_le_bytes([0xff; 32]),
+                            },
+                            false,
+                        );
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        let submit = |id: u32, worker: &str, job: &str| {
+            serde_json::from_str::<json_rpc::Message>(&format!(
+                r#"{{"id":{id},"method":"mining.submit","params":["{worker}","{job}","00000000000000000000000000000000","00000001","00000000"]}}"#
+            ))
+            .unwrap()
+        };
+        for message in [
+            submit(1, "worker", "1"),
+            // The same share again.
+            submit(2, "worker", "1"),
+            submit(3, "worker", "2"),
+            // Rejected by sv1_api before the server sees it.
+            submit(4, "someone-else", "1"),
+            // Answered `true` too, but not a share.
+            serde_json::from_str(r#"{"id":5,"method":"mining.extranonce.subscribe","params":[]}"#)
+                .unwrap(),
+        ] {
+            receive_request(&server, message).await.unwrap();
+            wire.recv().await.unwrap();
+        }
+
+        let expected = Sv1ShareCounts {
+            accepted: 1,
+            rejected_duplicate: 1,
+            rejected_job_not_found: 1,
+            rejected_unauthorized_worker: 1,
+            ..Default::default()
+        };
+        assert_eq!(server.get_sv1_client_by_id(7).unwrap().shares, expected);
+        assert_eq!(server.get_sv1_share_totals(), expected);
+
+        // The totals outlive the miner.
+        server.handle_downstream_disconnect(7).await.unwrap();
+        assert!(server.get_sv1_client_by_id(7).is_none());
+        assert_eq!(server.get_sv1_share_totals(), expected);
+    }
+
+    #[cfg(feature = "monitoring")]
+    fn test_share() -> MiningOwned {
+        MiningOwned::SubmitSharesExtended(
+            stratum_apps::stratum_core::mining_sv2::SubmitSharesExtendedOwned {
+                channel_id: 9,
+                sequence_number: 0,
+                job_id: 1,
+                nonce: 0,
+                ntime: 0,
+                version: 0x20000000,
+                extranonce: vec![0; 8].try_into().unwrap(),
+            },
+        )
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn shares_whose_upstream_went_away_are_counted_as_dropped() {
+        use stratum_apps::monitoring::Sv1ClientsMonitoring;
+
+        let (server, _to_server, _from_server, _events) = server_with_generation_control(false);
+        let fallback_token = CancellationToken::new();
+        server
+            .handle_generation_event(GenerationEvent::Connected {
+                fallback_token: fallback_token.clone(),
+            })
+            .await
+            .unwrap();
+        // Queued before the fallback, so discarded when the generation ends.
+        server
+            .send_to_channel_manager((test_share(), None))
+            .await
+            .unwrap();
+        server
+            .send_to_channel_manager((close_channel(9), None))
+            .await
+            .unwrap();
+        // Sent once the fallback has started, so dropped at once.
+        let epoch = server.generation_epoch();
+        fallback_token.cancel();
+        server
+            .send_to_channel_manager_in(epoch, (test_share(), None))
+            .unwrap();
+        server
+            .send_to_channel_manager_in(epoch, (close_channel(9), None))
+            .unwrap();
+        assert_eq!(server.get_sv1_share_drops().upstream_gone, 1);
+
+        server
+            .handle_generation_event(GenerationEvent::Ended { drained: None })
+            .await
+            .unwrap();
+        // Only shares count, not the channel closes.
+        assert_eq!(server.get_sv1_share_drops().upstream_gone, 2);
     }
 }

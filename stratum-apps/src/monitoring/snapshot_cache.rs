@@ -55,7 +55,10 @@ use super::{
     client::{Sv2ClientInfo, Sv2ClientsMonitoring, Sv2ClientsSummary},
     prometheus_metrics::PrometheusMetrics,
     server::{ServerInfo, ServerMonitoring, ServerSummary},
-    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
+    sv1::{
+        Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareDropReason,
+        Sv1ShareRejection,
+    },
     upstream::{UpstreamInfo, UpstreamMonitoring},
 };
 
@@ -94,6 +97,9 @@ struct PreviousPrometheusLabelSets {
     /// Labels for client per-rejection GaugeVecs: [client_id, channel_id, user_identity,
     /// error_code]
     client_rejected_share_labels: HashSet<[String; 4]>,
+    /// Labels for the SV1 block-found GaugeVec: [sv1_username, worker, user_identity,
+    /// share_hash, height]
+    sv1_block_found_labels: HashSet<[String; 5]>,
 }
 
 /// Cached snapshot of monitoring data.
@@ -109,6 +115,8 @@ pub struct MonitoringSnapshot {
     pub sv2_clients_summary: Option<Sv2ClientsSummary>,
     pub sv1_clients: Option<Vec<Sv1ClientInfo>>,
     pub sv1_clients_summary: Option<Sv1ClientsSummary>,
+    pub sv1_blocks_found: Option<Vec<Sv1BlockFound>>,
+    pub sv1_blocks_found_total: Option<u64>,
     pub upstream_info: Option<UpstreamInfo>,
 }
 
@@ -164,6 +172,7 @@ impl Clone for SnapshotCache {
                 client_rejected_share_labels: previous_metrics_labels
                     .client_rejected_share_labels
                     .clone(),
+                sv1_block_found_labels: previous_metrics_labels.sv1_block_found_labels.clone(),
             }),
         }
     }
@@ -236,6 +245,11 @@ impl SnapshotCache {
         self.snapshot.read().unwrap().clone()
     }
 
+    /// When the current snapshot was taken, without copying it.
+    pub fn snapshot_timestamp(&self) -> Option<Instant> {
+        self.snapshot.read().unwrap().timestamp
+    }
+
     /// Refresh the cache by reading from the data sources.
     ///
     /// This method DOES acquire the business logic locks (via the trait methods),
@@ -262,10 +276,17 @@ impl SnapshotCache {
             new_snapshot.sv2_clients_summary = Some(source.get_sv2_clients_summary());
         }
 
-        // Collect Sv1 clients data
+        // Collect Sv1 clients data, walking the clients once
         if let Some(ref source) = self.sv1_clients_source {
-            new_snapshot.sv1_clients = Some(source.get_sv1_clients());
-            new_snapshot.sv1_clients_summary = Some(source.get_sv1_clients_summary());
+            let clients = source.get_sv1_clients();
+            new_snapshot.sv1_clients_summary = Some(Sv1ClientsSummary::new(
+                &clients,
+                source.get_sv1_share_totals(),
+                source.get_sv1_share_drops(),
+            ));
+            new_snapshot.sv1_clients = Some(clients);
+            new_snapshot.sv1_blocks_found = Some(source.get_sv1_blocks_found());
+            new_snapshot.sv1_blocks_found_total = Some(source.get_sv1_blocks_found_total());
         }
 
         // Collect upstream data
@@ -291,6 +312,7 @@ impl SnapshotCache {
         let mut current_upstream_labels: HashSet<[String; 1]> = HashSet::new();
         let mut current_client_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_client_rejected_labels: HashSet<[String; 4]> = HashSet::new();
+        let mut current_sv1_block_found_labels: HashSet<[String; 5]> = HashSet::new();
 
         // Server metrics
         if let Some(ref summary) = snapshot.server_summary {
@@ -519,6 +541,18 @@ impl SnapshotCache {
             }
         }
 
+        if let Some(heap) = super::heap::heap_stats() {
+            for (gauge, bytes) in [
+                (&metrics.sv2_heap_in_use_bytes, heap.in_use),
+                (&metrics.sv2_heap_free_bytes, heap.free),
+                (&metrics.sv2_heap_mapped_bytes, heap.mapped),
+            ] {
+                if let Some(gauge) = gauge {
+                    gauge.set(bytes as f64);
+                }
+            }
+        }
+
         // SV1 client metrics
         if let Some(ref summary) = snapshot.sv1_clients_summary {
             if let Some(ref m) = metrics.sv1_clients_total {
@@ -526,6 +560,45 @@ impl SnapshotCache {
             }
             if let Some(ref m) = metrics.sv1_hashrate_total {
                 m.set(summary.total_hashrate as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_accepted_total {
+                m.set(summary.shares.accepted as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_rejected_total {
+                for rejection in Sv1ShareRejection::ALL {
+                    m.with_label_values(&[rejection.label()])
+                        .set(summary.shares.rejected(rejection) as f64);
+                }
+            }
+            if let Some(ref m) = metrics.sv1_shares_below_upstream_target_total {
+                m.set(summary.dropped.below_upstream_target as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_dropped_total {
+                for reason in Sv1ShareDropReason::ALL {
+                    m.with_label_values(&[reason.label()])
+                        .set(summary.dropped.dropped(reason) as f64);
+                }
+            }
+        }
+        if let (Some(total), Some(m)) = (
+            snapshot.sv1_blocks_found_total,
+            &metrics.sv1_blocks_found_total,
+        ) {
+            m.set(total as f64);
+        }
+        if let (Some(blocks), Some(m)) = (&snapshot.sv1_blocks_found, &metrics.sv1_block_found_info)
+        {
+            for block in blocks {
+                let labels = [
+                    block.sv1_username.clone(),
+                    block.worker.clone(),
+                    block.user_identity.clone(),
+                    block.share_hash.clone(),
+                    block.height.map(|h| h.to_string()).unwrap_or_default(),
+                ];
+                m.with_label_values(&labels.each_ref().map(String::as_str))
+                    .set(block.found_at_unix_secs as f64);
+                current_sv1_block_found_labels.insert(labels);
             }
         }
 
@@ -637,6 +710,20 @@ impl SnapshotCache {
         previous_metrics_labels.upstream_labels = current_upstream_labels;
         previous_metrics_labels.client_channel_labels = current_client_labels;
         previous_metrics_labels.client_rejected_share_labels = current_client_rejected_labels;
+
+        // Blocks that dropped out of the source's recent list.
+        for stale in previous_metrics_labels
+            .sv1_block_found_labels
+            .difference(&current_sv1_block_found_labels)
+        {
+            if let Some(ref m) = metrics.sv1_block_found_info {
+                let label_refs = stale.each_ref().map(String::as_str);
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale block-found label");
+                }
+            }
+        }
+        previous_metrics_labels.sv1_block_found_labels = current_sv1_block_found_labels;
     }
 
     /// Get the refresh interval

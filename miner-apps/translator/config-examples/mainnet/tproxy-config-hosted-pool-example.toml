@@ -62,6 +62,10 @@ monitoring_cache_refresh_secs = 15
 # Send `client.reconnect` to each miner before closing its connection during the drain.
 # drain_send_reconnect = false
 
+# On SIGUSR1, return free heap memory to the OS and log heap usage before and after (optional,
+# glibc builds). Off by default, when SIGUSR1 terminates the process.
+# release_heap_on_sigusr1 = false
+
 # Upstreams that served miners stay eligible for later fallbacks. To stop an upstream that accepts
 # connections and then keeps failing from looping forever, more than `max_fallbacks` fallbacks
 # within `fallback_window_secs` makes the translator exit (0 exits on the first fallback).
