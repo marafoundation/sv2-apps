@@ -231,6 +231,27 @@ cd stratum
 cargo build --release -p translator_sv2
 ```
 
+### Memory allocator
+
+The translator uses the system allocator by default. On glibc, memory the translator has freed is partly kept by the allocator rather than returned to the OS, so resident memory keeps growing under churn even though the memory in use does not. Build with the optional `jemalloc` feature to use jemalloc instead, which returns freed memory to the OS on a schedule rather than keeping it:
+
+```bash
+cargo build --release -p translator_sv2 --features jemalloc
+```
+
+The build bakes in this jemalloc configuration, so no environment variable is needed: `background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:0,thp:never`. A background thread returns freed (dirty) pages to the OS after about 5 seconds, even when the process is idle, and `thp:never` keeps jemalloc's own memory out of transparent huge pages. `background_thread` and `thp` are not enabled off Linux (untested there). To override it at runtime, set `_RJEM_MALLOC_CONF`, which jemalloc reads after the built-in configuration (for example `_RJEM_MALLOC_CONF=dirty_decay_ms:10000`).
+
+The built-in `thp:never` opts jemalloc's own memory out of transparent huge pages, even on a host set to `always`. It has no effect where the kernel exposes no transparent huge page setting. Other allocations and the kernel's khugepaged can still use huge pages there, so set them to `madvise` (or `never`) on the host:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled   # the selected value is in brackets
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+To keep the setting across reboots, add `transparent_hugepage=madvise` to the kernel command line. On Linux, a `jemalloc` build logs a warning at startup if the setting is `always`, and carries on.
+
+The monitoring heap gauges and `release_heap_on_sigusr1` work with jemalloc as well; see the [monitoring README](../../stratum-apps/src/monitoring/README.md) for what each gauge counts under each allocator. Under jemalloc, `mapped` is an estimate of what it keeps resident, and `free` is its fragmentation plus freed pages not yet returned. Both count whole jemalloc pages, so they should match where jemalloc and the kernel use the same page size, as on x86_64 (not yet measured there). On aarch64, jemalloc uses 64 KiB pages; where the kernel uses 4 KiB pages, untouched parts of a page are counted too, so `mapped` and `free` overstate (by about 2× in a local measurement), while `in_use` stays exact. The translator logs a warning at startup when that is the case. With jemalloc, SIGUSR1 purges all of its arenas at once instead of waiting for them to decay. The purge reports success whether or not it returned anything, so read the `resident_before` and `resident_after` figures in its log line to see what it freed. The `jemalloc` feature has no effect when `hotpath-alloc` is also enabled, since that feature installs its own allocator, and it is unavailable on MSVC targets. When both features are enabled, the translator logs a warning at startup that jemalloc is not in use. `tikv-jemalloc-ctl` depends on `paste`, which `cargo audit` reports as unmaintained (RUSTSEC-2024-0436, informational).
+
 ### Running the Translator
 
 #### **With Local Pool**

@@ -12,10 +12,16 @@ pub struct PrometheusMetrics {
     // System metrics
     pub sv2_uptime_seconds: Gauge,
     pub sv2_monitoring_snapshot_age_seconds: Gauge,
-    /// Allocator heap usage; present only where the allocator reports it (glibc).
+    /// Allocator heap usage; present only where the allocator reports it. See
+    /// [`heap`](super::heap).
     pub sv2_heap_in_use_bytes: Option<Gauge>,
     pub sv2_heap_free_bytes: Option<Gauge>,
     pub sv2_heap_mapped_bytes: Option<Gauge>,
+    /// Present only where the allocator also reports address space it keeps mapped but not
+    /// resident.
+    pub sv2_heap_retained_bytes: Option<Gauge>,
+    /// Names the allocator behind the heap gauges, as the `allocator` label of a series valued 1.
+    pub sv2_heap_allocator_info: Option<GaugeVec>,
     // Server metrics (upstream connection)
     pub sv2_server_channels: Option<GaugeVec>,
     pub sv2_server_hashrate_total: Option<Gauge>,
@@ -65,8 +71,14 @@ impl PrometheusMetrics {
             "Seconds since the monitoring snapshot was last refreshed",
         )?;
         registry.register(Box::new(sv2_monitoring_snapshot_age_seconds.clone()))?;
-        let (sv2_heap_in_use_bytes, sv2_heap_free_bytes, sv2_heap_mapped_bytes) =
-            if super::heap::heap_stats().is_some() {
+        let (
+            sv2_heap_in_use_bytes,
+            sv2_heap_free_bytes,
+            sv2_heap_mapped_bytes,
+            sv2_heap_retained_bytes,
+            sv2_heap_allocator_info,
+        ) = match (super::heap::heap_stats(), super::heap::allocator_name()) {
+            (Some(stats), Some(allocator)) => {
                 let in_use = Gauge::new(
                     "sv2_heap_in_use_bytes",
                     "Heap bytes allocated and not yet freed",
@@ -74,7 +86,7 @@ impl PrometheusMetrics {
                 registry.register(Box::new(in_use.clone()))?;
                 let free = Gauge::new(
                     "sv2_heap_free_bytes",
-                    "Heap bytes freed but still held by the allocator",
+                    "Heap bytes held by the allocator but not in use, including fragmentation where it cannot tell it apart",
                 )?;
                 registry.register(Box::new(free.clone()))?;
                 let mapped = Gauge::new(
@@ -82,10 +94,29 @@ impl PrometheusMetrics {
                     "Heap bytes obtained from the OS, in use or free",
                 )?;
                 registry.register(Box::new(mapped.clone()))?;
-                (Some(in_use), Some(free), Some(mapped))
-            } else {
-                (None, None, None)
-            };
+                let retained = if stats.retained.is_some() {
+                    let retained = Gauge::new(
+                        "sv2_heap_retained_bytes",
+                        "Address space returned to the OS but kept mapped by the allocator",
+                    )?;
+                    registry.register(Box::new(retained.clone()))?;
+                    Some(retained)
+                } else {
+                    None
+                };
+                let info = GaugeVec::new(
+                    Opts::new(
+                        "sv2_heap_allocator_info",
+                        "Allocator behind the heap gauges",
+                    ),
+                    &["allocator"],
+                )?;
+                registry.register(Box::new(info.clone()))?;
+                info.with_label_values(&[allocator]).set(1.0);
+                (Some(in_use), Some(free), Some(mapped), retained, Some(info))
+            }
+            _ => (None, None, None, None, None),
+        };
 
         // Server metrics (upstream connection)
         let (
@@ -358,6 +389,8 @@ impl PrometheusMetrics {
             sv2_heap_in_use_bytes,
             sv2_heap_free_bytes,
             sv2_heap_mapped_bytes,
+            sv2_heap_retained_bytes,
+            sv2_heap_allocator_info,
             sv2_server_channels,
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
@@ -465,6 +498,7 @@ mod tests {
         let mut expected = vec!["sv2_monitoring_snapshot_age_seconds", "sv2_uptime_seconds"];
         if super::super::heap::heap_stats().is_some() {
             expected.extend([
+                "sv2_heap_allocator_info",
                 "sv2_heap_free_bytes",
                 "sv2_heap_in_use_bytes",
                 "sv2_heap_mapped_bytes",

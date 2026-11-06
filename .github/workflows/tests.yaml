@@ -43,5 +43,9 @@ jobs:
         run: cargo test --manifest-path=pool-apps/jd-server/Cargo.toml
       - name: Test miner applications workspace
         run: cargo test --manifest-path=miner-apps/Cargo.toml
+      - name: Test translator with jemalloc
+        run: |
+          cargo test --manifest-path=miner-apps/Cargo.toml -p translator_sv2 --features jemalloc
+          cargo test --manifest-path=miner-apps/Cargo.toml -p translator_sv2 --no-default-features --features jemalloc
       - name: Test bitcoin-core-sv2 crate
         run: cargo test --manifest-path=bitcoin-core-sv2/Cargo.toml

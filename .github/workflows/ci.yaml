@@ -42,6 +42,8 @@ jobs:
           cargo clippy --manifest-path=stratum-apps/Cargo.toml --all-features -- -D warnings
           cargo clippy --manifest-path=pool-apps/Cargo.toml -- -D warnings
           cargo clippy --manifest-path=miner-apps/Cargo.toml -- -D warnings
+          cargo clippy --manifest-path=miner-apps/Cargo.toml -p translator_sv2 --all-targets --features jemalloc -- -D warnings
+          cargo clippy --manifest-path=miner-apps/Cargo.toml -p translator_sv2 --all-targets --no-default-features --features jemalloc -- -D warnings
           cargo clippy --manifest-path=integration-tests/Cargo.toml -- -D warnings
           cargo clippy --manifest-path=bitcoin-core-sv2/Cargo.toml -- -D warnings
 
