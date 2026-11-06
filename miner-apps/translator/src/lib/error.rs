@@ -264,6 +264,8 @@ pub enum TproxyErrorKind {
     PayoutVerificationFailed(String),
     /// More fallbacks than allowed happened within the configured window
     FallbackLoop { fallbacks: usize, window_secs: u64 },
+    /// The SV1 server did not confirm it discarded an ended upstream generation's messages
+    GenerationEndUnacknowledged,
 }
 
 impl std::error::Error for TproxyErrorKind {}
@@ -382,6 +384,10 @@ impl fmt::Display for TproxyErrorKind {
             } => write!(
                 f,
                 "{fallbacks} upstream fallbacks within {window_secs}s, giving up"
+            ),
+            GenerationEndUnacknowledged => write!(
+                f,
+                "SV1 server did not acknowledge the end of an upstream generation"
             ),
         }
     }
