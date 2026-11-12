@@ -98,6 +98,25 @@ pub enum TemplateProviderType {
     },
 }
 
+#[cfg(feature = "core")]
+impl TemplateProviderType {
+    /// The chain the template provider is on, if its config names it (`Sv2Tp` does not).
+    pub fn network(&self) -> Option<stratum_core::bitcoin::Network> {
+        #[cfg(feature = "bitcoin-core-sv2")]
+        use stratum_core::bitcoin::Network;
+        match self {
+            Self::Sv2Tp { .. } => None,
+            #[cfg(feature = "bitcoin-core-sv2")]
+            Self::BitcoinCoreIpc { network, .. } => Some(match network {
+                BitcoinNetwork::Mainnet => Network::Bitcoin,
+                BitcoinNetwork::Testnet4 => Network::Testnet4,
+                BitcoinNetwork::Signet => Network::Signet,
+                BitcoinNetwork::Regtest => Network::Regtest,
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -84,6 +84,8 @@ struct PreviousPrometheusLabelSets {
     server_channel_labels: HashSet<[String; 2]>,
     /// Labels for server per-rejection GaugeVecs: [channel_id, user_identity, error_code]
     server_rejected_share_labels: HashSet<[String; 3]>,
+    /// Labels for the coinbase output GaugeVec: [script_hex, address]
+    coinbase_output_labels: HashSet<[String; 2]>,
     /// Labels for client per-channel GaugeVecs: [client_id, channel_id, user_identity]
     client_channel_labels: HashSet<[String; 3]>,
     /// Labels for client per-rejection GaugeVecs: [client_id, channel_id, user_identity,
@@ -150,6 +152,7 @@ impl Clone for SnapshotCache {
                 server_rejected_share_labels: previous_metrics_labels
                     .server_rejected_share_labels
                     .clone(),
+                coinbase_output_labels: previous_metrics_labels.coinbase_output_labels.clone(),
                 client_channel_labels: previous_metrics_labels.client_channel_labels.clone(),
                 client_rejected_share_labels: previous_metrics_labels
                     .client_rejected_share_labels
@@ -255,6 +258,7 @@ impl SnapshotCache {
     fn update_metrics(&self, metrics: &PrometheusMetrics, snapshot: &MonitoringSnapshot) {
         let mut current_server_labels: HashSet<[String; 2]> = HashSet::new();
         let mut current_server_rejected_labels: HashSet<[String; 3]> = HashSet::new();
+        let mut current_coinbase_output_labels: HashSet<[String; 2]> = HashSet::new();
         let mut current_client_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_client_rejected_labels: HashSet<[String; 4]> = HashSet::new();
 
@@ -365,6 +369,15 @@ impl SnapshotCache {
                     )
                     .sum();
                 m.set(total as f64);
+            }
+
+            if let Some(ref m) = metrics.sv2_coinbase_output_info {
+                for output in &server.coinbase_outputs {
+                    m.with_label_values(&[&output.script_hex, &output.address])
+                        .set(1.0);
+                    current_coinbase_output_labels
+                        .insert([output.script_hex.clone(), output.address.clone()]);
+                }
             }
         }
 
@@ -522,6 +535,18 @@ impl SnapshotCache {
         }
 
         for stale in previous_metrics_labels
+            .coinbase_output_labels
+            .difference(&current_coinbase_output_labels)
+        {
+            let label_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            if let Some(ref m) = metrics.sv2_coinbase_output_info {
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale coinbase output label");
+                }
+            }
+        }
+
+        for stale in previous_metrics_labels
             .client_channel_labels
             .difference(&current_client_labels)
         {
@@ -552,6 +577,7 @@ impl SnapshotCache {
 
         previous_metrics_labels.server_channel_labels = current_server_labels;
         previous_metrics_labels.server_rejected_share_labels = current_server_rejected_labels;
+        previous_metrics_labels.coinbase_output_labels = current_coinbase_output_labels;
         previous_metrics_labels.client_channel_labels = current_client_labels;
         previous_metrics_labels.client_rejected_share_labels = current_client_rejected_labels;
     }
@@ -570,6 +596,7 @@ mod tests {
     impl ServerMonitoring for MockServerMonitoring {
         fn get_server(&self) -> ServerInfo {
             ServerInfo {
+                coinbase_outputs: vec![],
                 extended_channels: vec![],
                 standard_channels: vec![],
             }
@@ -668,6 +695,7 @@ mod tests {
             // Minimal sleep to simulate lock acquisition overhead
             std::thread::sleep(Duration::from_micros(10));
             ServerInfo {
+                coinbase_outputs: vec![],
                 extended_channels: vec![],
                 standard_channels: vec![],
             }
@@ -740,5 +768,55 @@ mod tests {
             total_cache_requests > 2,
             "Cache should have processed requests",
         );
+    }
+
+    struct CoinbaseOutputsServer(Mutex<Vec<super::super::server::CoinbaseOutputInfo>>);
+    impl ServerMonitoring for CoinbaseOutputsServer {
+        fn get_server(&self) -> ServerInfo {
+            ServerInfo {
+                coinbase_outputs: self.0.lock().unwrap().clone(),
+                extended_channels: vec![],
+                standard_channels: vec![],
+            }
+        }
+    }
+
+    #[test]
+    fn coinbase_output_info_follows_server_info_and_drops_stale_series() {
+        use super::super::server::CoinbaseOutputInfo;
+        let output = |script_hex: &str, address: &str| CoinbaseOutputInfo {
+            script_hex: script_hex.to_string(),
+            address: address.to_string(),
+        };
+        let series = |metrics: &PrometheusMetrics| -> Vec<String> {
+            let m = metrics.sv2_coinbase_output_info.as_ref().unwrap();
+            let mut labels: Vec<String> = prometheus::core::Collector::collect(m)[0]
+                .get_metric()
+                .iter()
+                .map(|metric| {
+                    assert_eq!(metric.get_gauge().get_value(), 1.0);
+                    let l = metric.get_label();
+                    format!("{}={}", l[0].get_value(), l[1].get_value())
+                })
+                .collect();
+            labels.sort();
+            labels
+        };
+        let source = Arc::new(CoinbaseOutputsServer(Mutex::new(vec![
+            output("a914aa87", "3pool"),
+            output("0014bb", "bc1miner"),
+        ])));
+        let metrics = PrometheusMetrics::new(true, false, false).unwrap();
+        let cache = SnapshotCache::new(Duration::from_secs(5), Some(source.clone()), None)
+            .with_metrics(metrics.clone());
+
+        cache.refresh();
+        // labels are sorted by name: address, script_hex
+        assert_eq!(series(&metrics), ["3pool=a914aa87", "bc1miner=0014bb"]);
+
+        // a miner disconnects: its payout script's series goes away
+        *source.0.lock().unwrap() = vec![output("a914aa87", "3pool")];
+        cache.refresh();
+        assert_eq!(series(&metrics), ["3pool=a914aa87"]);
     }
 }

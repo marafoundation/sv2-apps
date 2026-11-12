@@ -72,11 +72,13 @@ impl ServerMonitoring for ChannelManager {
                 ServerInfo {
                     extended_channels,
                     standard_channels,
+                    coinbase_outputs: Vec::new(),
                 }
             })
             .unwrap_or_else(|_| ServerInfo {
                 extended_channels: Vec::new(),
                 standard_channels: Vec::new(),
+                coinbase_outputs: Vec::new(),
             })
     }
 }
