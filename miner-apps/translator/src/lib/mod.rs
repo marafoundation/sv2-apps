@@ -35,6 +35,7 @@ mod monitoring;
 pub mod sv1;
 pub mod sv2;
 mod translator_runtime;
+mod upstream_walk;
 pub mod utils;
 
 /// The main struct that manages the SV1/SV2 translator.
@@ -118,7 +119,15 @@ impl TranslatorSv2 {
 
             // A requested reconnect shuts the components down like a fallback, then connects to
             // the requested endpoint instead of the next configured upstream.
-            let sv1_ready_runtime = running.cleanup_for_fallback().await;
+            let sv1_ready_runtime = match running.cleanup_for_fallback().await {
+                Ok(runtime) => runtime,
+                Err(bootstrap_err) => {
+                    let (kind, runtime) = bootstrap_err.into_parts();
+                    error!(?kind, "Giving up on upstream fallbacks");
+                    runtime.shutdown().await;
+                    return Err(kind);
+                }
+            };
             let upstream_ready = match requested_reconnect {
                 Some(request) => sv1_ready_runtime.try_reconnect(request).await,
                 None => sv1_ready_runtime.try_upstream().await,
