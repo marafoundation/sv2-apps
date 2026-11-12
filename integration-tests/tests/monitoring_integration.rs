@@ -31,7 +31,8 @@ const METRIC_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 // ---------------------------------------------------------------------------
 // 1. Pool + SV2 Mining Device (standard channel) Pool role exposes: client metrics (connections,
-//    channels, shares, hashrate) Pool has NO upstream, so server metrics should be absent.
+//    channels, shares, hashrate) Pool has NO upstream: zero server channels, plus its coinbase
+//    outputs.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn pool_monitoring_with_sv2_mining_device() {
@@ -92,12 +93,93 @@ async fn pool_monitoring_with_sv2_mining_device() {
         .await;
     assert_metric_present(&pool_metrics, "sv2_uptime_seconds");
 
-    // Pool has no upstream — server metrics should be absent
-    assert_metric_not_present(&pool_metrics, "sv2_server_channels");
-    assert_metric_not_present(&pool_metrics, "sv2_server_hashrate_total");
+    // Pool has no upstream: its server side has no channels and reports only coinbase outputs
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels("sv2_server_channels", &[("channel_type", "extended")]),
+        0.0,
+    );
+    assert_metric_eq(&pool_metrics, "sv2_server_hashrate_total", 0.0);
 
     // Pool should see 1 SV2 client (the mining device) with a standard channel
     assert_metric_eq(&pool_metrics, "sv2_clients_total", 1.0);
+
+    // The mining device's user_identity has no payout mode, so the pool pays only its own
+    // script (POOL_COINBASE_REWARD_DESCRIPTOR). An Sv2Tp template provider gives the pool no
+    // network, so the output is exported without an address.
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels(
+            "sv2_coinbase_output_info",
+            &[
+                ("script_hex", "0014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc"),
+                ("address", ""),
+            ],
+        ),
+        1.0,
+    );
+    assert_eq!(
+        pool_metrics
+            .lines()
+            .filter(|line| line.starts_with("sv2_coinbase_output_info{"))
+            .count(),
+        1,
+        "the pool pays exactly one script"
+    );
+    assert_metric_present(&pool_metrics, "sv2_monitoring_snapshot_age_seconds");
+
+    shutdown_all!(pool);
+}
+
+// A miner whose user_identity donates 50% is paid by the pool's jobs: the pool exports both its
+// own script and the miner's.
+#[tokio::test]
+async fn pool_monitoring_exports_miner_payout_script() {
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool, pool_addr, pool_monitoring) =
+        start_pool(sv2_tp_config(tp_addr), vec![], vec![], true).await;
+    let (sniffer, sniffer_addr) = start_sniffer("B", pool_addr, false, vec![], None);
+    start_mining_device_sv2(
+        sniffer_addr,
+        None,
+        None,
+        Some("sri/donate/50/tb1qzyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3apj6d3/worker".to_string()),
+        1,
+        None,
+        true,
+    );
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+
+    let pool_mon =
+        MonitoringApi::builder(pool_monitoring.expect("pool monitoring should be enabled")).build();
+    // Sv2Tp names no network, so both series carry an empty address.
+    let miner_output = Metric::with_labels(
+        "sv2_coinbase_output_info",
+        &[
+            ("script_hex", "00141111111111111111111111111111111111111111"),
+            ("address", ""),
+        ],
+    );
+    let pool_metrics = pool_mon
+        .poll_metric_gte(miner_output, 1.0, METRIC_POLL_TIMEOUT)
+        .await;
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels(
+            "sv2_coinbase_output_info",
+            &[
+                ("script_hex", "0014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc"),
+                ("address", ""),
+            ],
+        ),
+        1.0,
+    );
 
     shutdown_all!(pool);
 }
@@ -148,7 +230,11 @@ async fn pool_and_tproxy_monitoring_with_sv1_miner() {
     assert_metric_present(&pool_metrics, "sv2_uptime_seconds");
     assert_metric_eq(&pool_metrics, "sv2_clients_total", 1.0);
     // Pool has no upstream
-    assert_metric_not_present(&pool_metrics, "sv2_server_channels");
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels("sv2_server_channels", &[("channel_type", "extended")]),
+        0.0,
+    );
 
     // -- tProxy metrics --
     let tproxy_mon =
@@ -249,7 +335,11 @@ async fn jd_aggregated_topology_monitoring() {
         .await;
     assert_metric_present(&pool_metrics, "sv2_uptime_seconds");
     assert_metric_eq(&pool_metrics, "sv2_clients_total", 1.0);
-    assert_metric_not_present(&pool_metrics, "sv2_server_channels");
+    assert_metric_eq(
+        &pool_metrics,
+        Metric::with_labels("sv2_server_channels", &[("channel_type", "extended")]),
+        0.0,
+    );
 
     // -- tProxy metrics (aggregated): 2 SV1 clients, 1 upstream extended channel --
     let tproxy_mon =
@@ -356,21 +446,20 @@ async fn pool_api_endpoints_static() {
         root.endpoints,
     );
 
-    // Pool has no upstream and no SV1 — these endpoints should return 404 with a typed
-    // `ErrorResponse` body.
-    for path in [routes::SERVER, routes::SERVER_CHANNELS, routes::SV1_CLIENTS] {
-        let (status, err): (i32, ErrorResponse) = pool_mon.fetch_with_status(path).await;
-        assert_eq!(
-            status, 404,
-            "{} should return 404, got {} with body {:?}",
-            path, status, err
-        );
-        assert!(
-            !err.error.is_empty(),
-            "{} should return a non-empty error message",
-            path,
-        );
-    }
+    // Pool has no upstream: its server side exists (for its coinbase outputs) with no channels.
+    let server: ServerResponse = pool_mon.fetch_typed(routes::SERVER).await;
+    assert_eq!(
+        server.extended_channels_count + server.standard_channels_count,
+        0
+    );
+
+    // Pool has no SV1 — this endpoint should return 404 with a typed `ErrorResponse` body.
+    let (status, err): (i32, ErrorResponse) = pool_mon.fetch_with_status(routes::SV1_CLIENTS).await;
+    assert_eq!(status, 404, "got {status} with body {err:?}");
+    assert!(
+        !err.error.is_empty(),
+        "the 404 should carry an error message"
+    );
 
     pool.shutdown().await;
 }
@@ -416,15 +505,16 @@ async fn pool_api_endpoints_with_miner() {
     let pool_mon =
         MonitoringApi::builder(pool_monitoring.expect("pool monitoring should be enabled")).build();
 
-    // /api/v1/global — pool sees SV2 clients, no upstream server, no SV1.
+    // /api/v1/global — pool sees SV2 clients, a server side with no channels, no SV1.
     let global: GlobalInfo = pool_mon
         .poll_until(routes::GLOBAL, METRIC_POLL_TIMEOUT, |r: &GlobalInfo| {
             r.sv2_clients.as_ref().is_some_and(|c| c.total_clients >= 1)
         })
         .await;
-    assert!(
-        global.server.is_none(),
-        "Pool /api/v1/global should have null server"
+    assert_eq!(
+        global.server.as_ref().map(|s| s.total_channels),
+        Some(0),
+        "Pool has no upstream channels"
     );
     assert_eq!(global.sv2_clients.as_ref().unwrap().total_clients, 1);
     assert!(

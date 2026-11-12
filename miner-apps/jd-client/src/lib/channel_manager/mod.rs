@@ -789,6 +789,10 @@ pub struct ChannelManager {
     /// validated again and propagated upstream.
     pub cached_shares: SharedMap<TemplateId, BinaryHeap<SharesOrderedByDiff>>,
     miner_tag_string: String,
+    // Chain the template provider is on, for rendering coinbase output scripts as addresses in
+    // monitoring. `None` when the template provider config does not name it (Sv2Tp).
+    #[cfg(feature = "monitoring")]
+    pub(crate) network: Option<stratum_apps::stratum_core::bitcoin::Network>,
     share_batch_size: SharesBatchSize,
     shares_per_minute: SharesPerMinute,
     /// Past jobs retained per channel; `None` uses the `channels_sv2` default.
@@ -808,6 +812,27 @@ pub struct ChannelManager {
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl ChannelManager {
+    // The scripts the coinbase outputs of every live set pay: templates handed out with an older
+    // set stay minable until the chain tip moves on, so all of them are reported.
+    #[cfg(feature = "monitoring")]
+    pub(crate) fn coinbase_output_scripts(
+        &self,
+    ) -> Vec<stratum_apps::stratum_core::bitcoin::ScriptBuf> {
+        self.output_sets
+            .with(|output_sets| {
+                output_sets
+                    .sets
+                    .iter()
+                    .flat_map(|set| {
+                        set.outputs
+                            .iter()
+                            .map(|output| output.script_pubkey.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn handle_error_action(
         &self,
         context: &str,
@@ -939,6 +964,8 @@ impl ChannelManager {
             shares_per_minute: config.shares_per_minute(),
             max_past_jobs: config.max_past_jobs(),
             miner_tag_string: config.jdc_signature().to_string(),
+            #[cfg(feature = "monitoring")]
+            network: config.template_provider_type().network(),
             user_identity: Arc::new(OnceLock::new()),
             reserved_downstream_rollable_extranonce_size: config
                 .reserved_downstream_rollable_extranonce_size(),
