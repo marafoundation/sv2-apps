@@ -17,11 +17,12 @@ use crate::{
     utils::AGGREGATED_CHANNEL_ID,
 };
 
-/// The [`ChannelManager`] and [`Sv1Server`] currently serving miners.
+/// What monitoring reports on: the long-lived [`Sv1Server`] and the [`ChannelManager`] of the
+/// upstream generation currently serving miners.
 ///
-/// The monitoring server outlives upstream generations, so it reads these through this handle.
-/// While a part is unset it reports no channels or no SV1 clients, which is what is being
-/// served.
+/// The channel manager is rebuilt on every fallback while the monitoring server keeps running.
+/// Between a fallback and the next upstream connection there is none, and no server channels
+/// are reported.
 #[derive(Default)]
 pub(crate) struct CurrentGeneration {
     channel_manager: RwLock<Option<Arc<ChannelManager>>>,
@@ -45,11 +46,6 @@ impl CurrentGeneration {
             .channel_manager
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
-    }
-
-    pub(crate) fn clear(&self) {
-        self.clear_channel_manager();
-        *self.sv1_server.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn channel_manager(&self) -> Option<Arc<ChannelManager>> {

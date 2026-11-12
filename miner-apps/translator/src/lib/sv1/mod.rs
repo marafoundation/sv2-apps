@@ -19,4 +19,5 @@ mod job_store;
 mod monitoring;
 mod sv1_server;
 pub use downstream::Downstream;
+pub(crate) use sv1_server::GenerationEvent;
 pub use sv1_server::Sv1Server;

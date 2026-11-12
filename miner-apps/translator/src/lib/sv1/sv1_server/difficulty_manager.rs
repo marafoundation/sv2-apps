@@ -47,6 +47,11 @@ impl Sv1Server {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
+            // Between upstream generations miners have no channel and submit nothing that
+            // counts; adjusting then would read the gap as lost hashrate.
+            if self.current_generation().is_none() {
+                continue;
+            }
             info!("Starting vardiff loop for downstreams");
 
             self.handle_vardiff_updates().await?;
@@ -60,6 +65,8 @@ impl Sv1Server {
     /// downstream, or a single one for the aggregated channel), and updates the difficulty
     /// advertised to the miner, see [`Self::update_difficulty`].
     pub(super) async fn handle_vardiff_updates(&self) -> TproxyResult<(), error::Sv1Server> {
+        // The updates below are read under this generation and sent to its channel manager only.
+        let epoch = self.generation_epoch();
         let mut updates = Vec::new();
 
         self.vardiff.try_for_each_mut(|downstream_id, vardiff_state| {
@@ -160,7 +167,7 @@ impl Sv1Server {
             .iter()
             .map(|(downstream_id, ..)| *downstream_id)
             .collect();
-        self.send_update_channel_messages(updates).await?;
+        self.send_update_channel_messages(epoch, updates)?;
 
         for downstream_id in updated_downstreams {
             if let Err(e) = self.update_difficulty(downstream_id) {
@@ -185,8 +192,10 @@ impl Sv1Server {
     /// Handles both aggregated and non-aggregated modes:
     /// - Aggregated: Send single UpdateChannel with minimum target and sum of hashrates
     /// - Non-aggregated: Send individual UpdateChannel for each downstream
-    async fn send_update_channel_messages(
+    #[allow(clippy::result_large_err)]
+    pub(super) fn send_update_channel_messages(
         &self,
+        epoch: u64,
         all_updates: Vec<(DownstreamId, ChannelId, Target, Hashrate)>, /* (downstream_id,
                                                                         * channel_id,
                                                                         * new_target,
@@ -195,15 +204,17 @@ impl Sv1Server {
         if self.mode.is_aggregated() {
             // Aggregated mode: Send single UpdateChannel with minimum target and total hashrate of
             // ALL downstreams
-            self.send_aggregated_update_channel(all_updates).await
+            self.send_aggregated_update_channel(epoch, all_updates)
         } else {
             // Non-aggregated mode: Send individual UpdateChannel for each downstream
-            self.send_non_aggregated_update_channels(all_updates).await
+            self.send_non_aggregated_update_channels(epoch, all_updates)
         }
     }
 
-    pub(super) async fn send_aggregated_update_channel(
+    #[allow(clippy::result_large_err)]
+    pub(super) fn send_aggregated_update_channel(
         &self,
+        epoch: u64,
         all_updates: Vec<(DownstreamId, ChannelId, Target, Hashrate)>,
     ) -> TproxyResult<(), error::Sv1Server> {
         // Nothing to do if we received no updates
@@ -237,18 +248,17 @@ impl Sv1Server {
             all_updates.len()
         );
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((MiningOwned::UpdateChannel(update_channel), None))
-            .await
+        self.send_to_channel_manager_in(epoch, (MiningOwned::UpdateChannel(update_channel), None))
             .map_err(|e| {
                 error!("Failed to send aggregated UpdateChannel: {:?}", e);
                 TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
             })
     }
 
-    async fn send_non_aggregated_update_channels(
+    #[allow(clippy::result_large_err)]
+    fn send_non_aggregated_update_channels(
         &self,
+        epoch: u64,
         all_updates: Vec<(DownstreamId, ChannelId, Target, Hashrate)>,
     ) -> TproxyResult<(), error::Sv1Server> {
         for (downstream_id, channel_id, new_target, new_hashrate) in all_updates {
@@ -263,17 +273,17 @@ impl Sv1Server {
                 downstream_id, channel_id, new_hashrate, new_target
             );
 
-            self.sv1_server_io
-                .channel_manager_sender
-                .send((MiningOwned::UpdateChannel(update_channel), None))
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to send UpdateChannel for downstream {}: {:?}",
-                        downstream_id, e
-                    );
-                    TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
-                })?;
+            self.send_to_channel_manager_in(
+                epoch,
+                (MiningOwned::UpdateChannel(update_channel), None),
+            )
+            .map_err(|e| {
+                error!(
+                    "Failed to send UpdateChannel for downstream {}: {:?}",
+                    downstream_id, e
+                );
+                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+            })?;
         }
         Ok(())
     }
@@ -507,6 +517,16 @@ impl Sv1Server {
     pub async fn send_update_channel_on_downstream_state_change(
         &self,
     ) -> TproxyResult<(), error::Sv1Server> {
+        self.send_update_channel_on_downstream_state_change_in(self.generation_epoch())
+    }
+
+    /// [`Sv1Server::send_update_channel_on_downstream_state_change`] for the channel manager of
+    /// generation `epoch` only.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn send_update_channel_on_downstream_state_change_in(
+        &self,
+        epoch: u64,
+    ) -> TproxyResult<(), error::Sv1Server> {
         if self.mode.is_non_aggregated() {
             return Ok(());
         }
@@ -535,10 +555,7 @@ impl Sv1Server {
             }
         };
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((MiningOwned::UpdateChannel(update), None))
-            .await
+        self.send_to_channel_manager_in(epoch, (MiningOwned::UpdateChannel(update), None))
             .map_err(|e| {
                 error!(
                     "Failed to send UpdateChannel after downstream state change: {:?}",

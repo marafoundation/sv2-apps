@@ -9,7 +9,6 @@ use std::net::IpAddr;
 use std::{collections::VecDeque, future::Future, sync::Arc, time::Instant};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
-    fallback_coordinator::FallbackCoordinator,
     stratum_core::{
         bitcoin::{BlockHash, Target},
         channels_sv2::client::MAX_SEEN_SHARES,
@@ -199,6 +198,9 @@ impl Sv1AcceptedShareCache {
 #[derive(Debug)]
 pub struct DownstreamData {
     pub channel_id: Option<ChannelId>,
+    /// Upstream generation epoch `channel_id` was assigned under; only that generation's
+    /// channel manager knows the channel.
+    pub channel_epoch: u64,
     pub extranonce1: Extranonce,
     pub extranonce2_len: usize,
     // Current SV1 share-validation target. This follows the advertised
@@ -261,6 +263,7 @@ impl DownstreamData {
     ) -> Self {
         DownstreamData {
             channel_id: None,
+            channel_epoch: 0,
             extranonce1: vec![0; 8]
                 .try_into()
                 .expect("8-byte extranonce is always valid"),
@@ -370,27 +373,23 @@ impl Downstream {
         self.downstream_cancellation_token.is_cancelled()
     }
 
+    /// Whether the miner was sent `client.reconnect`, which closes its outbound channel.
+    #[cfg(test)]
+    pub(super) fn was_asked_to_reconnect(&self) -> bool {
+        self.downstream_io.downstream_sv1_sender.is_closed()
+    }
+
     fn handle_error_action(
         &self,
         context: &str,
         e: &TproxyError<error::Downstream>,
         cancellation_token: &CancellationToken,
-        fallback_token: &CancellationToken,
     ) -> LoopControl {
         if cancellation_token.is_cancelled() {
             debug!(
                 downstream_id = self.downstream_id,
                 error_kind = ?e.kind,
                 "{context} returned an error after shutdown was requested"
-            );
-            return LoopControl::Continue;
-        }
-
-        if fallback_token.is_cancelled() {
-            debug!(
-                downstream_id = self.downstream_id,
-                error_kind = ?e.kind,
-                "{context} returned an error during fallback"
             );
             return LoopControl::Continue;
         }
@@ -473,7 +472,7 @@ impl Downstream {
     ///
     /// This method creates an async task that handles all communication for this
     /// downstream connection. The task runs a select loop that processes:
-    /// - Cancellation signals (global via cancellation_token or fallback)
+    /// - The global cancellation signal. A downstream outlives upstream fallbacks.
     /// - Messages from the miner (subscribe, authorize, submit)
     /// - Messages from the SV1 server (notify, set_difficulty, etc.)
     ///
@@ -483,7 +482,6 @@ impl Downstream {
     pub(super) fn start<F, Fut>(
         self,
         cancellation_token: CancellationToken,
-        fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
         on_disconnect: F,
     ) where
@@ -491,17 +489,12 @@ impl Downstream {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let downstream_id = self.downstream_id;
-        let fallback_token = fallback_coordinator.token();
-        task_manager.spawn(fallback_coordinator.track(async move {
+        task_manager.spawn(async move {
             loop {
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {
                         info!("Downstream {downstream_id}: received app shutdown signal");
-                        break;
-                    }
-                    _ = fallback_token.cancelled() => {
-                        info!("Downstream {downstream_id}: fallback triggered");
                         break;
                     }
                     // Handle downstream -> server message
@@ -512,7 +505,6 @@ impl Downstream {
                                 "Downstream::handle_downstream_message",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ) {
                                 break;
                             }
@@ -527,7 +519,6 @@ impl Downstream {
                                 "Downstream::handle_sv1_server_message",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ) {
                                 break;
                             }
@@ -545,7 +536,7 @@ impl Downstream {
             self.downstream_cancellation_token.cancel();
             self.downstream_io.close();
             on_disconnect().await;
-        }));
+        });
     }
 
     /// Processes typed notifications in per-downstream FIFO order.

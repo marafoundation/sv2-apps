@@ -12,7 +12,7 @@
 //! etc.) for specialized functionalities.
 use error::TproxyErrorKind;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::Notify;
@@ -25,6 +25,7 @@ use config::TranslatorConfig;
 
 use crate::utils::TproxyMode;
 
+use sv1::Sv1Server;
 use translator_runtime::{Init, RuntimeEvent, TranslatorRuntime};
 
 pub mod config;
@@ -47,6 +48,9 @@ pub struct TranslatorSv2 {
     drain_token: CancellationToken,
     shutdown_notify: Arc<Notify>,
     is_alive: Arc<AtomicBool>,
+    /// The SV1 server, once [`TranslatorSv2::start`] has created it. It outlives upstream
+    /// generations, so its downstreams are the miners a drain has to wait for.
+    sv1_server: Arc<OnceLock<Arc<Sv1Server>>>,
     /// The upstream generation monitoring reports on; outlives fallbacks like the monitoring
     /// server itself.
     #[cfg(feature = "monitoring")]
@@ -66,6 +70,7 @@ impl TranslatorSv2 {
             drain_token: CancellationToken::new(),
             shutdown_notify: Arc::new(Notify::new()),
             is_alive: Arc::new(AtomicBool::new(true)),
+            sv1_server: Arc::new(OnceLock::new()),
             #[cfg(feature = "monitoring")]
             current_generation: Arc::default(),
         }
@@ -126,7 +131,7 @@ impl TranslatorSv2 {
 
             // A requested reconnect shuts the components down like a fallback, then connects to
             // the requested endpoint instead of the next configured upstream.
-            let sv1_ready_runtime = match running.cleanup_for_fallback().await {
+            let ready_runtime = match running.cleanup_for_fallback().await {
                 Ok(runtime) => runtime,
                 Err(bootstrap_err) => {
                     let (kind, runtime) = bootstrap_err.into_parts();
@@ -136,8 +141,8 @@ impl TranslatorSv2 {
                 }
             };
             let upstream_ready = match requested_reconnect {
-                Some(request) => sv1_ready_runtime.try_reconnect(request).await,
-                None => sv1_ready_runtime.try_upstream().await,
+                Some(request) => ready_runtime.try_reconnect(request).await,
+                None => ready_runtime.try_upstream().await,
             };
 
             running = match upstream_ready {
@@ -178,21 +183,31 @@ impl TranslatorSv2 {
     /// The SV1 listener is closed and connected miners are disconnected gradually across the
     /// window while the upstream connection stays up. Shutdown starts as soon as the last miner
     /// is gone, or when the window elapses, at which point any remaining miners are dropped by
-    /// [`TranslatorSv2::shutdown`]. With `drain_seconds = 0` this is exactly
+    /// [`TranslatorSv2::shutdown`]. While no SV1 downstream is connected or held there is
+    /// nothing to wait for, so shutdown starts at once. With `drain_seconds = 0` this is exactly
     /// [`TranslatorSv2::shutdown`].
     pub async fn drain_and_shutdown(&self) {
         let window = self.config.drain_window();
         if !window.is_zero() && self.is_alive.load(Ordering::Acquire) {
-            info!("Draining SV1 downstreams for up to {}s", window.as_secs());
             self.drain_token.cancel();
-            if tokio::time::timeout(window, self.cancellation_token.cancelled())
-                .await
-                .is_err()
-            {
-                warn!("Drain window elapsed; dropping remaining SV1 downstreams");
+            if self.has_sv1_downstreams() {
+                info!("Draining SV1 downstreams for up to {}s", window.as_secs());
+                if tokio::time::timeout(window, self.cancellation_token.cancelled())
+                    .await
+                    .is_err()
+                {
+                    warn!("Drain window elapsed; dropping remaining SV1 downstreams");
+                }
             }
         }
         self.shutdown().await;
+    }
+
+    /// Whether any SV1 miner is connected, including miners held across an upstream fallback.
+    fn has_sv1_downstreams(&self) -> bool {
+        self.sv1_server
+            .get()
+            .is_some_and(|server| !server.downstreams.is_empty())
     }
 
     /// Whether a drain has been requested.
@@ -239,6 +254,21 @@ mod tests {
         TranslatorSv2::new(config)
     }
 
+    /// Registers a connected SV1 miner on `translator`, as `start` would have done.
+    fn connect_a_miner(translator: &TranslatorSv2) {
+        let (cm_sender, _cm_receiver) = async_channel::unbounded();
+        let (_sv1_sender, cm_receiver) = async_channel::unbounded();
+        let server = Sv1Server::new(
+            "127.0.0.1:3333".parse().unwrap(),
+            cm_receiver,
+            cm_sender,
+            translator.config.clone(),
+            TproxyMode::Aggregated,
+        );
+        server.insert_idle_downstream(1);
+        assert!(translator.sv1_server.set(Arc::new(server)).is_ok());
+    }
+
     /// `drain_seconds = 0` shuts down at once without starting a drain.
     #[tokio::test(start_paused = true)]
     async fn zero_drain_window_shuts_down_immediately() {
@@ -258,6 +288,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drain_is_cut_at_the_window() {
         let translator = translator(30);
+        connect_a_miner(&translator);
         let shutdown = tokio::spawn({
             let translator = translator.clone();
             async move { translator.drain_and_shutdown().await }
@@ -266,6 +297,44 @@ mod tests {
         assert!(translator.drain_token.is_cancelled());
         assert!(!translator.cancellation_token.is_cancelled());
         tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(translator.cancellation_token.is_cancelled());
+        shutdown.abort();
+    }
+
+    /// With no SV1 miner connected or held there is nothing to drain, whether the server has not
+    /// been created yet or has no downstreams.
+    #[tokio::test(start_paused = true)]
+    async fn drain_skips_the_wait_without_sv1_downstreams() {
+        let translator = translator(30);
+        let started = tokio::time::Instant::now();
+        let shutdown = tokio::spawn({
+            let translator = translator.clone();
+            async move { translator.drain_and_shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(translator.cancellation_token.is_cancelled());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        shutdown.abort();
+
+        let (cm_sender, _cm_receiver) = async_channel::unbounded();
+        let (_sv1_sender, cm_receiver) = async_channel::unbounded();
+        let translator = self::translator(30);
+        translator
+            .sv1_server
+            .set(Arc::new(Sv1Server::new(
+                "127.0.0.1:3333".parse().unwrap(),
+                cm_receiver,
+                cm_sender,
+                translator.config.clone(),
+                TproxyMode::Aggregated,
+            )))
+            .ok()
+            .unwrap();
+        let shutdown = tokio::spawn({
+            let translator = translator.clone();
+            async move { translator.drain_and_shutdown().await }
+        });
+        tokio::task::yield_now().await;
         assert!(translator.cancellation_token.is_cancelled());
         shutdown.abort();
     }
