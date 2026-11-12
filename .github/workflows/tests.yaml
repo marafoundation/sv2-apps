@@ -48,5 +48,7 @@ jobs:
         run: cargo test -p jd_client_sv2
       - name: Test translator
         run: cargo test -p translator_sv2
+      - name: Test translator with jemalloc
+        run: cargo test -p translator_sv2 --features jemalloc
       - name: Test bitcoin-core-sv2 crate
         run: cargo test -p bitcoin_core_sv2
