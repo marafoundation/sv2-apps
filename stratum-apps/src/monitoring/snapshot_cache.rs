@@ -55,7 +55,10 @@ use super::{
     client::{Sv2ClientInfo, Sv2ClientsMonitoring, Sv2ClientsSummary},
     prometheus_metrics::PrometheusMetrics,
     server::{ServerInfo, ServerMonitoring, ServerSummary},
-    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
+    sv1::{
+        Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareDropReason,
+        Sv1ShareRejection,
+    },
     upstream::{UpstreamInfo, UpstreamMonitoring},
 };
 
@@ -94,6 +97,9 @@ struct PreviousPrometheusLabelSets {
     /// Labels for client per-rejection GaugeVecs: [client_id, channel_id, user_identity,
     /// error_code]
     client_rejected_share_labels: HashSet<[String; 4]>,
+    /// Labels for the SV1 block-found GaugeVec: [sv1_username, worker, user_identity,
+    /// share_hash, height]
+    sv1_block_found_labels: HashSet<[String; 5]>,
 }
 
 /// Cached snapshot of monitoring data.
@@ -110,6 +116,8 @@ pub struct MonitoringSnapshot {
     pub sv1_clients: Option<Vec<Sv1ClientInfo>>,
     pub sv1_clients_summary: Option<Sv1ClientsSummary>,
     pub upstream_info: Option<UpstreamInfo>,
+    pub sv1_blocks_found: Option<Vec<Sv1BlockFound>>,
+    pub sv1_blocks_found_total: Option<u64>,
 }
 
 /// A cache that holds monitoring snapshots and refreshes them periodically.
@@ -164,6 +172,7 @@ impl Clone for SnapshotCache {
                 client_rejected_share_labels: previous_metrics_labels
                     .client_rejected_share_labels
                     .clone(),
+                sv1_block_found_labels: previous_metrics_labels.sv1_block_found_labels.clone(),
             }),
         }
     }
@@ -267,10 +276,17 @@ impl SnapshotCache {
             new_snapshot.sv2_clients_summary = Some(source.get_sv2_clients_summary());
         }
 
-        // Collect Sv1 clients data
+        // Collect Sv1 clients data, walking the clients once
         if let Some(ref source) = self.sv1_clients_source {
-            new_snapshot.sv1_clients = Some(source.get_sv1_clients());
-            new_snapshot.sv1_clients_summary = Some(source.get_sv1_clients_summary());
+            let clients = source.get_sv1_clients();
+            new_snapshot.sv1_clients_summary = Some(Sv1ClientsSummary::new(
+                &clients,
+                source.get_sv1_share_totals(),
+                source.get_sv1_share_drops(),
+            ));
+            new_snapshot.sv1_clients = Some(clients);
+            new_snapshot.sv1_blocks_found = Some(source.get_sv1_blocks_found());
+            new_snapshot.sv1_blocks_found_total = Some(source.get_sv1_blocks_found_total());
         }
 
         // Collect upstream data
@@ -296,6 +312,7 @@ impl SnapshotCache {
         let mut current_upstream_labels: HashSet<[String; 1]> = HashSet::new();
         let mut current_client_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_client_rejected_labels: HashSet<[String; 4]> = HashSet::new();
+        let mut current_sv1_block_found_labels: HashSet<[String; 5]> = HashSet::new();
 
         // Server metrics
         if let Some(ref summary) = snapshot.server_summary {
@@ -544,6 +561,45 @@ impl SnapshotCache {
             if let Some(ref m) = metrics.sv1_hashrate_total {
                 m.set(summary.total_hashrate as f64);
             }
+            if let Some(ref m) = metrics.sv1_shares_accepted_total {
+                m.set(summary.shares.accepted as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_rejected_total {
+                for rejection in Sv1ShareRejection::ALL {
+                    m.with_label_values(&[rejection.label()])
+                        .set(summary.shares.rejected(rejection) as f64);
+                }
+            }
+            if let Some(ref m) = metrics.sv1_shares_below_upstream_target_total {
+                m.set(summary.dropped.below_upstream_target as f64);
+            }
+            if let Some(ref m) = metrics.sv1_shares_dropped_total {
+                for reason in Sv1ShareDropReason::ALL {
+                    m.with_label_values(&[reason.label()])
+                        .set(summary.dropped.dropped(reason) as f64);
+                }
+            }
+        }
+        if let (Some(total), Some(m)) = (
+            snapshot.sv1_blocks_found_total,
+            &metrics.sv1_blocks_found_total,
+        ) {
+            m.set(total as f64);
+        }
+        if let (Some(blocks), Some(m)) = (&snapshot.sv1_blocks_found, &metrics.sv1_block_found_info)
+        {
+            for block in blocks {
+                let labels = [
+                    block.sv1_username.clone(),
+                    block.worker.clone(),
+                    block.user_identity.clone(),
+                    block.share_hash.clone(),
+                    block.height.map(|h| h.to_string()).unwrap_or_default(),
+                ];
+                m.with_label_values(&labels.each_ref().map(String::as_str))
+                    .set(block.found_at_unix_secs as f64);
+                current_sv1_block_found_labels.insert(labels);
+            }
         }
 
         // Upstream metrics
@@ -654,6 +710,20 @@ impl SnapshotCache {
         previous_metrics_labels.upstream_labels = current_upstream_labels;
         previous_metrics_labels.client_channel_labels = current_client_labels;
         previous_metrics_labels.client_rejected_share_labels = current_client_rejected_labels;
+
+        // Blocks that dropped out of the source's recent list.
+        for stale in previous_metrics_labels
+            .sv1_block_found_labels
+            .difference(&current_sv1_block_found_labels)
+        {
+            if let Some(ref m) = metrics.sv1_block_found_info {
+                let label_refs = stale.each_ref().map(String::as_str);
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale block-found label");
+                }
+            }
+        }
+        previous_metrics_labels.sv1_block_found_labels = current_sv1_block_found_labels;
     }
 
     /// Get the refresh interval
@@ -989,5 +1059,58 @@ mod tests {
         };
         cache.refresh();
         assert_eq!(series(&metrics), ["a:1=1"]);
+    }
+
+    fn block_found(n: u64) -> Sv1BlockFound {
+        Sv1BlockFound {
+            sv1_username: format!("acct.rig{n}"),
+            worker: format!("rig{n}"),
+            user_identity: format!("pool.rig{n}"),
+            share_hash: format!("hash-{n}"),
+            height: Some(900_000 + n as u32),
+            found_at_unix_secs: 1_700_000_000 + n,
+        }
+    }
+
+    fn block_found_series(metrics: &PrometheusMetrics) -> Vec<String> {
+        metrics
+            .registry
+            .gather()
+            .iter()
+            .filter(|family| family.get_name() == "sv1_block_found_info")
+            .flat_map(|family| family.get_metric())
+            .flat_map(|metric| metric.get_label())
+            .filter(|label| label.get_name() == "share_hash")
+            .map(|label| label.get_value().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn stale_block_found_series_are_removed() {
+        const KEPT: u64 = 32;
+        let metrics = PrometheusMetrics::new(false, false, true, false).unwrap();
+        let cache =
+            SnapshotCache::new(Duration::from_secs(5), None, None).with_metrics(metrics.clone());
+        let update = |blocks: Vec<Sv1BlockFound>| {
+            cache.update_metrics(
+                &metrics,
+                &MonitoringSnapshot {
+                    sv1_blocks_found: Some(blocks),
+                    ..Default::default()
+                },
+            );
+        };
+
+        // The source keeps the most recent 32 blocks, so the 33rd pushes out the first.
+        update((0..KEPT).map(block_found).collect());
+        assert_eq!(block_found_series(&metrics).len(), KEPT as usize);
+        update((1..=KEPT).map(block_found).collect());
+        let series = block_found_series(&metrics);
+        assert_eq!(series.len(), KEPT as usize, "{series:?}");
+        assert!(!series.contains(&"hash-0".to_string()), "{series:?}");
+        assert!(series.contains(&format!("hash-{KEPT}")), "{series:?}");
+
+        update(vec![]);
+        assert_eq!(block_found_series(&metrics), Vec::<String>::new());
     }
 }
