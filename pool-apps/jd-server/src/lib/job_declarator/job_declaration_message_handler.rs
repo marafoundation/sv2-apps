@@ -10,12 +10,17 @@ use crate::{
 use async_channel::Sender;
 use std::time::Instant;
 use stratum_apps::{
+    payout::{
+        AllowedPayoutModes, PayoutValidationError, decode_declared_coinbase_tx,
+        validate_pool_only_outputs,
+    },
     stratum_core::{
         bitcoin::{Amount, BlockHash, TxOut, consensus},
         handlers_sv2::HandleJobDeclarationMessagesFromClientOwnedAsync,
         job_declaration_sv2::{
             AllocateMiningJobTokenOwned, AllocateMiningJobTokenSuccessOwned,
             DeclareMiningJobErrorOwned, DeclareMiningJobOwned, DeclareMiningJobSuccessOwned,
+            ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_JOB,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_MINING_JOB_TOKEN,
             ERROR_CODE_DECLARE_MINING_JOB_MISSING_TXS,
@@ -186,11 +191,43 @@ impl HandleJobDeclarationMessagesFromClientOwnedAsync for JobDeclarator {
                 .await;
         }
 
-        // validate job
-        let result = self
-            .job_validator
-            .handle_declare_mining_job(client_id, msg.clone(), None)
-            .await;
+        // A declaration that misses transactions is stored and re-validated as this same `msg`
+        // (see handle_provide_missing_transactions_success), so checking here covers it.
+        let pool_only = match self.payout_modes {
+            AllowedPayoutModes::Any => Ok(()),
+            // JD clients always declare segwit coinbases (version | marker 0x00 | flag 0x01 | ..),
+            // so any other serialisation is refused without being decoded.
+            AllowedPayoutModes::PoolOnly
+                if msg.coinbase_tx_prefix.as_bytes().get(4..6) != Some(&[0x00, 0x01]) =>
+            {
+                Err(PayoutValidationError::DecodeCoinbaseTransaction(
+                    "coinbase is not a segwit serialisation".into(),
+                ))
+            }
+            AllowedPayoutModes::PoolOnly => decode_declared_coinbase_tx(
+                msg.coinbase_tx_prefix.as_bytes(),
+                msg.coinbase_tx_suffix.as_bytes(),
+            )
+            .and_then(|tx| {
+                validate_pool_only_outputs(&tx.output, &self.coinbase_reward_script.script_pubkey())
+            }),
+        };
+        let result = match pool_only {
+            Ok(()) => {
+                // validate job
+                self.job_validator
+                    .handle_declare_mining_job(client_id, msg.clone(), None)
+                    .await
+            }
+            Err(e) => {
+                warn!(
+                    client_id,
+                    request_id = msg.request_id,
+                    "Refusing DeclareMiningJob: {e}"
+                );
+                DeclareMiningJobResult::Error(ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX)
+            }
+        };
         // Read once, so what this answer is tagged with and what the waiting declarations are
         // compared against below are the same tip.
         let latest_prev_hash = self.job_validator.latest_prev_hash();
