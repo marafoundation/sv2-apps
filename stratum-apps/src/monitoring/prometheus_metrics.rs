@@ -2,6 +2,8 @@
 
 use prometheus::{Gauge, GaugeVec, Opts, Registry};
 
+use super::sv1::{Sv1ShareDropReason, Sv1ShareRejection};
+
 /// Prometheus metrics for the monitoring server.
 /// Metrics are optional - only registered when the corresponding monitoring type is enabled.
 #[derive(Clone)]
@@ -36,6 +38,13 @@ pub struct PrometheusMetrics {
     // Upstream metrics
     pub sv2_upstream_connected: Option<GaugeVec>,
     pub sv2_upstream_fallbacks_total: Option<Gauge>,
+    pub sv1_shares_accepted_total: Option<Gauge>,
+    pub sv1_shares_rejected_total: Option<GaugeVec>,
+    pub sv1_shares_below_upstream_target_total: Option<Gauge>,
+    pub sv1_shares_dropped_total: Option<GaugeVec>,
+    /// One series per recent block-finding share, valued at the Unix time it was submitted.
+    pub sv1_block_found_info: Option<GaugeVec>,
+    pub sv1_blocks_found_total: Option<Gauge>,
 }
 
 impl PrometheusMetrics {
@@ -228,16 +237,96 @@ impl PrometheusMetrics {
         };
 
         // SV1 metrics
-        let (sv1_clients_total, sv1_hashrate_total) = if enable_sv1_metrics {
+        let (
+            sv1_clients_total,
+            sv1_hashrate_total,
+            sv1_shares_accepted_total,
+            sv1_shares_rejected_total,
+            sv1_shares_below_upstream_target_total,
+            sv1_shares_dropped_total,
+            sv1_block_found_info,
+            sv1_blocks_found_total,
+        ) = if enable_sv1_metrics {
             let clients = Gauge::new("sv1_clients_total", "Total number of SV1 clients")?;
             registry.register(Box::new(clients.clone()))?;
 
             let hashrate = Gauge::new("sv1_hashrate_total", "Total hashrate from SV1 clients")?;
             registry.register(Box::new(hashrate.clone()))?;
 
-            (Some(clients), Some(hashrate))
+            let accepted = Gauge::new(
+                "sv1_shares_accepted_total",
+                "SV1 shares accepted by the SV1 server since the process started",
+            )?;
+            registry.register(Box::new(accepted.clone()))?;
+
+            let rejected = GaugeVec::new(
+                Opts::new(
+                    "sv1_shares_rejected_total",
+                    "SV1 shares rejected by the SV1 server since the process started, by reason",
+                ),
+                &["reason"],
+            )?;
+            registry.register(Box::new(rejected.clone()))?;
+            // Every reason is exported from the start, so a rate over it never starts mid-way.
+            for rejection in Sv1ShareRejection::ALL {
+                rejected.with_label_values(&[rejection.label()]).set(0.0);
+            }
+
+            let block_found = GaugeVec::new(
+                Opts::new(
+                    "sv1_block_found_info",
+                    "Recent SV1 shares that met the network target (block candidates, before the \
+                     pool confirms them), valued at the Unix time they were submitted",
+                ),
+                &[
+                    "sv1_username",
+                    "worker",
+                    "user_identity",
+                    "share_hash",
+                    "height",
+                ],
+            )?;
+            registry.register(Box::new(block_found.clone()))?;
+
+            let blocks_found = Gauge::new(
+                "sv1_blocks_found_total",
+                "SV1 shares that met the network target since the process started (block \
+                 candidates, before the pool confirms them)",
+            )?;
+            registry.register(Box::new(blocks_found.clone()))?;
+
+            let below_target = Gauge::new(
+                "sv1_shares_below_upstream_target_total",
+                "Accepted SV1 shares not sent upstream because they do not meet the upstream \
+                 channel's target, since the process started",
+            )?;
+            registry.register(Box::new(below_target.clone()))?;
+
+            let dropped = GaugeVec::new(
+                Opts::new(
+                    "sv1_shares_dropped_total",
+                    "Accepted SV1 shares not sent upstream for any other reason, since the process \
+                     started, by reason",
+                ),
+                &["reason"],
+            )?;
+            registry.register(Box::new(dropped.clone()))?;
+            for reason in Sv1ShareDropReason::ALL {
+                dropped.with_label_values(&[reason.label()]).set(0.0);
+            }
+
+            (
+                Some(clients),
+                Some(hashrate),
+                Some(accepted),
+                Some(rejected),
+                Some(below_target),
+                Some(dropped),
+                Some(block_found),
+                Some(blocks_found),
+            )
         } else {
-            (None, None)
+            (None, None, None, None, None, None, None, None)
         };
 
         // Upstream metrics
@@ -287,6 +376,12 @@ impl PrometheusMetrics {
             sv1_hashrate_total,
             sv2_upstream_connected,
             sv2_upstream_fallbacks_total,
+            sv1_shares_accepted_total,
+            sv1_shares_rejected_total,
+            sv1_shares_below_upstream_target_total,
+            sv1_shares_dropped_total,
+            sv1_block_found_info,
+            sv1_blocks_found_total,
         })
     }
 }

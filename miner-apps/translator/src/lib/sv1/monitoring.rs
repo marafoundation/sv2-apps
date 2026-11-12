@@ -53,6 +53,7 @@ fn downstream_to_sv1_client_info(
                 .version_rolling_min_bit
                 .as_ref()
                 .map(|bit| format!("{:08x}", bit.0)),
+            shares: Default::default(),
         })
         .ok()
 }
