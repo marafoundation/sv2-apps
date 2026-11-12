@@ -82,6 +82,10 @@ translator = ["network", "fallback-coordinator", "config", "sv1", "with_buffer_p
 # Note: mining_device intentionally excludes 'core' and 'network' - it uses crates.io crates directly
 mining_device = ["config"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# glibc heap statistics (`mallinfo2`), `malloc_trim` and the page size, for monitoring.
+libc = "0.2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

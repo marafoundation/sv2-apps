@@ -10,6 +10,10 @@ pub struct PrometheusMetrics {
     // System metrics
     pub sv2_uptime_seconds: Gauge,
     pub sv2_monitoring_snapshot_age_seconds: Gauge,
+    /// Allocator heap usage; present only where the allocator reports it (glibc).
+    pub sv2_heap_in_use_bytes: Option<Gauge>,
+    pub sv2_heap_free_bytes: Option<Gauge>,
+    pub sv2_heap_mapped_bytes: Option<Gauge>,
     // Server metrics (upstream connection)
     pub sv2_server_channels: Option<GaugeVec>,
     pub sv2_server_hashrate_total: Option<Gauge>,
@@ -52,6 +56,27 @@ impl PrometheusMetrics {
             "Seconds since the monitoring snapshot was last refreshed",
         )?;
         registry.register(Box::new(sv2_monitoring_snapshot_age_seconds.clone()))?;
+        let (sv2_heap_in_use_bytes, sv2_heap_free_bytes, sv2_heap_mapped_bytes) =
+            if super::heap::heap_stats().is_some() {
+                let in_use = Gauge::new(
+                    "sv2_heap_in_use_bytes",
+                    "Heap bytes allocated and not yet freed",
+                )?;
+                registry.register(Box::new(in_use.clone()))?;
+                let free = Gauge::new(
+                    "sv2_heap_free_bytes",
+                    "Heap bytes freed but still held by the allocator",
+                )?;
+                registry.register(Box::new(free.clone()))?;
+                let mapped = Gauge::new(
+                    "sv2_heap_mapped_bytes",
+                    "Heap bytes obtained from the OS, in use or free",
+                )?;
+                registry.register(Box::new(mapped.clone()))?;
+                (Some(in_use), Some(free), Some(mapped))
+            } else {
+                (None, None, None)
+            };
 
         // Server metrics (upstream connection)
         let (
@@ -241,6 +266,9 @@ impl PrometheusMetrics {
             registry,
             sv2_uptime_seconds,
             sv2_monitoring_snapshot_age_seconds,
+            sv2_heap_in_use_bytes,
+            sv2_heap_free_bytes,
+            sv2_heap_mapped_bytes,
             sv2_server_channels,
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
@@ -339,10 +367,16 @@ mod tests {
         let families = m.registry.gather();
         // Only the system metrics should be registered (with default value 0)
         let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
-        assert_eq!(
-            names,
-            ["sv2_monitoring_snapshot_age_seconds", "sv2_uptime_seconds"]
-        );
+        let mut expected = vec!["sv2_monitoring_snapshot_age_seconds", "sv2_uptime_seconds"];
+        if super::super::heap::heap_stats().is_some() {
+            expected.extend([
+                "sv2_heap_free_bytes",
+                "sv2_heap_in_use_bytes",
+                "sv2_heap_mapped_bytes",
+            ]);
+        }
+        expected.sort_unstable();
+        assert_eq!(names, expected);
     }
 
     #[test]

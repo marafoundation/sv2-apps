@@ -11,6 +11,7 @@
 //! - **Upstream**: Connection state of the configured upstream endpoints (opt-in)
 
 pub mod client;
+pub mod heap;
 pub mod http_server;
 #[cfg(feature = "asic-rs-telemetry")]
 pub mod miner_telemetry;
