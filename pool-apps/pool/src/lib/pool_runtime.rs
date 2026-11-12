@@ -296,7 +296,7 @@ impl PoolRuntime<IoReady> {
             )
             .await
             {
-                Ok(jd) => jd,
+                Ok(jd) => jd.with_payout_modes(self.pool.config.payout_modes()),
                 Err(err) => return Err((PoolErrorKind::Jds(err), self)),
             };
 
@@ -539,7 +539,8 @@ impl PoolRuntime<ChannelManagerReady> {
 
             let monitoring_server = match stratum_apps::monitoring::MonitoringServer::new(
                 monitoring_addr,
-                None, // Pool doesn't have channels opened with servers
+                // No upstream channels; reports the coinbase outputs the pool builds jobs from
+                Some(Arc::new(self.state.channel_manager.clone())),
                 Some(Arc::new(self.state.channel_manager.clone())), // channels opened with clients
                 std::time::Duration::from_secs(
                     self.pool

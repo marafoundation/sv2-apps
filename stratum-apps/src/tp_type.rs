@@ -78,6 +78,7 @@ pub fn resolve_ipc_socket_path(
 /// Which type of Template Provider will be used,
 /// along with the relevant config parameters for each.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TemplateProviderType {
     Sv2Tp {
         address: String,
@@ -96,6 +97,25 @@ pub enum TemplateProviderType {
         fee_threshold: u64,
         min_interval: u8,
     },
+}
+
+#[cfg(feature = "core")]
+impl TemplateProviderType {
+    /// The chain the template provider is on, if its config names it (`Sv2Tp` does not).
+    pub fn network(&self) -> Option<stratum_core::bitcoin::Network> {
+        #[cfg(feature = "bitcoin-core-sv2")]
+        use stratum_core::bitcoin::Network;
+        match self {
+            Self::Sv2Tp { .. } => None,
+            #[cfg(feature = "bitcoin-core-sv2")]
+            Self::BitcoinCoreIpc { network, .. } => Some(match network {
+                BitcoinNetwork::Mainnet => Network::Bitcoin,
+                BitcoinNetwork::Testnet4 => Network::Testnet4,
+                BitcoinNetwork::Signet => Network::Signet,
+                BitcoinNetwork::Regtest => Network::Regtest,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

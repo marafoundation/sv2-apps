@@ -28,6 +28,7 @@ use stratum_apps::{
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
+    payout::AllowedPayoutModes,
     stratum_core::{
         handlers_sv2::HandleJobDeclarationMessagesFromClientOwnedAsync,
         mining_sv2::{
@@ -116,6 +117,8 @@ pub struct JobDeclarator {
     job_validator: Arc<dyn JobValidationEngine>,
     job_declarator_io: Arc<JobDeclaratorIo>,
     coinbase_reward_script: CoinbaseRewardScript,
+    /// Under `PoolOnly`, declared coinbases must pay only `coinbase_reward_script`.
+    payout_modes: AllowedPayoutModes,
     downstream_clients: SharedMap<DownstreamId, Downstream>,
     downstream_id_factory: Arc<AtomicUsize>,
     // When the downstream received the JDP message being handled. Messages wait in the fan-in
@@ -149,6 +152,7 @@ impl JobDeclarator {
             job_validator: engine,
             job_declarator_io,
             coinbase_reward_script,
+            payout_modes: AllowedPayoutModes::Any,
             downstream_clients: SharedMap::new(),
             downstream_id_factory: Arc::new(AtomicUsize::new(0)),
             message_received_at: Instant::now(),
@@ -158,6 +162,14 @@ impl JobDeclarator {
 
 /// Generic implementation for all [`JobValidationEngine`] types.
 impl JobDeclarator {
+    /// Under [`AllowedPayoutModes::PoolOnly`], a `DeclareMiningJob` whose coinbase fails
+    /// [`stratum_apps::payout::validate_pool_only_outputs`] for `coinbase_reward_script` is
+    /// refused with `invalid-coinbase-tx`, before it reaches the validation backend.
+    pub fn with_payout_modes(mut self, payout_modes: AllowedPayoutModes) -> Self {
+        self.payout_modes = payout_modes;
+        self
+    }
+
     fn handle_error_action(
         &self,
         context: &str,

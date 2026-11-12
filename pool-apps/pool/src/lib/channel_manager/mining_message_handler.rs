@@ -174,14 +174,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     ));
                 };
 
-                let payout_mode = match PayoutMode::try_from(user_identity.as_str()) {
+                let payout_mode = match PayoutMode::try_from(user_identity.as_str())
+                    .and_then(|mode| self.payout_modes.check(mode))
+                {
                     Ok(mode) => mode,
                     Err(PayoutModeError::NoPayoutMode(_)) => PayoutMode::FullDonation,
-                    Err(_) => {
-                        error!(
-                            "Invalid user_identity '{}': does not match any supported identity format",
-                            user_identity
-                        );
+                    Err(e) => {
+                        error!("Invalid user_identity '{}': {}", user_identity, e);
                         let open_standard_mining_channel_error = OpenMiningChannelErrorOwned {
                             request_id,
                             error_code: ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY
@@ -438,14 +437,13 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                         .into()]);
                 }
 
-                let payout_mode = match PayoutMode::try_from(user_identity.as_str()) {
+                let payout_mode = match PayoutMode::try_from(user_identity.as_str())
+                    .and_then(|mode| self.payout_modes.check(mode))
+                {
                     Ok(mode) => mode,
                     Err(PayoutModeError::NoPayoutMode(_)) => PayoutMode::FullDonation,
-                    Err(_) => {
-                        error!(
-                            "Invalid user_identity '{}': does not match any supported identity format",
-                            user_identity
-                        );
+                    Err(e) => {
+                        error!("Invalid user_identity '{}': {}", user_identity, e);
                         let open_extended_mining_channel_error = OpenMiningChannelErrorOwned {
                             request_id,
                             error_code: ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY
@@ -793,7 +791,14 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                                         template_id,
                                         coinbase,
                                     )) => {
-                                        info!("SubmitSharesStandard: 💰 Block Found!!! 💰{share_hash}");
+                                        // Attribution fields: see the extended-share handler below.
+                                        info!(
+                                            downstream_id,
+                                            channel_id,
+                                            user_identity = ?standard_channel.get_user_identity(),
+                                            template_id = ?template_id,
+                                            "SubmitSharesStandard: 💰 Block Found!!! 💰{share_hash}"
+                                        );
                                         // if we have a template id (i.e.: this was not a custom job)
                                         // we can propagate the solution to the TP
                                         if let Some(template_id) = template_id {
@@ -1022,10 +1027,6 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     )
                         .into()]
                 } else {
-                    if let Some(_user_identity) = user_identity {
-                        // here we have the UserIdentity TLV, so we can use it to enhance monitoring of
-                        // individual miners in the future
-                    }
                     let validation =
                         downstream
                             .extended_channels
@@ -1064,7 +1065,17 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                                         template_id,
                                         coinbase,
                                     )) => {
-                                        info!("SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}");
+                                        // Attribution fields for the long-term block-found archive
+                                        // (pool-v4-infra ADR-015). The hash stays first in the message so
+                                        // existing `Block Found` greps keep matching.
+                                        info!(
+                                            downstream_id,
+                                            channel_id,
+                                            user_identity = ?extended_channel.get_user_identity(),
+                                            share_user_identity = ?user_identity.as_ref().map(|u| u.as_string_or_hex()).unwrap_or_default(),
+                                            template_id = ?template_id,
+                                            "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
+                                        );
                                         if let Some(template_id) = template_id {
                                             info!("SubmitSharesExtended: Propagating solution to the Template Provider.");
                                             let solution = SubmitSolutionOwned {
