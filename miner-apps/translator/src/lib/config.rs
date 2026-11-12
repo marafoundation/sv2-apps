@@ -160,8 +160,10 @@ pub struct TranslatorConfig {
     pub hold_keepalive_notify_secs: u64,
     /// Whether SIGUSR1 makes the translator return the allocator's free heap memory to the OS
     /// and log heap usage before and after. If memory drops, it was held free by the allocator;
-    /// if not, it is in use. Only glibc builds can release memory this way. When off, SIGUSR1
-    /// keeps its default action, which terminates the process.
+    /// if not, it is in use. Only glibc builds can release memory this way: under a `jemalloc`
+    /// build it does nothing beyond logging that the allocator cannot report or release, and the
+    /// `sv2_heap_*` gauges are absent. When off, SIGUSR1 keeps its default action, which
+    /// terminates the process.
     #[serde(default)]
     pub release_heap_on_sigusr1: bool,
 }
