@@ -16,6 +16,59 @@ async fn main() {
     inner_main().await;
 }
 
+/// On every SIGUSR1, returns the allocator's free heap memory to the OS and logs heap usage
+/// before and after. The handler is installed before this returns.
+#[cfg(all(unix, feature = "monitoring"))]
+fn release_heap_on_sigusr1() {
+    use stratum_apps::monitoring::heap;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut signals = match signal(SignalKind::user_defined1()) {
+        Ok(signals) => signals,
+        Err(e) => {
+            tracing::error!("Failed to install SIGUSR1 handler: {e}");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        while signals.recv().await.is_some() {
+            // Holds the allocator's locks for as long as it runs.
+            let report = tokio::task::spawn_blocking(|| {
+                let before = (heap::heap_stats(), heap::resident_bytes());
+                let released = heap::release_free_heap();
+                (
+                    before,
+                    released,
+                    (heap::heap_stats(), heap::resident_bytes()),
+                )
+            })
+            .await;
+            match report {
+                // Resident memory is logged too: the release can lower it without changing the
+                // heap figures, which only move when the heap itself shrinks.
+                Ok(((Some(before), rss_before), released, (Some(after), rss_after))) => {
+                    tracing::info!(
+                        released,
+                        resident_before = rss_before,
+                        resident_after = rss_after,
+                        in_use_before = before.in_use,
+                        in_use_after = after.in_use,
+                        free_before = before.free,
+                        free_after = after.free,
+                        mapped_before = before.mapped,
+                        mapped_after = after.mapped,
+                        "SIGUSR1: returned free heap memory to the OS"
+                    )
+                }
+                Ok(_) => tracing::warn!(
+                    "SIGUSR1: this build's allocator cannot report or release heap memory"
+                ),
+                Err(e) => tracing::error!("SIGUSR1: heap release failed: {e}"),
+            }
+        }
+    });
+}
+
 /// Entrypoint for the Translator binary.
 ///
 /// Loads the configuration from TOML and initializes the main runtime
@@ -28,6 +81,13 @@ async fn inner_main() {
     });
 
     init_logging(proxy_config.log_dir());
+
+    if proxy_config.release_heap_on_sigusr1 {
+        #[cfg(all(unix, feature = "monitoring"))]
+        release_heap_on_sigusr1();
+        #[cfg(not(all(unix, feature = "monitoring")))]
+        tracing::warn!("release_heap_on_sigusr1 needs a Unix build with the monitoring feature");
+    }
 
     let translator = TranslatorSv2::new(proxy_config);
     let mut shutdown_listener = ShutdownListener::new().unwrap_or_else(|e| {
