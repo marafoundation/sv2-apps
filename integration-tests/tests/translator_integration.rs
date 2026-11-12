@@ -3639,3 +3639,532 @@ async fn drain_sv1_downstreams_gradually(send_reconnect: bool) {
         "shutdown should follow the last disconnect"
     );
 }
+
+// The hold tests stop a pool while frames from it may still be queued in the translator. The
+// reader task that owned that connection then drops its buffer pool, whose `Drop` spins until
+// every frame is released, so the tests run on a multi-threaded runtime like the translator
+// binary does; on a current-thread runtime the spin would starve the task holding the frames.
+
+/// A translator that holds miners for `hold_secs` after losing its upstream.
+async fn start_holding_translator(
+    upstreams: &[std::net::SocketAddr],
+    aggregate_channels: bool,
+    hold_secs: u64,
+    hold_keepalive_notify_secs: u64,
+) -> HoldingTranslator {
+    start_holding_translator_with_hashrate(
+        upstreams,
+        aggregate_channels,
+        hold_secs,
+        hold_keepalive_notify_secs,
+        1_000_000.0,
+    )
+    .await
+}
+
+/// Like [`start_holding_translator`], with the hashrate miners are assumed to have until
+/// vardiff learns theirs. The pools hand out targets that follow it.
+async fn start_holding_translator_with_hashrate(
+    upstreams: &[std::net::SocketAddr],
+    aggregate_channels: bool,
+    hold_secs: u64,
+    hold_keepalive_notify_secs: u64,
+    min_individual_miner_hashrate: f32,
+) -> HoldingTranslator {
+    use translator_sv2::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let monitoring_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        upstreams
+            .iter()
+            .map(|addr| {
+                Upstream::new(
+                    addr.ip().to_string(),
+                    addr.port(),
+                    authority_pubkey,
+                    "user_identity".to_string(),
+                )
+            })
+            .collect(),
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(min_individual_miner_hashrate, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        aggregate_channels,
+        vec![],
+        vec![],
+        Some(monitoring_addr),
+        Some(1),
+    );
+    config.upstream_loss_hold_secs = hold_secs;
+    config.hold_keepalive_notify_secs = hold_keepalive_notify_secs;
+    let translator = translator_sv2::TranslatorSv2::new(config);
+    let run = tokio::spawn({
+        let translator = translator.clone();
+        async move { translator.start().await }
+    });
+    HoldingTranslator {
+        translator,
+        listen_addr,
+        monitoring_addr,
+        run,
+    }
+}
+
+struct HoldingTranslator {
+    translator: translator_sv2::TranslatorSv2,
+    listen_addr: std::net::SocketAddr,
+    monitoring_addr: std::net::SocketAddr,
+    run: tokio::task::JoinHandle<Result<(), translator_sv2::error::TproxyErrorKind>>,
+}
+
+/// The miner's connection survives the loss of its pool: it is moved onto the next pool in
+/// place, with `mining.set_extranonce` because the new pool hands out another prefix, and gets a
+/// clean job from it.
+async fn held_miner_is_reattached_to_the_next_pool(aggregate_channels: bool) {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_a, pool_a_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 1).await;
+    let (pool_b, pool_b_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 2).await;
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        ..
+    } = start_holding_translator(&[pool_a_addr, pool_b_addr], aggregate_channels, 60, 30).await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            extranonce_subscribe: true,
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let local_addr = miner.local_addr();
+    let (first_extranonce, _) = miner.extranonce();
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool_a.shutdown().await;
+
+    miner
+        .wait_for_method("mining.set_extranonce", Duration::from_secs(60))
+        .await;
+    let clean_job = miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+    assert_eq!(clean_job[8], serde_json::json!(true), "{clean_job}");
+    assert_ne!(miner.extranonce().0, first_extranonce);
+    assert!(!miner.is_closed());
+    assert_eq!(
+        miner.local_addr(),
+        local_addr,
+        "the same connection was kept"
+    );
+
+    shutdown_all!(translator, pool_b);
+}
+
+/// A miner held across the loss of its pool is credited by the next pool: a share it mines after
+/// the re-attach, with the extranonce `mining.set_extranonce` gave it, is accepted by pool B.
+///
+/// The miner is a raw-TCP one that mines its own shares: cpuminer, the device the other tests use,
+/// does not support `mining.set_extranonce`, and a pool with another prefix makes it reconnect,
+/// which is a new miner and no proof of a re-attach.
+async fn held_miner_is_credited_by_the_next_pool(aggregate_channels: bool) {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+    use stratum_apps::stratum_core::bitcoin::Target;
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_a, pool_a_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 1).await;
+    let (pool_b, pool_b_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 2).await;
+    let (pool_b_sniffer, pool_b_sniffer_addr) =
+        start_sniffer("B", pool_b_addr, false, vec![], None);
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        ..
+    } = start_holding_translator_with_hashrate(
+        &[pool_a_addr, pool_b_sniffer_addr],
+        aggregate_channels,
+        60,
+        30,
+        1_000.0,
+    )
+    .await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            extranonce_subscribe: true,
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let local_addr = miner.local_addr();
+    let (first_extranonce, _) = miner.extranonce();
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool_a.shutdown().await;
+
+    miner
+        .wait_for_method("mining.set_extranonce", Duration::from_secs(60))
+        .await;
+    let clean_job = miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+    assert_eq!(clean_job[8], serde_json::json!(true), "{clean_job}");
+    assert_ne!(miner.extranonce().0, first_extranonce);
+    assert_eq!(
+        miner.local_addr(),
+        local_addr,
+        "the same connection was kept"
+    );
+
+    pool_b_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+    let channel_target = loop {
+        if let Some((
+            _,
+            AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+                success,
+            )),
+        )) = pool_b_sniffer.next_message_from_upstream()
+        {
+            break Target::from_le_bytes(success.target.to_array());
+        }
+    };
+
+    let job_id = clean_job[0].as_str().unwrap();
+    let response = miner
+        .submit_mined_share(job_id, channel_target, Duration::from_secs(60))
+        .await;
+    assert_eq!(response["result"], serde_json::json!(true), "{response}");
+
+    pool_b_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+        )
+        .await;
+    pool_b_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+        )
+        .await;
+    assert!(!miner.is_closed());
+
+    shutdown_all!(translator, pool_b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_credited_by_the_next_pool_non_aggregated() {
+    held_miner_is_credited_by_the_next_pool(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_credited_by_the_next_pool_aggregated() {
+    held_miner_is_credited_by_the_next_pool(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_reattached_to_the_next_pool_non_aggregated() {
+    held_miner_is_reattached_to_the_next_pool(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_reattached_to_the_next_pool_aggregated() {
+    held_miner_is_reattached_to_the_next_pool(true).await;
+}
+
+/// A held miner that never announced `mining.extranonce.subscribe` cannot be given the new
+/// pool's prefix, so it is asked to reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_without_extranonce_support_is_asked_to_reconnect() {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_a, pool_a_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 1).await;
+    let (pool_b, pool_b_addr, _) =
+        start_pool_with_server_id(sv2_tp_config(tp_addr), vec![], vec![], false, 2).await;
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        ..
+    } = start_holding_translator(&[pool_a_addr, pool_b_addr], false, 60, 30).await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool_a.shutdown().await;
+
+    miner
+        .wait_for_method("client.reconnect", Duration::from_secs(60))
+        .await;
+    assert!(miner.wait_closed(Duration::from_secs(10)).await);
+
+    shutdown_all!(translator, pool_b);
+}
+
+/// With no upstream to go to, a held miner keeps receiving keep-alive jobs, has its shares
+/// rejected as stale, and is asked to reconnect when the hold window ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miner_is_released_when_no_upstream_returns() {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        monitoring_addr,
+        run,
+    } = start_holding_translator(&[pool_addr], false, 8, 1).await;
+
+    let miner = Sv1MockMiner::connect(
+        tproxy_addr,
+        Sv1MockMinerOptions {
+            extranonce_subscribe: true,
+            configure_version_rolling: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    pool.shutdown().await;
+
+    let keepalive = miner
+        .wait_for_method("mining.notify", Duration::from_secs(10))
+        .await;
+    let keepalive_job_id = keepalive[0].as_str().unwrap().to_string();
+    assert!(keepalive_job_id.contains('#'), "{keepalive}");
+    let response = miner
+        .submit(&keepalive_job_id, Duration::from_secs(10))
+        .await;
+    assert_eq!(response["error"][0], serde_json::json!(21), "{response}");
+    assert!(!miner.is_closed());
+    assert_eq!(
+        health_status(monitoring_addr).await,
+        Some(200),
+        "a translator holding its miners stays in the load balancer"
+    );
+
+    miner
+        .wait_for_method("client.reconnect", Duration::from_secs(30))
+        .await;
+    assert!(miner.wait_closed(Duration::from_secs(10)).await);
+    let result = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the translator exits once the hold window ends")
+        .unwrap();
+    assert!(result.is_err(), "{result:?}");
+    translator.shutdown().await;
+}
+
+/// A mock pool opens the channel the translator asks it for, and serves it one job, with
+/// `extranonce_prefix` as the channel's prefix.
+async fn mock_pool_serves_channel(
+    pool: &async_channel::Sender<AnyMessageOwned>,
+    sniffer: &Sniffer<'_>,
+    extranonce_prefix: Vec<u8>,
+) {
+    let coinbase_tx_prefix = hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap();
+    let pool_script_pubkey =
+        CoinbaseRewardScript::from_descriptor(&format!("addr({POOL_COINBASE_REWARD_ADDRESS})"))
+            .unwrap()
+            .script_pubkey();
+    let mut coinbase_tx_suffix = hex::decode("feffffff").unwrap();
+    coinbase_tx_suffix.extend(serialize(&vec![TxOut {
+        value: Amount::from_sat(5_000_000_000),
+        script_pubkey: pool_script_pubkey,
+    }]));
+    coinbase_tx_suffix.extend([0, 0, 0, 0]);
+
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+    let open: OpenExtendedMiningChannelOwned = loop {
+        if let Some((
+            _,
+            AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+        )) = sniffer.next_message_from_downstream()
+        {
+            break msg;
+        }
+    };
+    pool.send(AnyMessageOwned::Mining(
+        parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+            OpenExtendedMiningChannelSuccessOwned {
+                request_id: open.request_id,
+                channel_id: 1,
+                target: open.max_target.clone(),
+                extranonce_size: 4,
+                extranonce_prefix: extranonce_prefix.try_into().unwrap(),
+                group_channel_id: 100,
+            },
+        ),
+    ))
+    .await
+    .unwrap();
+    pool.send(AnyMessageOwned::Mining(
+        parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
+            channel_id: 1,
+            job_id: 1,
+            ntime_start: Sv2OptionOwned::new(None),
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
+            coinbase_tx_prefix: coinbase_tx_prefix.try_into().unwrap(),
+            coinbase_tx_suffix: coinbase_tx_suffix.try_into().unwrap(),
+        }),
+    ))
+    .await
+    .unwrap();
+    pool.send(AnyMessageOwned::Mining(
+        parsers_sv2::MiningOwned::SetNewPrevHash(SetNewPrevHashOwned {
+            channel_id: 1,
+            job_id: 1,
+            prev_hash: hex::decode(
+                "3ab7089cd2cd30f133552cfde82c4cb239cd3c2310306f9d825e088a1772cc39",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            ntime_start: 1766782170,
+            nbits: 0x207fffff,
+        }),
+    ))
+    .await
+    .unwrap();
+}
+
+/// A reconnect requested by the upstream ends its generation like a fallback does: the miner is
+/// held, and moved in place onto the requested endpoint, which hands out another prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_miners_follow_a_reconnect_requested_by_the_upstream() {
+    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
+
+    start_tracing();
+    let current_upstream_addr = get_available_address();
+    let current_pool = MockUpstream::new(
+        current_upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let requested_upstream_addr = get_available_address();
+    let requested_pool = MockUpstream::new(
+        requested_upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let (current_sniffer, current_sniffer_addr) = start_sniffer(
+        "held-reconnect-current",
+        current_upstream_addr,
+        false,
+        vec![],
+        None,
+    );
+    let (requested_sniffer, requested_sniffer_addr) = start_sniffer(
+        "held-reconnect-requested",
+        requested_upstream_addr,
+        false,
+        vec![],
+        None,
+    );
+    let HoldingTranslator {
+        translator,
+        listen_addr: tproxy_addr,
+        ..
+    } = start_holding_translator(&[current_sniffer_addr], false, 60, 30).await;
+
+    // The miner's subscribe is answered once the pool has opened its channel.
+    let (miner, ()) = tokio::join!(
+        Sv1MockMiner::connect(
+            tproxy_addr,
+            Sv1MockMinerOptions {
+                extranonce_subscribe: true,
+                configure_version_rolling: true,
+                ..Default::default()
+            },
+        ),
+        mock_pool_serves_channel(&current_pool, &current_sniffer, vec![0, 1, 0, 0]),
+    );
+    let local_addr = miner.local_addr();
+    miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+    let (first_extranonce, _) = miner.extranonce();
+
+    current_pool
+        .send(AnyMessageOwned::Common(CommonMessagesOwned::Reconnect(
+            ReconnectOwned {
+                new_host: requested_sniffer_addr.ip().to_string().try_into().unwrap(),
+                new_port: requested_sniffer_addr.port(),
+            },
+        )))
+        .await
+        .unwrap();
+
+    mock_pool_serves_channel(&requested_pool, &requested_sniffer, vec![0, 2, 0, 0]).await;
+    miner
+        .wait_for_method("mining.set_extranonce", Duration::from_secs(60))
+        .await;
+    let clean_job = miner
+        .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+    assert_eq!(clean_job[8], serde_json::json!(true), "{clean_job}");
+    assert_ne!(miner.extranonce().0, first_extranonce);
+    assert!(!miner.is_closed());
+    assert_eq!(
+        miner.local_addr(),
+        local_addr,
+        "the same connection was kept"
+    );
+
+    shutdown_all!(translator);
+}

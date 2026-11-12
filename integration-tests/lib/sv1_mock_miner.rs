@@ -15,6 +15,15 @@ use std::{
     },
     time::Duration,
 };
+use stratum_apps::stratum_core::{
+    bitcoin::Target,
+    sv1_api::{
+        client_to_server::Submit,
+        json_rpc,
+        server_to_client::Notify as Sv1Notify,
+        utils::{Extranonce, HexU32Be},
+    },
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpStream, tcp::OwnedWriteHalf},
@@ -29,6 +38,9 @@ const AUTHORIZE_ID: u64 = 4;
 const FIRST_SUBMIT_ID: u64 = 5;
 
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The version-rolling mask the miner asks for in `mining.configure`.
+const VERSION_ROLLING_MASK: u32 = 0x1fff_e000;
 
 /// Index of `ntime` in the params of a `mining.notify`.
 const NOTIFY_NTIME_INDEX: usize = 7;
@@ -61,6 +73,8 @@ struct State {
     extranonce2_size: usize,
     /// `ntime` of the latest `mining.notify` seen for each job id.
     job_ntime: HashMap<String, String>,
+    /// The latest `mining.notify` seen for each job id.
+    job_notify: HashMap<String, Value>,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +138,7 @@ impl Shared {
                     state
                         .job_ntime
                         .insert(job_id.to_string(), ntime.to_string());
+                    state.job_notify.insert(job_id.to_string(), message.clone());
                 }
             }
             _ => {}
@@ -147,6 +162,7 @@ pub struct Sv1MockMiner {
     shared: Arc<Shared>,
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
     next_submit_id: AtomicU64,
+    version_rolling: bool,
 }
 
 impl Sv1MockMiner {
@@ -193,6 +209,7 @@ impl Sv1MockMiner {
             shared,
             writer: tokio::sync::Mutex::new(writer),
             next_submit_id: AtomicU64::new(FIRST_SUBMIT_ID),
+            version_rolling: opts.configure_version_rolling,
         };
 
         if opts.configure_version_rolling {
@@ -203,7 +220,7 @@ impl Sv1MockMiner {
                     "params": [
                         ["version-rolling"],
                         {
-                            "version-rolling.mask": "1fffe000",
+                            "version-rolling.mask": format!("{VERSION_ROLLING_MASK:08x}"),
                             "version-rolling.min-bit-count": 2,
                         },
                     ],
@@ -315,13 +332,95 @@ impl Sv1MockMiner {
                 .clone();
             (ntime, "00".repeat(state.extranonce2_size))
         };
+        let params = json!([self.worker, job_id, extranonce2, ntime, "00000000"]);
+        self.send_submit(params, timeout).await
+    }
+
+    /// Mines a share for `job_id` that is below `target` with the extranonce the miner works
+    /// with now, submits it and returns the server's JSON-RPC response. The proof of work is
+    /// checked with the translator's own share validation. Panics if the job was never notified,
+    /// no such share is found within `timeout`, or no response arrives within it.
+    pub async fn submit_mined_share(
+        &self,
+        job_id: &str,
+        target: Target,
+        timeout: Duration,
+    ) -> Value {
+        let (notify, ntime, extranonce1, extranonce2_size) = {
+            let state = self.shared.state();
+            let notify = state
+                .job_notify
+                .get(job_id)
+                .unwrap_or_else(|| panic!("no mining.notify seen for job {job_id}"))
+                .clone();
+            (
+                notify,
+                state.job_ntime[job_id].clone(),
+                state.extranonce1.clone().unwrap_or_default(),
+                state.extranonce2_size,
+            )
+        };
+        let json_rpc::Message::Notification(notification) =
+            serde_json::from_value(notify).expect("a mining.notify is a JSON-RPC message")
+        else {
+            panic!("a mining.notify is a notification");
+        };
+        let notify = Sv1Notify::try_from(notification).expect("a well-formed mining.notify");
+        let extranonce2 = vec![0_u8; extranonce2_size];
+        let mut share = Submit {
+            user_name: self.worker.clone(),
+            job_id: job_id.to_string(),
+            extra_nonce2: Extranonce::try_from(extranonce2.clone()).expect("a valid extranonce2"),
+            time: HexU32Be(u32::from_str_radix(&ntime, 16).expect("a hex nTime")),
+            nonce: HexU32Be(0),
+            version_bits: self.version_rolling.then_some(HexU32Be(0)),
+            id: 0,
+        };
+        let extranonce1 = hex::decode(extranonce1).expect("a hex extranonce1");
+        let mask = self
+            .version_rolling
+            .then_some(HexU32Be(VERSION_ROLLING_MASK));
+        let deadline = std::time::Instant::now() + timeout;
+        let nonce = tokio::task::spawn_blocking(move || {
+            (0..=u32::MAX).find(|&nonce| {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no share below the target was found in time"
+                );
+                share.nonce = HexU32Be(nonce);
+                matches!(
+                    translator_sv2::utils::validate_sv1_share(
+                        &share,
+                        target,
+                        extranonce1.clone(),
+                        mask.clone(),
+                        notify.clone(),
+                    ),
+                    Ok(translator_sv2::utils::Sv1ShareValidationOutcome::MeetsTarget(_))
+                )
+            })
+        })
+        .await
+        .expect("the mining thread did not panic")
+        .expect("a nonce is below the target");
+
+        let mut params = vec![
+            json!(self.worker),
+            json!(job_id),
+            json!(hex::encode(extranonce2)),
+            json!(ntime),
+            json!(format!("{nonce:08x}")),
+        ];
+        if self.version_rolling {
+            params.push(json!("00000000"));
+        }
+        self.send_submit(Value::Array(params), timeout).await
+    }
+
+    async fn send_submit(&self, params: Value, timeout: Duration) -> Value {
         let id = self.next_submit_id.fetch_add(1, Ordering::SeqCst);
-        self.send(json!({
-            "id": id,
-            "method": "mining.submit",
-            "params": [self.worker, job_id, extranonce2, ntime, "00000000"],
-        }))
-        .await;
+        self.send(json!({"id": id, "method": "mining.submit", "params": params}))
+            .await;
 
         let response = self
             .shared
