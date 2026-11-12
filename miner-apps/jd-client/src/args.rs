@@ -126,4 +126,32 @@ mod tests {
             unsafe { std::env::remove_var(key) };
         }
     }
+
+    /// Every shipped example must deserialize, so a key renamed or removed in the config structs
+    /// (the shared `TemplateProviderType` denies unknown fields) cannot leave an example that no
+    /// longer starts the client.
+    #[test]
+    fn every_jdc_config_example_loads() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config-examples");
+        let mut checked = 0;
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("read config-examples") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "toml") {
+                    load_config::<JobDeclaratorClientConfig>(
+                        &path,
+                        "JDC_TEST_UNUSED",
+                        LIST_KEYS,
+                        ENUM_KEYS,
+                    )
+                    .unwrap_or_else(|e| panic!("{} does not load: {e}", path.display()));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no examples found, the test would be vacuous");
+    }
 }

@@ -19,6 +19,7 @@ use stratum_apps::{
 /// Contains only JDS-specific fields. Shared fields (authority keys, cert validity,
 /// coinbase script) are inherited from the parent Pool config.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JDSPartialConfig {
     listen_address: SocketAddr,
     #[serde(default)]

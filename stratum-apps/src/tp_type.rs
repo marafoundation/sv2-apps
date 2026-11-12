@@ -78,6 +78,7 @@ pub fn resolve_ipc_socket_path(
 /// Which type of Template Provider will be used,
 /// along with the relevant config parameters for each.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TemplateProviderType {
     Sv2Tp {
         address: String,

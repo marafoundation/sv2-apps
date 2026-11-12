@@ -27,6 +27,7 @@ use crate::error::PoolErrorKind;
 
 /// Configuration for the Pool, including connection, authority, and coinbase settings.
 #[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     listen_address: SocketAddr,
     template_provider_type: TemplateProviderType,
@@ -291,6 +292,17 @@ mod tests {
     }
 
     fn try_load_with(extra: &str, name: &str) -> Result<PoolConfig, ConfigError> {
+        try_load_with_tp_extra(extra, "", name, "POOL_TEST_UNUSED")
+    }
+
+    /// Like `try_load_with`, with `tp_extra` appended to the `Sv2Tp` table and a chosen
+    /// environment prefix.
+    fn try_load_with_tp_extra(
+        extra: &str,
+        tp_extra: &str,
+        name: &str,
+        env_prefix: &str,
+    ) -> Result<PoolConfig, ConfigError> {
         let path = std::env::temp_dir().join(format!("pool-config-{name}.toml"));
         std::fs::write(
             &path,
@@ -308,11 +320,12 @@ share_batch_size = 10
 
 [template_provider_type.Sv2Tp]
 address = "127.0.0.1:8442"
+{tp_extra}
 "#
             ),
         )
         .expect("write temp config");
-        let cfg = load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"]);
+        let cfg = load_config(&path, env_prefix, &[], &["template_provider_type"]);
         let _ = std::fs::remove_file(&path);
         cfg
     }
@@ -362,5 +375,72 @@ address = "127.0.0.1:8442"
     fn payout_modes_rejects_unknown_values() {
         // A typo must not silently fall back to the permissive default.
         assert!(try_load_with("payout_modes = \"pool-only\"", "payout-typo").is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        // A misspelled key must not be dropped, leaving its field at the default (for
+        // `payout_mode`, the permissive `any`).
+        let err = try_load_with("payout_mode = \"pool_only\"", "unknown-key")
+            .expect_err("misspelled key must not load")
+            .to_string();
+        assert!(err.contains("unknown field `payout_mode`"), "{err}");
+        let err = try_load_with(
+            "[jds]\nlisten_address = \"0.0.0.0:3334\"\nlisten_adress = \"0.0.0.0:3334\"",
+            "unknown-jds-key",
+        )
+        .expect_err("misspelled [jds] key must not load")
+        .to_string();
+        assert!(err.contains("unknown field `listen_adress`"), "{err}");
+        let err = try_load_with_tp_extra(
+            "",
+            "adress = \"127.0.0.1:8442\"",
+            "unknown-tp-key",
+            "POOL_TEST_UNUSED",
+        )
+        .expect_err("misspelled template provider key must not load")
+        .to_string();
+        assert!(err.contains("unknown field `adress`"), "{err}");
+    }
+
+    #[test]
+    fn env_override_with_unknown_key_is_rejected() {
+        // The prefix is unique to this test, so the variable reaches no other test's loader.
+        let key = "POOL_TEST_ENV_UNKNOWN_KEY__BOGUS";
+        // `set_var` is unsafe as of Rust 2024; see the loader's tests.
+        unsafe { std::env::set_var(key, "1") };
+        let result = try_load_with_tp_extra("", "", "env-unknown-key", "POOL_TEST_ENV_UNKNOWN_KEY");
+        unsafe { std::env::remove_var(key) };
+        let err = result
+            .expect_err("unknown env override must not load")
+            .to_string();
+        assert!(err.contains("unknown field `bogus`"), "{err}");
+    }
+
+    /// Every shipped example must deserialize, so a key renamed in the config structs cannot
+    /// leave an example that no longer starts the pool.
+    #[test]
+    fn every_pool_config_example_loads() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config-examples");
+        let mut checked = 0;
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("read config-examples") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "toml") {
+                    load_config::<PoolConfig>(
+                        &path,
+                        "POOL_TEST_UNUSED",
+                        &[],
+                        &["template_provider_type"],
+                    )
+                    .unwrap_or_else(|e| panic!("{} does not load: {e}", path.display()));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no examples found, the test would be vacuous");
     }
 }
