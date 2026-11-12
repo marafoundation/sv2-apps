@@ -34,9 +34,14 @@ hex = "0.4.3"
 hotpath = "0.14.0"
 socket2 = { version = "0.6.3", features = ["all"] }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7.0", optional = true }
+tikv-jemalloc-sys = { version = "0.7.0", optional = true }
+
 [features]
 default = ["monitoring"]
 monitoring = ["stratum-apps/asic-rs-telemetry"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 

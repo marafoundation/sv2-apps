@@ -282,6 +282,18 @@ cd stratum
 cargo build --release -p translator_sv2
 ```
 
+### Memory allocator
+
+The translator uses the system allocator by default. On glibc, memory it has freed is partly kept by the allocator, so resident memory can stay high after a burst of connections. Build with the optional `jemalloc` feature to use jemalloc, which returns freed pages to the OS in the background:
+
+```bash
+cargo build --release -p translator_sv2 --features jemalloc
+```
+
+The build bakes in `background_thread:true,thp:never` on Linux (jemalloc's own defaults otherwise, including `dirty_decay_ms:10000` and `muzzy_decay_ms:0`). Set `_RJEM_MALLOC_CONF` to override it, for example `_RJEM_MALLOC_CONF=dirty_decay_ms:5000`. `thp:never` keeps jemalloc's own memory out of transparent huge pages, but other allocations and the kernel's khugepaged can still use them, so run nodes with `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise`.
+
+Under jemalloc the `sv2_heap_*` monitoring gauges are not exported, and `release_heap_on_sigusr1` logs that the allocator cannot report or release. The feature has no effect when `hotpath-alloc` is also enabled, which installs its own allocator (a warning is logged at startup), and is unavailable on MSVC targets.
+
 ### Running the Translator
 
 #### **With Local Pool**

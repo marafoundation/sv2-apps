@@ -1,4 +1,10 @@
 mod args;
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "hotpath-alloc"),
+    not(target_env = "msvc")
+))]
+mod jemalloc;
 use stratum_apps::{config_helpers::logging::init_logging, utils::shutdown::ShutdownListener};
 pub use translator_sv2::{TranslatorSv2, config, error, sv1, sv2};
 
@@ -75,12 +81,22 @@ fn release_heap_on_sigusr1() {
 /// defined in `translator_sv2::TranslatorSv2`. Errors during startup are logged.
 #[cfg_attr(not(test), hotpath::main(limit = 0))]
 async fn inner_main() {
+    #[cfg(all(
+        feature = "jemalloc",
+        feature = "monitoring",
+        not(feature = "hotpath-alloc"),
+        not(target_env = "msvc")
+    ))]
+    jemalloc::report_no_heap_stats();
     let proxy_config = process_cli_args().unwrap_or_else(|e| {
         eprintln!("Translator proxy config error: {e}");
         std::process::exit(1);
     });
 
     init_logging(proxy_config.log_dir());
+
+    #[cfg(all(feature = "jemalloc", feature = "hotpath-alloc"))]
+    tracing::warn!("hotpath-alloc installs its own allocator, so this build does not use jemalloc");
 
     if proxy_config.release_heap_on_sigusr1 {
         #[cfg(all(unix, feature = "monitoring"))]

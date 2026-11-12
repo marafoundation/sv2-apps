@@ -53,7 +53,8 @@ monitoring_cache_refresh_secs = 15
 # drain_send_reconnect = false
 
 # On SIGUSR1, return free heap memory to the OS and log heap usage before and after (optional,
-# glibc builds). Off by default, when SIGUSR1 terminates the process.
+# glibc builds; does nothing under a jemalloc build). Off by default, when SIGUSR1 terminates
+# the process.
 # release_heap_on_sigusr1 = false
 
 # LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
