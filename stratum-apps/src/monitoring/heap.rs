@@ -2,8 +2,10 @@
 //!
 //! A process's resident memory also counts memory the allocator has freed but kept, so it
 //! cannot tell memory the program still holds from memory merely retained. These figures can.
-//! Only glibc reports them (2.33 or later, which a glibc build then needs to start); on other
-//! targets there are none.
+//! glibc reports them (2.33 or later, which a glibc build then needs to start). An application
+//! using another allocator can register it with [`use_allocator`]; without one there are none.
+
+use std::sync::OnceLock;
 
 /// Allocator heap usage, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,12 +18,53 @@ pub struct HeapStats {
     pub mapped: u64,
 }
 
+/// An allocator's heap statistics and release function, for [`use_allocator`].
+#[derive(Debug, Clone, Copy)]
+pub struct HeapAllocator {
+    /// Current heap usage, or `None` if the allocator cannot report it. Called for each periodic
+    /// refresh of the monitoring snapshot.
+    pub stats: fn() -> Option<HeapStats>,
+    /// Returns free memory to the OS where it can, and whether it did.
+    pub release: fn() -> bool,
+}
+
+static REGISTERED: OnceLock<HeapAllocator> = OnceLock::new();
+
+/// Reports and releases heap memory through `allocator` instead of the default for this target.
+///
+/// An allocator whose `stats` returns `None` leaves the heap gauges unregistered, which is how
+/// an application keeps the default allocator's figures from describing a heap it no longer
+/// uses. Call it before the monitoring server starts, since the gauges exist only if the
+/// allocator reports statistics when the server starts. Only the first call takes effect; a
+/// later one gives its allocator back.
+pub fn use_allocator(allocator: HeapAllocator) -> Result<(), HeapAllocator> {
+    REGISTERED.set(allocator)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static BUILT_IN: Option<HeapAllocator> = Some(HeapAllocator {
+    stats: glibc_heap_stats,
+    release: glibc_release_free_heap,
+});
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+static BUILT_IN: Option<HeapAllocator> = None;
+
+fn active() -> Option<&'static HeapAllocator> {
+    REGISTERED.get().or(BUILT_IN.as_ref())
+}
+
 /// Current heap usage, if the allocator reports it.
 ///
-/// Walks the allocator's free lists while holding each arena's lock, so it is meant for a
-/// periodic refresh, not for every request.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// May be costly, since an allocator can walk its free lists under a lock to produce it, so it
+/// is meant for a periodic refresh, not for every request.
 pub fn heap_stats() -> Option<HeapStats> {
+    (active()?.stats)()
+}
+
+/// Walks the free lists while holding each arena's lock.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn glibc_heap_stats() -> Option<HeapStats> {
     // SAFETY: mallinfo2 takes no arguments and only reads allocator state.
     let info = unsafe { libc::mallinfo2() };
     // Memory-mapped allocations (`hblkhd`) are always in use; `uordblks` and `fordblks` cover
@@ -31,12 +74,6 @@ pub fn heap_stats() -> Option<HeapStats> {
         free: info.fordblks as u64,
         mapped: (info.arena + info.hblkhd) as u64,
     })
-}
-
-/// Current heap usage, if the allocator reports it.
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn heap_stats() -> Option<HeapStats> {
-    None
 }
 
 /// The process's resident memory in bytes, where the OS reports it (Linux).
@@ -60,18 +97,16 @@ pub fn resident_bytes() -> Option<u64> {
 
 /// Returns the allocator's free memory to the OS where it can. Returns whether any was released.
 ///
-/// Holds each arena's lock while it runs, which can take a while on a large heap, so call it
-/// off the async runtime.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// May take a while on a large heap, since an allocator can hold its locks while it runs, so
+/// call it off the async runtime.
 pub fn release_free_heap() -> bool {
-    // SAFETY: malloc_trim only reorganises the allocator's own free memory.
-    unsafe { libc::malloc_trim(0) == 1 }
+    active().is_some_and(|allocator| (allocator.release)())
 }
 
-/// Returns the allocator's free memory to the OS where it can. Returns whether any was released.
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub fn release_free_heap() -> bool {
-    false
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn glibc_release_free_heap() -> bool {
+    // SAFETY: malloc_trim only reorganises the allocator's own free memory.
+    unsafe { libc::malloc_trim(0) == 1 }
 }
 
 #[cfg(test)]
