@@ -513,7 +513,7 @@ pub mod http {
                             "Attempt {attempt}: URL {url} returned a server error code {status_code}"
                         );
                     } else {
-                        return (status_code, res.as_bytes().to_vec());
+                        return (i32::from(status_code), res.as_bytes().to_vec());
                     }
                 }
                 Err(err) => {
