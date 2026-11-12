@@ -8,6 +8,7 @@ use crate::{
         downstream::{DownstreamData, Sv1ServerEvent},
         sv1_server::sv1_difficulty,
     },
+    utils::finite_hashrate,
 };
 
 use stratum_apps::{
@@ -264,7 +265,7 @@ impl Sv1Server {
         for (downstream_id, channel_id, new_target, new_hashrate) in all_updates {
             let update_channel = UpdateChannelOwned {
                 channel_id,
-                nominal_hash_rate: new_hashrate,
+                nominal_hash_rate: finite_hashrate(new_hashrate),
                 max_target: new_target.to_le_bytes().into(),
             };
 
@@ -329,7 +330,7 @@ impl Sv1Server {
                 }
             };
 
-            total_hashrate += hashrate;
+            total_hashrate += finite_hashrate(hashrate);
             min_target = Some(match min_target {
                 Some(current) => current.min(target),
                 None => target,

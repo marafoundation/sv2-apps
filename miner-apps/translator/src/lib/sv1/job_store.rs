@@ -91,7 +91,7 @@ impl<T> Sv1JobStore<T> {
         }
     }
 
-    fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.active_job = None;
         self.past_jobs.clear();
         self.past_job_order.clear();

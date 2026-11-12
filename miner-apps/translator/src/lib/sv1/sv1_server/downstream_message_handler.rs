@@ -249,7 +249,10 @@ impl IsServer for Sv1Server {
         self.with_registered_downstream(downstream_id, |downstream| {
             downstream
                 .downstream_data
-                .with(|data| data.extranonce1.clone())
+                .with(|data| {
+                    data.miner_extranonce = Some((data.extranonce1.clone(), data.extranonce2_len));
+                    data.extranonce1.clone()
+                })
                 .map_err(TproxyError::shutdown)
         })
     }
@@ -276,7 +279,10 @@ impl IsServer for Sv1Server {
         self.with_registered_downstream(downstream_id, |downstream| {
             downstream
                 .downstream_data
-                .with(|data| data.extranonce2_len)
+                .with(|data| {
+                    data.miner_extranonce = Some((data.extranonce1.clone(), data.extranonce2_len));
+                    data.extranonce2_len
+                })
                 .map_err(TproxyError::shutdown)
         })
     }

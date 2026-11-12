@@ -113,9 +113,9 @@ impl TranslatorSv2 {
             Ok(running) => running,
             Err(bootstrap_err) => {
                 let (kind, runtime) = bootstrap_err.into_parts();
-                error!(?kind, "Failed to bootstrap Translator Proxy");
+                let outcome = self.failure_outcome(kind, "Failed to bootstrap Translator Proxy");
                 runtime.shutdown().await;
-                return Err(kind);
+                return outcome;
             }
         };
 
@@ -135,9 +135,10 @@ impl TranslatorSv2 {
                 Ok(runtime) => runtime,
                 Err(bootstrap_err) => {
                     let (kind, runtime) = bootstrap_err.into_parts();
-                    error!(?kind, "Giving up on upstream fallbacks");
+                    let outcome = self.failure_outcome(kind, "Giving up on upstream fallbacks");
+                    runtime.release_held_miners().await;
                     runtime.shutdown().await;
-                    return Err(kind);
+                    return outcome;
                 }
             };
             let upstream_ready = match requested_reconnect {
@@ -150,18 +151,36 @@ impl TranslatorSv2 {
                     Ok(running) => running,
                     Err(bootstrap_err) => {
                         let (kind, runtime) = bootstrap_err.into_parts();
-                        error!(?kind, "Failed to start services for Translator Proxy");
+                        let outcome = self
+                            .failure_outcome(kind, "Failed to start services for Translator Proxy");
+                        runtime.release_held_miners().await;
                         runtime.shutdown().await;
-                        return Err(kind);
+                        return outcome;
                     }
                 },
                 Err(bootstrap_err) => {
                     let (kind, runtime) = bootstrap_err.into_parts();
-                    error!(?kind, "Failed to reconnect Translator Proxy");
+                    let outcome =
+                        self.failure_outcome(kind, "Failed to reconnect Translator Proxy");
+                    runtime.release_held_miners().await;
                     runtime.shutdown().await;
-                    return Err(kind);
+                    return outcome;
                 }
             };
+        }
+    }
+
+    /// What [`TranslatorSv2::start`] returns after `kind` stopped it. A failure that comes while
+    /// a shutdown or drain is already under way is part of that shutdown, not an error.
+    ///
+    /// Must be called before the failed runtime is shut down, which cancels the shutdown token.
+    fn failure_outcome(&self, kind: TproxyErrorKind, message: &str) -> Result<(), TproxyErrorKind> {
+        if self.cancellation_token.is_cancelled() {
+            info!(?kind, "{message}: shutdown in progress");
+            Ok(())
+        } else {
+            error!(?kind, "{message}");
+            Err(kind)
         }
     }
 
@@ -337,5 +356,23 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(translator.cancellation_token.is_cancelled());
         shutdown.abort();
+    }
+
+    /// A bootstrap that fails because the translator is already shutting down is a clean exit.
+    #[tokio::test(start_paused = true)]
+    async fn start_returns_ok_when_shut_down_during_the_first_walk() {
+        let translator = translator(0);
+        translator.cancellation_token.cancel();
+        assert!(translator.start().await.is_ok());
+    }
+
+    /// The same failure with no shutdown under way is reported.
+    #[tokio::test(start_paused = true)]
+    async fn start_fails_when_no_upstream_connects() {
+        let translator = translator(0);
+        assert!(matches!(
+            translator.start().await,
+            Err(TproxyErrorKind::CouldNotInitiateSystem)
+        ));
     }
 }

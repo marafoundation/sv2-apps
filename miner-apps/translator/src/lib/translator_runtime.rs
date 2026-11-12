@@ -52,6 +52,9 @@ struct Sv1Side {
 /// Connection attempts made to an upstream before moving on.
 const MAX_UPSTREAM_RETRIES: usize = 3;
 
+/// Longest pause between upstream walks while miners are held.
+const MAX_WALK_PAUSE: Duration = Duration::from_secs(16);
+
 /// The core coordinator of the Translator runtime, parameterized by its current bootstrap `State`.
 ///
 /// It manages the lifecycle of essential sub-services and channels, ensuring resources
@@ -159,6 +162,32 @@ impl<State> TranslatorRuntime<State> {
         info!("TranslatorSv2 shutdown complete.");
     }
 
+    /// Asks every held miner to reconnect, spread over the drain window, and waits for them to
+    /// leave. Called before shutting down because no upstream connected within the hold window.
+    pub(super) async fn release_held_miners(&self) {
+        let was_holding = self.upstreams.holding_until().is_some();
+        self.upstreams.stop_holding();
+        if !was_holding || !self.sv1.started {
+            return;
+        }
+        let _ = self
+            .sv1
+            .generation_events
+            .try_send(GenerationEvent::Released);
+        let wait = self.translator.config.drain_window() + Duration::from_secs(2);
+        let server = self.sv1.server.clone();
+        if tokio::time::timeout(wait, async move {
+            while !server.downstreams.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            warn!("Held miners did not all leave within {wait:?}");
+        }
+    }
+
     fn payout_mode(&self, user_identity: &str) -> Result<Option<PayoutMode>, TproxyErrorKind> {
         let expected_payout_distribution = self
             .translator
@@ -177,6 +206,17 @@ impl<State> TranslatorRuntime<State> {
         }
         Ok(expected_payout_distribution)
     }
+}
+
+/// `pause` scaled by a random factor in [0.8, 1.2), so translators that lost the same upstream
+/// do not retry in lockstep.
+fn jittered(pause: Duration) -> Duration {
+    let unit = (std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        Instant::now(),
+    ) >> 11) as f64
+        / (1u64 << 53) as f64;
+    pause.mul_f64(0.8 + 0.4 * unit)
 }
 
 /// How long a fallback waits for the SV1 server to acknowledge [`GenerationEvent::Ended`].
@@ -433,7 +473,42 @@ impl TranslatorRuntime<ChannelManagerReady> {
     /// Each entry gets [`MAX_UPSTREAM_RETRIES`] attempts before the walk moves on. See
     /// [`UpstreamWalk`] for the order entries are visited in. Returns
     /// [`TproxyErrorKind::CouldNotInitiateSystem`] once every entry has been tried in this walk.
+    ///
+    /// While miners are held after a fallback, walks repeat with a growing pause (1 s doubling to
+    /// [`MAX_WALK_PAUSE`], with jitter) until one connects or the hold window would end before
+    /// the next walk.
     async fn initialize_upstream(&mut self) -> Result<(), TproxyErrorKind> {
+        let mut pause = Duration::from_secs(1);
+        loop {
+            if self.walk_upstreams().await? {
+                return Ok(());
+            }
+            let Some(until) = self.upstreams.holding_until() else {
+                break;
+            };
+            let delay = jittered(pause);
+            if Instant::now() + delay >= until {
+                break;
+            }
+            warn!("No upstream accepted the connection; holding miners, next attempt in {delay:?}");
+            tokio::select! {
+                _ = self.translator.cancellation_token.cancelled() => {
+                    return Err(TproxyErrorKind::CouldNotInitiateSystem);
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            pause = (pause * 2).min(MAX_WALK_PAUSE);
+        }
+
+        tracing::error!(
+            "All upstreams failed after {} retries each",
+            MAX_UPSTREAM_RETRIES
+        );
+        Err(TproxyErrorKind::CouldNotInitiateSystem)
+    }
+
+    /// One walk over the configured upstreams. Returns whether one connected.
+    async fn walk_upstreams(&mut self) -> Result<bool, TproxyErrorKind> {
         let upstream_len = self.upstreams.len();
 
         for i in self.upstreams.order() {
@@ -448,15 +523,11 @@ impl TranslatorRuntime<ChannelManagerReady> {
 
             if self.connect_with_retries(&upstream).await? {
                 self.upstreams.mark_connected(i);
-                return Ok(());
+                return Ok(true);
             }
         }
 
-        tracing::error!(
-            "All upstreams failed after {} retries each",
-            MAX_UPSTREAM_RETRIES
-        );
-        Err(TproxyErrorKind::CouldNotInitiateSystem)
+        Ok(false)
     }
 
     /// Tries `upstream` up to [`MAX_UPSTREAM_RETRIES`] times and, once connected, configures the
@@ -718,11 +789,25 @@ impl TranslatorRuntime<Running> {
     /// Fails with [`TproxyErrorKind::FallbackLoop`] when this fallback exceeds the configured
     /// budget, or with [`TproxyErrorKind::GenerationEndUnacknowledged`] when the SV1 server does
     /// not confirm it discarded the ended generation's messages; the caller then shuts the
-    /// translator down.
+    /// translator down. When the translator is already shutting down it fails with
+    /// [`TproxyErrorKind::CouldNotInitiateSystem`] before recording the fallback.
     pub(super) async fn cleanup_for_fallback(
         mut self,
     ) -> Result<TranslatorRuntime<ChannelManagerReady>, BootstrapError> {
+        // A shutdown or drain that has already cancelled the translator is not an upstream
+        // failure: it must not hold miners or count toward the fallback metric and budget.
+        if self.translator.cancellation_token.is_cancelled() {
+            return Err(BootstrapError::from((
+                TproxyErrorKind::CouldNotInitiateSystem,
+                self,
+            )));
+        }
         info!("Preparing fallback");
+        // Set before the teardown so health does not report the held miners' pod as down.
+        if let Some(hold) = self.translator.config.upstream_loss_hold() {
+            info!("Holding SV1 miners for up to {}s", hold.as_secs());
+            self.upstreams.hold_until(Instant::now() + hold);
+        }
         let fallback_budget = self.upstreams.record_fallback(Instant::now());
         #[cfg(feature = "monitoring")]
         self.translator.current_generation.clear_channel_manager();
@@ -740,6 +825,9 @@ impl TranslatorRuntime<Running> {
         if let Err(kind) =
             await_generation_end(&self.sv1, &self.translator.cancellation_token).await
         {
+            // The SV1 server would not act on a release either; shutting down disconnects the
+            // miners.
+            self.upstreams.stop_holding();
             return Err(BootstrapError::from((kind, self)));
         }
 
@@ -781,6 +869,15 @@ mod tests {
     use super::*;
     use crate::config::{DownstreamDifficultyConfig, TranslatorConfig};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn walk_pauses_are_jittered_within_twenty_percent() {
+        let pause = Duration::from_secs(10);
+        for _ in 0..100 {
+            let jittered = jittered(pause);
+            assert!(jittered >= Duration::from_secs(8) && jittered < Duration::from_secs(12));
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn an_unanswered_generation_end_is_not_acknowledged() {
@@ -903,5 +1000,61 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    fn running_runtime() -> TranslatorRuntime<Running> {
+        let config = TranslatorConfig::new(
+            vec![],
+            "127.0.0.1".into(),
+            3333,
+            DownstreamDifficultyConfig::new(100.0, 5.0, true, 60),
+            2,
+            1,
+            4,
+            false,
+            true,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let runtime = TranslatorRuntime::<Init>::new(TranslatorSv2::new(config)).unwrap();
+        TranslatorRuntime {
+            tproxy_mode: runtime.tproxy_mode,
+            fallback_coordinator: runtime.fallback_coordinator,
+            task_manager: runtime.task_manager,
+            translator: runtime.translator,
+            upstreams: runtime.upstreams,
+            protocol_reconnect: runtime.protocol_reconnect,
+            listen_addr: runtime.listen_addr,
+            sv1: runtime.sv1,
+            state: Running,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_during_shutdown_is_not_counted() {
+        let runtime = running_runtime();
+        let status = runtime.upstreams.status();
+        runtime.translator.cancellation_token.cancel();
+
+        let Err(bootstrap_err) = runtime.cleanup_for_fallback().await else {
+            panic!("a translator that is shutting down does not fall back");
+        };
+
+        let (kind, runtime) = bootstrap_err.into_parts();
+        assert!(matches!(kind, TproxyErrorKind::CouldNotInitiateSystem));
+        assert_eq!(status.fallbacks(), 0);
+        assert!(runtime.upstreams.holding_until().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fallback_is_counted_while_the_translator_runs() {
+        let runtime = running_runtime();
+        let status = runtime.upstreams.status();
+
+        assert!(runtime.cleanup_for_fallback().await.is_ok());
+
+        assert_eq!(status.fallbacks(), 1);
     }
 }
