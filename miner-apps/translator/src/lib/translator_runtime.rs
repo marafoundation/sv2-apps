@@ -18,13 +18,14 @@ use stratum_apps::{
     task_manager::TaskManager,
     utils::types::{GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, InboundFrame, OutboundFrame},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     TranslatorSv2,
     error::{TproxyError, TproxyErrorKind},
     sv1::Sv1Server,
     sv2::{ChannelManager, ProtocolReconnect, Upstream},
+    upstream_walk::UpstreamWalk,
     utils::{ReconnectRequest, TproxyMode, UpstreamEntry},
 };
 
@@ -51,7 +52,7 @@ pub(super) struct TranslatorRuntime<State> {
     fallback_coordinator: FallbackCoordinator,
     task_manager: Arc<TaskManager>,
     translator: TranslatorSv2,
-    upstream_addresses: Vec<UpstreamEntry>,
+    upstreams: UpstreamWalk,
     protocol_reconnect: SharedLock<ProtocolReconnect>,
     listen_addr: SocketAddr,
     state: State,
@@ -111,7 +112,7 @@ impl<State> TranslatorRuntime<State> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: Failed,
@@ -186,7 +187,7 @@ impl TranslatorRuntime<Init> {
 
         let listen_addr = SocketAddr::new(downstream_addr_ip, translator.config.downstream_port);
 
-        let upstream_addresses = translator
+        let upstream_entries = translator
             .config
             .upstreams
             .iter()
@@ -194,17 +195,21 @@ impl TranslatorRuntime<Init> {
                 host: u.address.clone(),
                 port: u.port,
                 authority_pubkey: u.authority_pubkey,
-                tried_or_flagged: false,
                 user_identity: u.user_identity.clone(),
             })
             .collect();
+        let upstreams = UpstreamWalk::new(
+            upstream_entries,
+            translator.config.max_fallbacks,
+            translator.config.fallback_window(),
+        );
 
         Ok(TranslatorRuntime {
             tproxy_mode,
             fallback_coordinator: FallbackCoordinator::new(),
             task_manager: Arc::new(TaskManager::new()),
             translator,
-            upstream_addresses,
+            upstreams,
             protocol_reconnect: SharedLock::new(ProtocolReconnect::default()),
             listen_addr,
             state: Init,
@@ -239,7 +244,7 @@ impl TranslatorRuntime<Init> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: IoReady {
@@ -281,7 +286,7 @@ impl TranslatorRuntime<IoReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: ChannelManagerReady {
@@ -307,7 +312,7 @@ impl TranslatorRuntime<ChannelManagerReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: Sv1ServerReady {
@@ -336,13 +341,16 @@ impl TranslatorRuntime<Sv1ServerReady> {
     /// so it can only be another server of the same pool. It is tried on its own and does not join
     /// the configured list.
     pub(super) async fn try_reconnect(
-        self,
+        mut self,
         request: ReconnectRequest,
     ) -> Result<TranslatorRuntime<UpstreamReady>, BootstrapError> {
         let upstream = request.into_upstream();
         info!("Reconnecting to {}:{}", upstream.host, upstream.port);
         match self.connect_with_retries(&upstream).await {
-            Ok(true) => Ok(self.into_upstream_ready()),
+            Ok(true) => {
+                self.upstreams.mark_reconnected();
+                Ok(self.into_upstream_ready())
+            }
             Ok(false) => {
                 warn!(
                     "Could not reconnect to {}:{}; trying the configured upstreams",
@@ -360,7 +368,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: UpstreamReady {
@@ -370,39 +378,26 @@ impl TranslatorRuntime<Sv1ServerReady> {
         }
     }
 
-    /// Initializes the upstream connection list, handling retries, fallbacks, and flagging.
+    /// Walks the configured upstreams until one accepts the connection.
     ///
-    /// Upstreams are tried sequentially, each receiving a fixed number of retries before we
-    /// advance to the next entry. This ensures we exhaust every healthy upstream before shutting
-    /// the translator down.
-    ///
-    /// The `tried_or_flagged` flag in the `UpstreamEntry` acts as the upstream's state machine:
-    ///  `false` means "never tried", while `true` means "already connected or marked as
-    /// malicious". Once an upstream is flagged we skip it on future loops
-    /// to avoid hammering known-bad endpoints during failover.
+    /// Each entry gets [`MAX_UPSTREAM_RETRIES`] attempts before the walk moves on. See
+    /// [`UpstreamWalk`] for the order entries are visited in. Returns
+    /// [`TproxyErrorKind::CouldNotInitiateSystem`] once every entry has been tried in this walk.
     async fn initialize_upstream(&mut self) -> Result<(), TproxyErrorKind> {
-        let upstream_len = self.upstream_addresses.len();
+        let upstream_len = self.upstreams.len();
 
-        for i in 0..upstream_len {
-            if self.upstream_addresses[i].tried_or_flagged {
-                debug!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
-                );
-                continue;
-            }
-
+        for i in self.upstreams.order() {
+            let upstream = self.upstreams.entry(i).clone();
             info!(
                 "Trying upstream {} of {}: {}:{}",
                 i + 1,
                 upstream_len,
-                self.upstream_addresses[i].host,
-                self.upstream_addresses[i].port
+                upstream.host,
+                upstream.port
             );
 
-            let upstream = self.upstream_addresses[i].clone();
-            let connected = self.connect_with_retries(&upstream).await?;
-            self.upstream_addresses[i].tried_or_flagged = true;
-            if connected {
+            if self.connect_with_retries(&upstream).await? {
+                self.upstreams.mark_connected(i);
                 return Ok(());
             }
         }
@@ -530,7 +525,7 @@ impl TranslatorRuntime<UpstreamReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: Running,
@@ -631,8 +626,15 @@ impl TranslatorRuntime<Running> {
         }
     }
 
-    pub(super) async fn cleanup_for_fallback(self) -> TranslatorRuntime<Sv1ServerReady> {
+    /// Tears down the current upstream generation and prepares a fresh one.
+    ///
+    /// Fails with [`TproxyErrorKind::FallbackLoop`] when this fallback exceeds the configured
+    /// budget; the caller then shuts the translator down.
+    pub(super) async fn cleanup_for_fallback(
+        mut self,
+    ) -> Result<TranslatorRuntime<Sv1ServerReady>, BootstrapError> {
         info!("Preparing fallback");
+        let fallback_budget = self.upstreams.record_fallback(Instant::now());
         self.fallback_coordinator.trigger_fallback_and_wait().await;
         info!("All components finished fallback cleanup");
         // `wait` already took the request that caused this teardown. One recorded while it was
@@ -641,20 +643,35 @@ impl TranslatorRuntime<Running> {
             .protocol_reconnect
             .with(|protocol_reconnect| protocol_reconnect.discard());
 
+        if let Err(fallbacks) = fallback_budget {
+            let window_secs = self.translator.config.fallback_window().as_secs();
+            error!(
+                "{fallbacks} fallbacks within {window_secs}s exceed max_fallbacks = {}",
+                self.translator.config.max_fallbacks
+            );
+            return Err(BootstrapError::from((
+                TproxyErrorKind::FallbackLoop {
+                    fallbacks,
+                    window_secs,
+                },
+                self,
+            )));
+        }
+
         let fresh_fallback_coordinator = FallbackCoordinator::new();
 
-        TranslatorRuntime {
+        Ok(TranslatorRuntime {
             tproxy_mode: self.tproxy_mode,
             fallback_coordinator: fresh_fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
             state: Init,
         }
         .bootstrap_io()
         .bootstrap_channel_manager()
-        .bootstrap_sv1_server()
+        .bootstrap_sv1_server())
     }
 }

@@ -174,7 +174,6 @@ pub struct UpstreamEntry {
     pub host: String,
     pub port: u16,
     pub authority_pubkey: Secp256k1PublicKey,
-    pub tried_or_flagged: bool,
     pub user_identity: String,
 }
 
