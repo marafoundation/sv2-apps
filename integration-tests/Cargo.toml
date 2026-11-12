@@ -21,7 +21,7 @@ pool_sv2 = { version = "0.8.0", path = "../pool-apps/pool" }
 translator_sv2 = { version = "0.7.0", path = "../miner-apps/translator" }
 async-channel = { version = "1.5.1", default-features = false }
 corepc-node = { version = "0.7.0", default-features = false, features = ["28_0"] }
-minreq = { version = "2.12.0", default-features = false, features = ["https"] }
+minreq = { version = "3.0.0", default-features = false, features = ["https"] }
 once_cell = { version = "1.19.0", default-features = false }
 tokio = { version="1.44.1", default-features = false,  features = ["tracing"] }
 tokio-util = { version = "0.7", default-features = false }
