@@ -34,6 +34,7 @@ Applications implement these traits on their data structures:
 - `ServerMonitoring` - For upstream connection info
 - `Sv2ClientsMonitoring` - For Sv2 downstream client info (Pool, JDC)
 - `Sv1ClientsMonitoring` - For Sv1 downstream client info (Translator Proxy only)
+- `UpstreamMonitoring` - For the connection state of the configured upstream endpoints (optional)
 
 ## Usage
 
@@ -50,6 +51,10 @@ let server = MonitoringServer::new(
 
 // For Translator, add SV1 monitoring
 let server = server.with_sv1_monitoring(Arc::new(sv1_server.clone()))?;
+
+// Optionally expose upstream connection state. This also makes `/api/v1/health` answer
+// 503 `upstream_disconnected` while `is_connected()` is false. Without it, health is always 200.
+let server = server.with_upstream_monitoring(Arc::new(upstream_state.clone()))?;
 
 // Create a shutdown signal (any Future that completes when shutdown is needed)
 let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
@@ -89,6 +94,10 @@ tokio::spawn(async move {
 - `sv2_client_shares_accepted_total{client_id, channel_id, user_identity}` - Per-channel shares
 - `sv2_client_shares_rejected_total{client_id, channel_id, user_identity, error_code}` - Per-channel rejected shares by error code
 - `sv2_client_blocks_found_total` - Total blocks found across all current client channels
+
+**Upstream (only with `with_upstream_monitoring`):**
+- `sv2_upstream_connected{pool_address}` - 1 for the connected upstream, 0 for every other configured one
+- `sv2_upstream_fallbacks_total` - Fallbacks to another upstream since the process started
 
 **Sv1 (Translator Proxy only):**
 - `sv1_clients_total` - Sv1 client count

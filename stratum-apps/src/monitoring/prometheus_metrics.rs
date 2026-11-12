@@ -29,6 +29,9 @@ pub struct PrometheusMetrics {
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
+    // Upstream metrics
+    pub sv2_upstream_connected: Option<GaugeVec>,
+    pub sv2_upstream_fallbacks_total: Option<Gauge>,
 }
 
 impl PrometheusMetrics {
@@ -36,6 +39,7 @@ impl PrometheusMetrics {
         enable_server_metrics: bool,
         enable_clients_metrics: bool,
         enable_sv1_metrics: bool,
+        enable_upstream_metrics: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let registry = Registry::new();
 
@@ -211,6 +215,28 @@ impl PrometheusMetrics {
             (None, None)
         };
 
+        // Upstream metrics
+        let (sv2_upstream_connected, sv2_upstream_fallbacks_total) = if enable_upstream_metrics {
+            let connected = GaugeVec::new(
+                Opts::new(
+                    "sv2_upstream_connected",
+                    "Whether the app is connected to each configured upstream (1) or not (0)",
+                ),
+                &["pool_address"],
+            )?;
+            registry.register(Box::new(connected.clone()))?;
+
+            let fallbacks = Gauge::new(
+                "sv2_upstream_fallbacks_total",
+                "Number of fallbacks to another upstream since the process started",
+            )?;
+            registry.register(Box::new(fallbacks.clone()))?;
+
+            (Some(connected), Some(fallbacks))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             registry,
             sv2_uptime_seconds,
@@ -231,6 +257,8 @@ impl PrometheusMetrics {
             sv2_client_blocks_found_total,
             sv1_clients_total,
             sv1_hashrate_total,
+            sv2_upstream_connected,
+            sv2_upstream_fallbacks_total,
         })
     }
 }
@@ -242,7 +270,7 @@ mod tests {
 
     #[test]
     fn uptime_metric_always_registered() {
-        let m = PrometheusMetrics::new(false, false, false).unwrap();
+        let m = PrometheusMetrics::new(false, false, false, false).unwrap();
         m.sv2_uptime_seconds.set(42.0);
 
         let families = m.registry.gather();
@@ -252,7 +280,7 @@ mod tests {
 
     #[test]
     fn server_metrics_enabled() {
-        let m = PrometheusMetrics::new(true, false, false).unwrap();
+        let m = PrometheusMetrics::new(true, false, false, false).unwrap();
         assert!(m.sv2_server_channels.is_some());
         assert!(m.sv2_server_hashrate_total.is_some());
         assert!(m.sv2_server_channel_hashrate.is_some());
@@ -266,7 +294,7 @@ mod tests {
 
     #[test]
     fn clients_metrics_enabled() {
-        let m = PrometheusMetrics::new(false, true, false).unwrap();
+        let m = PrometheusMetrics::new(false, true, false, false).unwrap();
         assert!(m.sv2_clients_total.is_some());
         assert!(m.sv2_client_channels.is_some());
         assert!(m.sv2_client_hashrate_total.is_some());
@@ -280,7 +308,7 @@ mod tests {
 
     #[test]
     fn sv1_metrics_enabled() {
-        let m = PrometheusMetrics::new(false, false, true).unwrap();
+        let m = PrometheusMetrics::new(false, false, true, false).unwrap();
         assert!(m.sv1_clients_total.is_some());
         assert!(m.sv1_hashrate_total.is_some());
         // server and clients should be None
@@ -289,11 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn all_metrics_disabled_only_system_metrics() {
-        let m = PrometheusMetrics::new(false, false, false).unwrap();
+    fn upstream_metrics_enabled() {
+        let m = PrometheusMetrics::new(false, false, false, true).unwrap();
+        assert!(m.sv2_upstream_connected.is_some());
+        assert!(m.sv2_upstream_fallbacks_total.is_some());
+        // server, clients and sv1 should be None
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv2_clients_total.is_none());
         assert!(m.sv1_clients_total.is_none());
+    }
+
+    #[test]
+    fn all_metrics_disabled_only_system_metrics() {
+        let m = PrometheusMetrics::new(false, false, false, false).unwrap();
+        assert!(m.sv2_server_channels.is_none());
+        assert!(m.sv2_clients_total.is_none());
+        assert!(m.sv1_clients_total.is_none());
+        assert!(m.sv2_upstream_connected.is_none());
+        assert!(m.sv2_upstream_fallbacks_total.is_none());
 
         let families = m.registry.gather();
         // Only the system metrics should be registered (with default value 0)
@@ -306,7 +347,7 @@ mod tests {
 
     #[test]
     fn metrics_encode_to_prometheus_text_format() {
-        let m = PrometheusMetrics::new(true, true, true).unwrap();
+        let m = PrometheusMetrics::new(true, true, true, true).unwrap();
         m.sv2_uptime_seconds.set(123.0);
         m.sv2_server_hashrate_total.as_ref().unwrap().set(1000.0);
         m.sv2_clients_total.as_ref().unwrap().set(5.0);
