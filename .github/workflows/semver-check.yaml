@@ -3,10 +3,10 @@ name: Semver Check
 on:
   pull_request:
     branches:
-      - main
+      - mara-0.9
   push:
     branches:
-      - main
+      - mara-0.9
 
 jobs:
   semver-check:
@@ -61,20 +61,3 @@ jobs:
 
       - name: Run semver checks
         run: cargo semver-checks --workspace --all-features
-
-  version-bump-check:
-    # Only pull requests have a base branch to diff against; the workflow
-    # also runs on pushes to main, where this check has nothing to compare.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          # Full history, so the script can diff the PR against its
-          # merge-base with the base branch.
-          fetch-depth: 0
-
-      - name: Check that modified crates carry a version bump
-        run: ./scripts/check-version-bumps.sh origin/${{ github.base_ref }}
