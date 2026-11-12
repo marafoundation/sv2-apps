@@ -15,7 +15,7 @@ use stratum_apps::{
             Sv2ClientsMonitoring,
         },
         match_discovered_miners_to_downstreams_by_worker_and_port,
-        server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+        server::{CoinbaseOutputInfo, ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
     },
     utils::types::DownstreamId,
 };
@@ -32,6 +32,9 @@ const MINER_TELEMETRY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 impl ServerMonitoring for ChannelManager {
     fn get_server(&self) -> ServerInfo {
+        // Read before taking the upstream channel lock, so the two locks are never held together.
+        let coinbase_outputs =
+            CoinbaseOutputInfo::from_scripts(self.coinbase_output_scripts(), self.network);
         self.upstream_channel
             .with(|upstream_channel| {
                 let mut extended_channels = Vec::new();
@@ -72,7 +75,7 @@ impl ServerMonitoring for ChannelManager {
                 ServerInfo {
                     extended_channels,
                     standard_channels,
-                    coinbase_outputs: Vec::new(),
+                    coinbase_outputs,
                 }
             })
             .unwrap_or_else(|_| ServerInfo {
