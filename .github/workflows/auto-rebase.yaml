@@ -3,11 +3,12 @@ name: Auto Rebase
 on:
   push:
     branches:
-      - main
+      - mara-0.9
   workflow_dispatch:
 
 jobs:
   rebase-outdated-prs:
+    if: github.repository == 'stratum-mining/sv2-apps'
     runs-on: ubuntu-latest
     steps:
 
@@ -48,9 +49,9 @@ jobs:
             git config --global user.name "$PR_AUTHOR_NAME"
             git config --global user.email "$PR_AUTHOR_EMAIL"
 
-            # Rebase the branch on top of the main branch
-            git fetch origin main
-            if ! git rebase origin/main; then
+            # Rebase the branch on top of the mara-0.9 branch
+            git fetch origin mara-0.9
+            if ! git rebase origin/mara-0.9; then
               echo "Conflict detected. Aborting rebase and continuing."
               git rebase --abort
 
@@ -67,7 +68,7 @@ jobs:
             git remote remove contributor
 
             # Ensure we are not on the branch to be deleted
-            git checkout main
+            git checkout mara-0.9
 
             # Delete the local unique branch
             git branch -D $unique_branch_name
