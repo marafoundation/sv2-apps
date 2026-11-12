@@ -88,6 +88,7 @@ impl TranslatorSv2 {
     ///    termination.
     pub async fn start(&self) -> Result<(), TproxyErrorKind> {
         info!("Starting Translator Proxy...");
+        self.config.warn_about_ignored_settings();
 
         let runtime = match TranslatorRuntime::<Init>::new(self.clone()) {
             Ok(runtime) => runtime,
