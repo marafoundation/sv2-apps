@@ -11,7 +11,10 @@
 //!   [`TranslatorConfig::downstream_port`])
 //! - Supported protocol versions
 //! - Downstream difficulty adjustment parameters ([`DownstreamDifficultyConfig`])
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -21,6 +24,11 @@ use stratum_apps::{
     payout::{MissingMinerPayoutMode, PayoutMode, PayoutModeError},
     utils::types::{Hashrate, SharesPerMinute},
 };
+
+/// How long to wait for an upstream to answer `SetupConnection` when
+/// [`TranslatorConfig::setup_connection_timeout_secs`] is unset. It matches the Noise handshake
+/// timeout, so an upstream gets the same patience at both steps of connecting.
+pub const DEFAULT_SETUP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for the Translator.
 #[derive(Debug, Deserialize, Clone)]
@@ -55,6 +63,13 @@ pub struct TranslatorConfig {
     /// `cap / job rate` — and here the upstream sets the rate; see `channels_sv2` for sizing.
     #[serde(default)]
     pub max_past_jobs: Option<usize>,
+    /// Seconds to wait for the upstream to answer `SetupConnection` before giving up on it and
+    /// moving to the next attempt or upstream.
+    ///
+    /// `None` and `Some(0)` both select [`DEFAULT_SETUP_CONNECTION_TIMEOUT`]; a zero timeout
+    /// would fail every connection attempt.
+    #[serde(default)]
+    pub setup_connection_timeout_secs: Option<u64>,
     /// Protocol extensions that the translator requires (server must support these).
     /// If the upstream server doesn't support these, the translator will fail over to another
     /// upstream.
@@ -152,6 +167,14 @@ impl TranslatorConfig {
         std::time::Duration::from_secs(self.fallback_window_secs.min(86_400))
     }
 
+    /// How long to wait for the upstream's answer to `SetupConnection`.
+    pub fn setup_connection_timeout(&self) -> Duration {
+        match self.setup_connection_timeout_secs {
+            Some(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => DEFAULT_SETUP_CONNECTION_TIMEOUT,
+        }
+    }
+
     /// Creates a new `TranslatorConfig` instance with the specified upstream and downstream
     /// configurations and version constraints.
     #[allow(clippy::too_many_arguments)]
@@ -175,6 +198,7 @@ impl TranslatorConfig {
             // Programmatic construction takes the library default; the file-based path
             // sets it via serde, and callers can assign the field directly.
             max_past_jobs: None,
+            setup_connection_timeout_secs: None,
             downstream_address,
             downstream_port,
             max_supported_version,
@@ -593,6 +617,59 @@ mod tests {
         "#;
         let upstream: Upstream = toml::from_str(toml).unwrap();
         assert_eq!(upstream.user_identity, "");
+    }
+
+    /// Parses a minimal config file, with `extra` as additional top-level keys.
+    fn parse_config(extra: &str) -> TranslatorConfig {
+        let toml = format!(
+            r#"
+            {extra}
+            downstream_address = "0.0.0.0"
+            downstream_port = 34255
+            max_supported_version = 2
+            min_supported_version = 2
+            downstream_extranonce2_size = 8
+            aggregate_channels = false
+
+            [downstream_difficulty_config]
+            min_individual_miner_hashrate = 10000000.0
+            shares_per_minute = 6.0
+            enable_vardiff = false
+            job_keepalive_interval_secs = 60
+
+            [[upstreams]]
+            address = "127.0.0.1"
+            port = 3333
+            authority_pubkey = "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan"
+            user_identity = "user"
+            "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn setup_connection_timeout_defaults_when_absent() {
+        let config = parse_config("");
+        assert_eq!(config.setup_connection_timeout_secs, None);
+        assert_eq!(
+            config.setup_connection_timeout(),
+            DEFAULT_SETUP_CONNECTION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn setup_connection_timeout_uses_configured_value() {
+        let config = parse_config("setup_connection_timeout_secs = 3");
+        assert_eq!(config.setup_connection_timeout(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn setup_connection_timeout_zero_selects_the_default() {
+        let config = parse_config("setup_connection_timeout_secs = 0");
+        assert_eq!(
+            config.setup_connection_timeout(),
+            DEFAULT_SETUP_CONNECTION_TIMEOUT
+        );
     }
 
     #[test]
