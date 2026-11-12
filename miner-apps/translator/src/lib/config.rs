@@ -111,6 +111,12 @@ pub struct TranslatorConfig {
     monitoring_address: Option<SocketAddr>,
     #[serde(default)]
     monitoring_cache_refresh_secs: Option<u64>,
+    /// Whether SIGUSR1 makes the translator return the allocator's free heap memory to the OS
+    /// and log heap usage before and after. If memory drops, it was held free by the allocator;
+    /// if not, it is in use. Only glibc builds can release memory this way. When off, SIGUSR1
+    /// keeps its default action, which terminates the process.
+    #[serde(default)]
+    pub release_heap_on_sigusr1: bool,
     #[serde(default)]
     miner_telemetry: MinerTelemetryConfig,
     /// Seconds to drain SV1 downstreams for on SIGTERM/SIGINT before shutting down.
@@ -318,6 +324,7 @@ impl TranslatorConfig {
             log_file: None,
             monitoring_address,
             monitoring_cache_refresh_secs,
+            release_heap_on_sigusr1: false,
             miner_telemetry: MinerTelemetryConfig::default(),
             drain_seconds: 0,
             drain_send_reconnect: false,
@@ -727,34 +734,6 @@ mod tests {
         assert_eq!(upstream.user_identity, "");
     }
 
-    /// Parses a minimal config file, with `extra` as additional top-level keys.
-    fn parse_config(extra: &str) -> TranslatorConfig {
-        let toml = format!(
-            r#"
-            {extra}
-            downstream_address = "0.0.0.0"
-            downstream_port = 34255
-            max_supported_version = 2
-            min_supported_version = 2
-            downstream_extranonce2_size = 8
-            aggregate_channels = false
-
-            [downstream_difficulty_config]
-            min_individual_miner_hashrate = 10000000.0
-            shares_per_minute = 6.0
-            enable_vardiff = false
-            job_keepalive_interval_secs = 60
-
-            [[upstreams]]
-            address = "127.0.0.1"
-            port = 3333
-            authority_pubkey = "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan"
-            user_identity = "user"
-            "#
-        );
-        toml::from_str(&toml).unwrap()
-    }
-
     #[test]
     fn setup_connection_timeout_defaults_when_absent() {
         let config = parse_config("");
@@ -918,6 +897,39 @@ mod tests {
             Some(std::time::Duration::from_secs(120))
         );
         assert_eq!(held.hold_keepalive_interval(), None);
+    }
+
+    fn parse_config(extra: &str) -> TranslatorConfig {
+        let toml = format!(
+            r#"
+            {extra}
+            downstream_address = "0.0.0.0"
+            downstream_port = 34255
+            max_supported_version = 2
+            min_supported_version = 2
+            downstream_extranonce2_size = 8
+            aggregate_channels = false
+
+            [downstream_difficulty_config]
+            min_individual_miner_hashrate = 10000000.0
+            shares_per_minute = 6.0
+            enable_vardiff = false
+            job_keepalive_interval_secs = 60
+
+            [[upstreams]]
+            address = "127.0.0.1"
+            port = 3333
+            authority_pubkey = "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan"
+            user_identity = "user"
+            "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn heap_release_on_sigusr1_is_off_unless_enabled() {
+        assert!(!parse_config("").release_heap_on_sigusr1);
+        assert!(parse_config("release_heap_on_sigusr1 = true").release_heap_on_sigusr1);
     }
 }
 
