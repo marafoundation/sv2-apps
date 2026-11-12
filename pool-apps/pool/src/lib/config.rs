@@ -17,6 +17,7 @@ pub use jd_server_sv2::config::{JDSConfig, JDSPartialConfig};
 use stratum_apps::{
     config_helpers::{CoinbaseRewardScript, opt_path_from_toml},
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
+    payout::AllowedPayoutModes,
     stratum_core::bitcoin::{Amount, TxOut},
     tp_type::TemplateProviderType,
     utils::types::{SharesBatchSize, SharesPerMinute},
@@ -60,6 +61,9 @@ pub struct PoolConfig {
     /// `SetCustomMiningJob` retires the active job, so the rate is the client's, not this pool's.
     #[serde(default)]
     max_past_jobs: Option<usize>,
+    /// Which payout modes a `user_identity` may select; `pool_only` also binds the embedded JDS.
+    #[serde(default)]
+    payout_modes: AllowedPayoutModes,
 }
 
 impl PoolConfig {
@@ -94,6 +98,7 @@ impl PoolConfig {
             shares_per_minute,
             share_batch_size,
             max_past_jobs: None,
+            payout_modes: AllowedPayoutModes::default(),
             log_file: None,
             server_id,
             supported_extensions,
@@ -107,6 +112,16 @@ impl PoolConfig {
     /// Returns the coinbase output.
     pub fn coinbase_reward_script(&self) -> &CoinbaseRewardScript {
         &self.coinbase_reward_script
+    }
+
+    /// Returns which payout modes a `user_identity` may select.
+    pub fn payout_modes(&self) -> AllowedPayoutModes {
+        self.payout_modes
+    }
+
+    /// Sets which payout modes a `user_identity` may select.
+    pub fn set_payout_modes(&mut self, payout_modes: AllowedPayoutModes) {
+        self.payout_modes = payout_modes;
     }
 
     /// Returns Pool listenining address.
@@ -265,13 +280,17 @@ impl ConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stratum_apps::config_helpers::load_config;
+    use stratum_apps::config_helpers::{ConfigError, load_config};
 
     /// Writes a minimal pool config with `extra` spliced in, so each test varies exactly
     /// one thing, and loads it through the SAME loader the binary uses — not a bare
     /// `toml::from_str`. That way the test covers serde attributes, the env-override layer
     /// and the enum handling, rather than just the struct definition.
     fn load_with(extra: &str, name: &str) -> PoolConfig {
+        try_load_with(extra, name).expect("config loads")
+    }
+
+    fn try_load_with(extra: &str, name: &str) -> Result<PoolConfig, ConfigError> {
         let path = std::env::temp_dir().join(format!("pool-config-{name}.toml"));
         std::fs::write(
             &path,
@@ -293,8 +312,7 @@ address = "127.0.0.1:8442"
             ),
         )
         .expect("write temp config");
-        let cfg = load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"])
-            .expect("config loads");
+        let cfg = load_config(&path, "POOL_TEST_UNUSED", &[], &["template_provider_type"]);
         let _ = std::fs::remove_file(&path);
         cfg
     }
@@ -321,5 +339,28 @@ address = "127.0.0.1:8442"
         let mut cfg = load_with("", "setter");
         cfg.set_max_past_jobs(Some(50));
         assert_eq!(cfg.max_past_jobs(), Some(50));
+    }
+
+    #[test]
+    fn payout_modes_is_read_from_config() {
+        // Absent keeps upstream behaviour; a deployment opts in.
+        assert_eq!(
+            load_with("", "payout-absent").payout_modes(),
+            AllowedPayoutModes::Any
+        );
+        assert_eq!(
+            load_with("payout_modes = \"any\"", "payout-any").payout_modes(),
+            AllowedPayoutModes::Any
+        );
+        assert_eq!(
+            load_with("payout_modes = \"pool_only\"", "payout-pool-only").payout_modes(),
+            AllowedPayoutModes::PoolOnly
+        );
+    }
+
+    #[test]
+    fn payout_modes_rejects_unknown_values() {
+        // A typo must not silently fall back to the permissive default.
+        assert!(try_load_with("payout_modes = \"pool-only\"", "payout-typo").is_err());
     }
 }
