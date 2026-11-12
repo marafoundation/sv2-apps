@@ -2,7 +2,7 @@ name: Notify Monitoring API Update
 
 on:
   push:
-    branches: [main]
+    branches: [mara-0.9]
     paths:
       - 'stratum-apps/src/monitoring/openapi.json'
   workflow_dispatch:
@@ -13,6 +13,7 @@ on:
 
 jobs:
   create-issue:
+    if: github.repository == 'stratum-mining/sv2-apps'
     runs-on: ubuntu-latest
 
     steps:

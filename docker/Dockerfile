@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 ###
 # ---- Builder Stage ----
 ###
@@ -12,28 +13,14 @@ WORKDIR /app
 # to define what app will be built
 ARG APP
 
-### caching dependencies
+### workspace manifests
 
-# `cargo fetch` resolves the whole workspace, so every member manifest has to be
-# in place before the dependency layer can be built.
+# The workspace has to load before building, and integration-tests is the one
+# member that is not copied below, so its manifest is copied here. The cargo
+# registry and git dirs are cache mounts in the build step, which shadow
+# anything downloaded in an earlier layer, so dependencies are not fetched here.
 COPY Cargo.toml Cargo.lock ./
-
-COPY bitcoin-core-sv2/Cargo.toml bitcoin-core-sv2/Cargo.toml
-COPY bitcoin-core-sv2/src/lib.rs bitcoin-core-sv2/src/lib.rs
-
-COPY stratum-apps/Cargo.toml stratum-apps/Cargo.toml
-COPY stratum-apps/src/lib.rs stratum-apps/src/lib.rs
-
-COPY pool-apps/pool/Cargo.toml pool-apps/pool/Cargo.toml
-
-COPY pool-apps/jd-server/Cargo.toml pool-apps/jd-server/Cargo.toml
-
-COPY miner-apps/jd-client/Cargo.toml miner-apps/jd-client/Cargo.toml
-COPY miner-apps/translator/Cargo.toml miner-apps/translator/Cargo.toml
-
 COPY integration-tests/Cargo.toml integration-tests/Cargo.toml
-
-RUN echo "Fetching deps for ${APP}" && cargo fetch --locked
 
 
 ### copying source code
@@ -44,11 +31,19 @@ COPY bitcoin-core-sv2/ bitcoin-core-sv2/
 COPY stratum-apps/ stratum-apps/
 
 # build target app
-RUN echo "Building ${APP}" && \
+# The cache mounts keep the cargo download caches and the compiled target dir
+# warm across builds. The mounted target dir is not part of the image, so the
+# binary is copied out in the same step.
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target,target=/app/target \
+    echo "Building ${APP}" && \
     case "$APP" in \
-        pool_sv2|jd_client_sv2|translator_sv2) cargo build --release --locked -p "$APP" --target-dir ./ ;; \
+        pool_sv2|jd_client_sv2|translator_sv2) cargo build --release --locked -p "$APP" --target-dir /app/target ;; \
         *) echo "Unknown APP: $APP" && exit 1 ;; \
-    esac
+    esac && \
+    mkdir -p /app/release && \
+    cp "/app/target/release/${APP}" "/app/release/${APP}"
 
 ###
 # ---- Runtime Stage ----

@@ -3,37 +3,92 @@ name: Build and Push Docker Images
 on:
   push:
     branches:
-      - main
-
-  release:
-    types: [published]
+      - mara-0.9
+    tags:
+      # Only this fork's release tags. Plain upstream tags (v0.9.2) are mirrored
+      # into this repo for reference and must NOT trigger a build.
+      - 'v[0-9]+.[0-9]+.[0-9]+-mara.[0-9]+'
   workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REGISTRY: 047385673162.dkr.ecr.us-east-2.amazonaws.com
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        app: [pool_sv2, jd_client_sv2, translator_sv2]
+        include:
+          - app: pool_sv2
+            image: pool
+          - app: jd_client_sv2
+            image: jdc
+          - app: translator_sv2
+            image: tproxy
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: stratumv2
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Build and push multi-arch images
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tags
+        id: tags
+        env:
+          IMAGE: ${{ env.ECR_REGISTRY }}/${{ matrix.image }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # Version-tag pushes publish under the git ref name, and nothing else.
+            # The ECR repositories are tag-immutable, so a floating :latest could
+            # never be moved; deployments pin the version tag.
+            echo "tags=${IMAGE}:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            # Branch pushes and manual dispatch publish under the commit SHA.
+            echo "tags=${IMAGE}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Persist the cargo cache mounts (registry/git/compiled target dir) across
+      # runs so a source change recompiles only what changed. Keyed on the
+      # lockfile: the cache is reused until a dependency version changes.
+      # actions/cache is declared before the dance so its save (a post step) runs
+      # after the dance extracts the mounts back out.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache@v4
+        with:
+          path: cargo-cache
+          key: cargo-cache-${{ matrix.image }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-cache-${{ matrix.image }}-
+
+      - name: Inject cargo cache into Buildx
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "cargo-cache/registry": { "target": "/usr/local/cargo/registry", "id": "cargo-registry" },
+              "cargo-cache/git": { "target": "/usr/local/cargo/git", "id": "cargo-git" },
+              "cargo-cache/target": { "target": "/app/target", "id": "cargo-target" }
+            }
+          skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
+
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -41,11 +96,5 @@ jobs:
           file: docker/Dockerfile
           build-args: |
             APP=${{ matrix.app }}
-
-          platforms: |
-            linux/amd64
-            linux/arm64
-
-          tags: |
-            stratumv2/${{ matrix.app }}:${{ github.ref_name }}
-
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.tags }}
