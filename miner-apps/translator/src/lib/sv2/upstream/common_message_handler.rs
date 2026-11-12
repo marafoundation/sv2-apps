@@ -132,6 +132,8 @@ mod tests {
             address: "127.0.0.1:3333".parse().unwrap(),
             entry: upstream_entry(),
             protocol_reconnect: SharedLock::new(ProtocolReconnect::default()),
+            setup_connection_timeout: Duration::from_secs(10),
+            io_cancellation: CancellationToken::new(),
         }
     }
 
