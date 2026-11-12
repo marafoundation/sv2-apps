@@ -21,7 +21,7 @@ pub(crate) struct UpstreamStatus {
     fallbacks: AtomicU64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
 impl UpstreamStatus {
     fn new(addresses: Vec<String>) -> Self {
         Self {
@@ -90,7 +90,7 @@ impl UpstreamWalk {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(feature = "monitoring"), allow(dead_code))]
     pub(crate) fn status(&self) -> Arc<UpstreamStatus> {
         self.status.clone()
     }
