@@ -80,19 +80,18 @@ impl TaskManager {
     ///
     /// This method will block until all tasks that were spawned through this
     /// manager have finished executing. Tasks are awaited in completion order.
+    ///
+    /// If this future is dropped before completion, the tasks that have not finished
+    /// remain tracked.
     pub async fn join_all(&self) {
-        // `JoinSet::join_next` borrows mutably and is awaited, and a
-        // `std::sync::Mutex` guard must not be held across an `.await`. Move the set
-        // out under the lock, leaving an empty one behind, then drain it unlocked.
-        // Tasks spawned after this point land in the fresh set and are covered by a
-        // later `join_all` or `abort_all`.
-        let mut owned = {
-            let mut tasks = self.tasks.lock().unwrap();
-            std::mem::take(&mut *tasks)
-        };
-
-        // The lock is already released here, so reporting inline is safe.
-        while let Some(joined) = owned.join_next().await {
+        // Entries are joined in place, so cancelling this future (for example with a
+        // shutdown timeout) leaves the unfinished tasks in the set. A following
+        // `abort_all` and `join_all` then still reach and reap them. The lock is taken
+        // per poll and never held across an `.await`, so `spawn` is not blocked while
+        // waiting. Tasks spawned meanwhile are awaited as well.
+        while let Some(joined) =
+            std::future::poll_fn(|cx| self.tasks.lock().unwrap().poll_join_next(cx)).await
+        {
             if let Err(join_error) = joined {
                 if !join_error.is_cancelled() {
                     tracing::warn!(error = %join_error, "managed task terminated abnormally");
@@ -123,6 +122,21 @@ impl TaskManager {
 #[cfg(test)]
 mod tests {
     use super::TaskManager;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     /// `join_all` must release every tracked entry. This is exact rather than
     /// approximate: after draining, nothing may remain.
@@ -197,5 +211,45 @@ mod tests {
             0,
             "panicked task was not reaped"
         );
+    }
+
+    /// A `join_all` cancelled by a timeout must leave unfinished tasks tracked, so the
+    /// `abort_all` and `join_all` that follow it still reap them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_join_all_leaves_tasks_reachable() {
+        let task_manager = TaskManager::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let guard = SetOnDrop(dropped.clone());
+        task_manager.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), task_manager.join_all())
+            .await
+            .is_err();
+        assert!(
+            timed_out,
+            "join_all returned although a task is still running"
+        );
+        assert_eq!(
+            task_manager.tracked_len(),
+            1,
+            "cancelled join_all dropped the running task from the set"
+        );
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "cancelled join_all aborted the running task"
+        );
+
+        task_manager.abort_all().await;
+        task_manager.join_all().await;
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "abort_all and join_all did not reap the task"
+        );
+        assert_eq!(task_manager.tracked_len(), 0);
     }
 }
