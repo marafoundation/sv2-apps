@@ -22,7 +22,7 @@ use stratum_apps::{
             utils::{HexU32Be, VERSION_ROLLING_MASK},
         },
     },
-    utils::types::{ChannelId, DownstreamId},
+    utils::types::{ChannelId, DownstreamId, Hashrate},
 };
 
 use tracing::{debug, warn};
@@ -304,6 +304,22 @@ pub struct SubmitShareWithChannelId {
 /// Format: `{original_job_id}#{counter}`
 pub(crate) const KEEPALIVE_JOB_ID_DELIMITER: char = '#';
 
+/// Maximum keepalive nTime offset from the original upstream job.
+pub(crate) const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
+
+/// Difficulty below which `mining.set_difficulty` is not rounded to a power of two.
+pub(crate) const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
+
+/// A hashrate that can go out as a `nominal_hash_rate`: serializing a NaN, infinite or negative
+/// one is an error, which would drop the message carrying it.
+pub(crate) fn finite_hashrate(hashrate: Hashrate) -> Hashrate {
+    if hashrate.is_nan() {
+        0.0
+    } else {
+        hashrate.clamp(0.0, Hashrate::MAX)
+    }
+}
+
 /// Derives the SV1 worker name from the full `mining.authorize` username.
 pub(crate) fn sv1_worker_name_from_sv1_username(sv1_username: &str) -> &str {
     sv1_username
@@ -356,6 +372,16 @@ pub(crate) fn tlv_user_identity_from_sv1_worker_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nominal_hashrates_are_finite_and_not_negative() {
+        assert_eq!(finite_hashrate(1.5e12), 1.5e12);
+        assert_eq!(finite_hashrate(0.0), 0.0);
+        assert_eq!(finite_hashrate(Hashrate::NAN), 0.0);
+        assert_eq!(finite_hashrate(-1.0), 0.0);
+        assert_eq!(finite_hashrate(Hashrate::NEG_INFINITY), 0.0);
+        assert_eq!(finite_hashrate(Hashrate::INFINITY), Hashrate::MAX);
+    }
 
     #[test]
     fn derives_sv1_worker_name_from_first_dot() {
