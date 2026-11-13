@@ -3785,9 +3785,15 @@ async fn held_miner_is_reattached_to_the_next_pool(aggregate_channels: bool) {
 /// The miner is a raw-TCP one that mines its own shares: cpuminer, the device the other tests use,
 /// does not support `mining.set_extranonce`, and a pool with another prefix makes it reconnect,
 /// which is a new miner and no proof of a re-attach.
+///
+/// The SV1 share totals also keep counting across the fallback: a share accepted while pool A
+/// served the miner is still in `sv1_shares_accepted_total` after pool B has credited another.
 async fn held_miner_is_credited_by_the_next_pool(aggregate_channels: bool) {
-    use integration_tests_sv2::sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions};
-    use stratum_apps::stratum_core::bitcoin::Target;
+    use integration_tests_sv2::{
+        prometheus_metrics_assertions::MonitoringApi,
+        sv1_mock_miner::{Sv1MockMiner, Sv1MockMinerOptions},
+    };
+    use stratum_apps::stratum_core::{bitcoin::Target, channels_sv2::target::hash_rate_to_target};
 
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
@@ -3800,6 +3806,7 @@ async fn held_miner_is_credited_by_the_next_pool(aggregate_channels: bool) {
     let HoldingTranslator {
         translator,
         listen_addr: tproxy_addr,
+        monitoring_addr,
         ..
     } = start_holding_translator_with_hashrate(
         &[pool_a_addr, pool_b_sniffer_addr],
@@ -3821,8 +3828,23 @@ async fn held_miner_is_credited_by_the_next_pool(aggregate_channels: bool) {
     .await;
     let local_addr = miner.local_addr();
     let (first_extranonce, _) = miner.extranonce();
-    miner
+    let first_job = miner
         .wait_for_method("mining.notify", Duration::from_secs(60))
+        .await;
+
+    // A share mined for pool A is counted, and the count is still there once the miner has
+    // moved to pool B.
+    let api = MonitoringApi::builder(monitoring_addr).build();
+    let pool_a_target = hash_rate_to_target(1_000.0, 6.0).unwrap();
+    let response = miner
+        .submit_mined_share(
+            first_job[0].as_str().unwrap(),
+            pool_a_target,
+            Duration::from_secs(60),
+        )
+        .await;
+    assert_eq!(response["result"], serde_json::json!(true), "{response}");
+    api.poll_metric_gte("sv1_shares_accepted_total", 1.0, Duration::from_secs(30))
         .await;
 
     pool_a.shutdown().await;
@@ -3878,6 +3900,9 @@ async fn held_miner_is_credited_by_the_next_pool(aggregate_channels: bool) {
         )
         .await;
     assert!(!miner.is_closed());
+
+    api.poll_metric_gte("sv1_shares_accepted_total", 2.0, Duration::from_secs(30))
+        .await;
 
     shutdown_all!(translator, pool_b);
 }

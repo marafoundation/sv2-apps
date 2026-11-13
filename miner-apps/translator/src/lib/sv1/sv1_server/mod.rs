@@ -1426,6 +1426,8 @@ impl Sv1Server {
                 let response = submit
                     .clone()
                     .respond(SubmitOutcome::Rejected(SubmitError::JobNotFound));
+                #[cfg(feature = "monitoring")]
+                self.record_share_outcome(downstream_id, &response);
                 let downstream_sender = self
                     .with_registered_downstream(downstream_id, |downstream| {
                         Ok(downstream.downstream_io.downstream_sv1_sender.clone())
@@ -6470,6 +6472,12 @@ mod tests {
                 "a submit while held is not a protocol error"
             );
             assert_eq!(server.hold.rejected_shares.load(Ordering::Relaxed), 1);
+            #[cfg(feature = "monitoring")]
+            assert_eq!(
+                stratum_apps::monitoring::Sv1ClientsMonitoring::get_sv1_share_totals(&server)
+                    .rejected_job_not_found,
+                1
+            );
         }
     }
 
