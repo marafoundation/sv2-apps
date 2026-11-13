@@ -4,11 +4,14 @@
 //! tProxy has server channels (upstream to pool) but no SV2 clients
 //! (SV1 clients are handled separately by the SV1 monitoring module).
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use stratum_apps::monitoring::{
     server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
-    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring},
+    sv1::{Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring},
     upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring},
 };
 
@@ -111,6 +114,45 @@ impl UpstreamMonitoring for UpstreamStatus {
     /// balancer does not deregister it and cut the connections it is keeping open.
     fn is_connected(&self) -> bool {
         self.connected().is_some() || self.holding(std::time::Instant::now())
+    }
+}
+
+/// How many recent block-finding shares are kept for monitoring.
+const BLOCKS_FOUND_KEPT: usize = 32;
+
+/// The most recent shares that found a block, shared by every channel manager the process runs.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlocksFound(Arc<Mutex<BlocksFoundInner>>);
+
+#[derive(Debug, Default)]
+struct BlocksFoundInner {
+    recent: VecDeque<Sv1BlockFound>,
+    total: u64,
+}
+
+impl BlocksFound {
+    pub(crate) fn record(&self, block: Sv1BlockFound) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner.total = inner.total.saturating_add(1);
+        let blocks = &mut inner.recent;
+        if blocks.len() == BLOCKS_FOUND_KEPT {
+            blocks.pop_front();
+        }
+        blocks.push_back(block);
+    }
+
+    pub(crate) fn recent(&self) -> Vec<Sv1BlockFound> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recent
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).total
     }
 }
 
@@ -242,6 +284,10 @@ mod tests {
             TproxyMode::Aggregated,
             None,
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         )
     }
 
@@ -293,5 +339,28 @@ mod tests {
         assert_eq!(aggregated.shares_acknowledged, 2);
         assert_eq!(aggregated.acknowledged_work_sum, 10);
         assert_eq!(aggregated.validated_work_sum, 0.0);
+    }
+
+    #[test]
+    fn only_the_most_recent_blocks_found_are_kept() {
+        let blocks = BlocksFound::default();
+        for n in 0..BLOCKS_FOUND_KEPT as u64 + 5 {
+            blocks.record(Sv1BlockFound {
+                sv1_username: format!("acct.rig{n}"),
+                worker: format!("rig{n}"),
+                user_identity: String::new(),
+                share_hash: String::new(),
+                height: None,
+                found_at_unix_secs: n,
+            });
+        }
+        let recent = blocks.recent();
+        assert_eq!(blocks.total(), BLOCKS_FOUND_KEPT as u64 + 5);
+        assert_eq!(recent.len(), BLOCKS_FOUND_KEPT);
+        assert_eq!(recent[0].found_at_unix_secs, 5);
+        assert_eq!(
+            recent.last().unwrap().found_at_unix_secs,
+            BLOCKS_FOUND_KEPT as u64 + 4
+        );
     }
 }

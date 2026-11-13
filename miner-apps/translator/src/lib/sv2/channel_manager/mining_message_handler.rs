@@ -1507,6 +1507,10 @@ mod tests {
                 None,
                 #[cfg(feature = "monitoring")]
                 true,
+                #[cfg(feature = "monitoring")]
+                Default::default(),
+                #[cfg(feature = "monitoring")]
+                Default::default(),
             ),
             sv1_server_receiver_for_test,
         )
