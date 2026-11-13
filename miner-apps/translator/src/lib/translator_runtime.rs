@@ -1006,7 +1006,7 @@ mod tests {
         );
     }
 
-    fn running_runtime() -> TranslatorRuntime<Running> {
+    fn init_runtime() -> TranslatorRuntime<Init> {
         let config = TranslatorConfig::new(
             vec![],
             "127.0.0.1".into(),
@@ -1022,7 +1022,11 @@ mod tests {
             None,
             None,
         );
-        let runtime = TranslatorRuntime::<Init>::new(TranslatorSv2::new(config)).unwrap();
+        TranslatorRuntime::<Init>::new(TranslatorSv2::new(config)).unwrap()
+    }
+
+    fn running_runtime() -> TranslatorRuntime<Running> {
+        let runtime = init_runtime();
         TranslatorRuntime {
             tproxy_mode: runtime.tproxy_mode,
             fallback_coordinator: runtime.fallback_coordinator,
@@ -1060,5 +1064,93 @@ mod tests {
         assert!(runtime.cleanup_for_fallback().await.is_ok());
 
         assert_eq!(status.fallbacks(), 1);
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn every_channel_manager_reports_share_accounting_to_the_sv1_server() {
+        use stratum_apps::monitoring::Sv1BlockFound;
+
+        let ready = init_runtime().bootstrap_io().bootstrap_channel_manager();
+        let server = ready.sv1.server.clone();
+        let first = ready.state.channel_manager.clone();
+        let runtime = TranslatorRuntime {
+            tproxy_mode: ready.tproxy_mode,
+            fallback_coordinator: ready.fallback_coordinator,
+            task_manager: ready.task_manager,
+            translator: ready.translator,
+            upstreams: ready.upstreams,
+            protocol_reconnect: ready.protocol_reconnect,
+            listen_addr: ready.listen_addr,
+            sv1: ready.sv1,
+            state: Running,
+        };
+
+        let Ok(second) = runtime.cleanup_for_fallback().await else {
+            panic!("the fallback should succeed");
+        };
+        let second = &second.state.channel_manager;
+
+        assert!(Arc::ptr_eq(&first.share_drops, &server.share_drops));
+        assert!(Arc::ptr_eq(&second.share_drops, &server.share_drops));
+        second.blocks_found.record(Sv1BlockFound {
+            sv1_username: "acct.rig".into(),
+            worker: "rig".into(),
+            user_identity: "pool.rig".into(),
+            share_hash: "hash".into(),
+            height: None,
+            found_at_unix_secs: 1,
+        });
+        assert_eq!(server.blocks_found.total(), 1);
+        assert_eq!(first.blocks_found.total(), 1);
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn monitoring_reads_share_accounting_through_the_current_generation() {
+        use crate::monitoring::CurrentGeneration;
+        use stratum_apps::monitoring::{
+            Sv1BlockFound, Sv1ClientsMonitoring, Sv1ShareDropReason, Sv1ShareRejection,
+        };
+
+        let sv1 = sv1_side(false, false);
+        let current = CurrentGeneration::default();
+        assert_eq!(current.get_sv1_blocks_found_total(), 0);
+        current.set_sv1_server(sv1.server.clone());
+
+        {
+            let mut totals = sv1.server.share_totals.lock().unwrap();
+            totals.record(None);
+            totals.record(None);
+            totals.record(Some(Sv1ShareRejection::Duplicate));
+        }
+        {
+            let mut drops = sv1.server.share_drops.lock().unwrap();
+            drops.record(None);
+            drops.record(Some(Sv1ShareDropReason::UpstreamGone));
+        }
+        sv1.server.blocks_found.record(Sv1BlockFound {
+            sv1_username: "acct.rig".into(),
+            worker: "rig".into(),
+            user_identity: "pool.rig".into(),
+            share_hash: "hash".into(),
+            height: Some(7),
+            found_at_unix_secs: 1,
+        });
+
+        let totals = current.get_sv1_share_totals();
+        assert_eq!(totals.accepted, 2);
+        assert_eq!(totals.rejected_duplicate, 1);
+        let drops = current.get_sv1_share_drops();
+        assert_eq!(drops.below_upstream_target, 1);
+        assert_eq!(drops.dropped(Sv1ShareDropReason::UpstreamGone), 1);
+        let blocks = current.get_sv1_blocks_found();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].share_hash, "hash");
+        assert_eq!(current.get_sv1_blocks_found_total(), 1);
+
+        let summary = current.get_sv1_clients_summary();
+        assert_eq!(summary.shares, totals);
+        assert_eq!(summary.dropped, drops);
     }
 }
