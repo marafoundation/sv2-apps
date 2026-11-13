@@ -4,9 +4,181 @@
 //! tProxy has server channels (upstream to pool) but no SV2 clients
 //! (SV1 clients are handled separately by the SV1 monitoring module).
 
-use stratum_apps::monitoring::server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, RwLock},
+};
 
-use crate::{TproxyMode, sv2::ChannelManager, utils::AGGREGATED_CHANNEL_ID};
+use stratum_apps::monitoring::{
+    server::{ServerExtendedChannelInfo, ServerInfo, ServerMonitoring},
+    sv1::{Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDrops},
+    upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring},
+};
+
+use crate::{
+    TproxyMode, sv1::Sv1Server, sv2::ChannelManager, upstream_walk::UpstreamStatus,
+    utils::AGGREGATED_CHANNEL_ID,
+};
+
+/// What monitoring reports on: the long-lived [`Sv1Server`] and the [`ChannelManager`] of the
+/// upstream generation currently serving miners.
+///
+/// The channel manager is rebuilt on every fallback while the monitoring server keeps running.
+/// Between a fallback and the next upstream connection there is none, and no server channels
+/// are reported.
+#[derive(Default)]
+pub(crate) struct CurrentGeneration {
+    channel_manager: RwLock<Option<Arc<ChannelManager>>>,
+    sv1_server: RwLock<Option<Arc<Sv1Server>>>,
+}
+
+impl CurrentGeneration {
+    pub(crate) fn set_sv1_server(&self, sv1_server: Arc<Sv1Server>) {
+        *self.sv1_server.write().unwrap_or_else(|e| e.into_inner()) = Some(sv1_server);
+    }
+
+    pub(crate) fn set_channel_manager(&self, channel_manager: Arc<ChannelManager>) {
+        *self
+            .channel_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(channel_manager);
+    }
+
+    pub(crate) fn clear_channel_manager(&self) {
+        *self
+            .channel_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn channel_manager(&self) -> Option<Arc<ChannelManager>> {
+        self.channel_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn sv1_server(&self) -> Option<Arc<Sv1Server>> {
+        self.sv1_server
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl ServerMonitoring for CurrentGeneration {
+    fn get_server(&self) -> ServerInfo {
+        match self.channel_manager() {
+            Some(channel_manager) => channel_manager.get_server(),
+            None => ServerInfo {
+                extended_channels: vec![],
+                standard_channels: vec![],
+                // the translator builds no coinbase
+                coinbase_outputs: vec![],
+            },
+        }
+    }
+}
+
+impl Sv1ClientsMonitoring for CurrentGeneration {
+    fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_clients())
+            .unwrap_or_default()
+    }
+
+    fn get_sv1_client_by_id(&self, client_id: usize) -> Option<Sv1ClientInfo> {
+        self.sv1_server()
+            .and_then(|sv1_server| sv1_server.get_sv1_client_by_id(client_id))
+    }
+
+    fn get_sv1_share_totals(&self) -> Sv1ShareCounts {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_share_totals())
+            .unwrap_or_default()
+    }
+
+    fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_share_drops())
+            .unwrap_or_default()
+    }
+
+    fn get_sv1_blocks_found(&self) -> Vec<Sv1BlockFound> {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_blocks_found())
+            .unwrap_or_default()
+    }
+
+    fn get_sv1_blocks_found_total(&self) -> u64 {
+        self.sv1_server()
+            .map(|sv1_server| sv1_server.get_sv1_blocks_found_total())
+            .unwrap_or_default()
+    }
+}
+
+impl UpstreamMonitoring for UpstreamStatus {
+    fn get_upstream_info(&self) -> UpstreamInfo {
+        let connected = self.connected();
+        UpstreamInfo {
+            upstreams: self
+                .addresses()
+                .iter()
+                .enumerate()
+                .map(|(index, address)| UpstreamEndpointInfo {
+                    address: address.clone(),
+                    connected: connected == Some(index),
+                })
+                .collect(),
+            fallbacks: self.fallbacks(),
+        }
+    }
+
+    /// Reports a translator holding its miners within the hold window as connected, so a load
+    /// balancer does not deregister it and cut the connections it is keeping open.
+    fn is_connected(&self) -> bool {
+        self.connected().is_some() || self.holding(std::time::Instant::now())
+    }
+}
+
+/// How many recent block-finding shares are kept for monitoring.
+const BLOCKS_FOUND_KEPT: usize = 32;
+
+/// The most recent shares that found a block, shared by every channel manager the process runs.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlocksFound(Arc<Mutex<BlocksFoundInner>>);
+
+#[derive(Debug, Default)]
+struct BlocksFoundInner {
+    recent: VecDeque<Sv1BlockFound>,
+    total: u64,
+}
+
+impl BlocksFound {
+    pub(crate) fn record(&self, block: Sv1BlockFound) {
+        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        inner.total = inner.total.saturating_add(1);
+        let blocks = &mut inner.recent;
+        if blocks.len() == BLOCKS_FOUND_KEPT {
+            blocks.pop_front();
+        }
+        blocks.push_back(block);
+    }
+
+    pub(crate) fn recent(&self) -> Vec<Sv1BlockFound> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recent
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).total
+    }
+}
 
 impl ServerMonitoring for ChannelManager {
     fn get_server(&self) -> ServerInfo {
@@ -136,6 +308,10 @@ mod tests {
             TproxyMode::Aggregated,
             None,
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         )
     }
 
@@ -187,5 +363,28 @@ mod tests {
         assert_eq!(aggregated.shares_acknowledged, 2);
         assert_eq!(aggregated.acknowledged_work_sum, 10);
         assert_eq!(aggregated.validated_work_sum, 0.0);
+    }
+
+    #[test]
+    fn only_the_most_recent_blocks_found_are_kept() {
+        let blocks = BlocksFound::default();
+        for n in 0..BLOCKS_FOUND_KEPT as u64 + 5 {
+            blocks.record(Sv1BlockFound {
+                sv1_username: format!("acct.rig{n}"),
+                worker: format!("rig{n}"),
+                user_identity: String::new(),
+                share_hash: String::new(),
+                height: None,
+                found_at_unix_secs: n,
+            });
+        }
+        let recent = blocks.recent();
+        assert_eq!(blocks.total(), BLOCKS_FOUND_KEPT as u64 + 5);
+        assert_eq!(recent.len(), BLOCKS_FOUND_KEPT);
+        assert_eq!(recent[0].found_at_unix_secs, 5);
+        assert_eq!(
+            recent.last().unwrap().found_at_unix_secs,
+            BLOCKS_FOUND_KEPT as u64 + 4
+        );
     }
 }

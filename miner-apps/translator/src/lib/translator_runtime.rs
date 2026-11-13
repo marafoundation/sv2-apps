@@ -18,29 +18,42 @@ use stratum_apps::{
     task_manager::TaskManager,
     utils::types::{GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, InboundFrame, OutboundFrame},
 };
-use tracing::{debug, error, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 use crate::{
     TranslatorSv2,
     error::{TproxyError, TproxyErrorKind},
-    sv1::Sv1Server,
-    sv2::{ChannelManager, ProtocolReconnect, Upstream},
-    utils::{ReconnectRequest, TproxyMode, UpstreamEntry},
+    sv1::{GenerationEvent, Sv1Server},
+    sv2::{ChannelManager, ProtocolReconnect, Upstream, UpstreamConnectOptions},
+    upstream_walk::UpstreamWalk,
+    utils::{ReconnectRequest, ShareOrigin, TproxyMode, UpstreamEntry},
 };
 
+/// Channels between the [`ChannelManager`] and the [`Upstream`] of one upstream generation.
 struct Io {
     channel_manager_to_upstream_sender: Sender<OutboundFrame>,
     channel_manager_to_upstream_receiver: Receiver<OutboundFrame>,
     upstream_to_channel_manager_sender: Sender<InboundFrame>,
     upstream_to_channel_manager_receiver: Receiver<InboundFrame>,
+}
+
+/// The SV1 server and its channels to the channel manager, which outlive upstream generations:
+/// every [`ChannelManager`] is built on the same pair of channels, and the server learns about
+/// generation boundaries through `generation_events`.
+struct Sv1Side {
+    server: Arc<Sv1Server>,
     channel_manager_to_sv1_server_sender: Sender<MiningOwned>,
-    channel_manager_to_sv1_server_receiver: Receiver<MiningOwned>,
-    sv1_server_to_channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
-    sv1_server_to_channel_manager_receiver: Receiver<(MiningOwned, Option<String>)>,
+    sv1_server_to_channel_manager_receiver: Receiver<(MiningOwned, Option<ShareOrigin>)>,
+    generation_events: Sender<GenerationEvent>,
+    started: bool,
 }
 
 /// Connection attempts made to an upstream before moving on.
 const MAX_UPSTREAM_RETRIES: usize = 3;
+
+/// Longest pause between upstream walks while miners are held.
+const MAX_WALK_PAUSE: Duration = Duration::from_secs(16);
 
 /// The core coordinator of the Translator runtime, parameterized by its current bootstrap `State`.
 ///
@@ -51,9 +64,10 @@ pub(super) struct TranslatorRuntime<State> {
     fallback_coordinator: FallbackCoordinator,
     task_manager: Arc<TaskManager>,
     translator: TranslatorSv2,
-    upstream_addresses: Vec<UpstreamEntry>,
+    upstreams: UpstreamWalk,
     protocol_reconnect: SharedLock<ProtocolReconnect>,
     listen_addr: SocketAddr,
+    sv1: Sv1Side,
     state: State,
 }
 
@@ -63,19 +77,12 @@ struct IoReady {
     io: Io,
 }
 
-struct ChannelManagerReady {
+pub(super) struct ChannelManagerReady {
     io: Io,
     channel_manager: Arc<ChannelManager>,
-}
-
-pub(super) struct Sv1ServerReady {
-    io: Io,
-    channel_manager: Arc<ChannelManager>,
-    sv1_server: Arc<Sv1Server>,
 }
 
 pub(super) struct UpstreamReady {
-    sv1_server: Arc<Sv1Server>,
     channel_manager: Arc<ChannelManager>,
 }
 
@@ -111,9 +118,10 @@ impl<State> TranslatorRuntime<State> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: Failed,
         }
     }
@@ -154,6 +162,32 @@ impl<State> TranslatorRuntime<State> {
         info!("TranslatorSv2 shutdown complete.");
     }
 
+    /// Asks every held miner to reconnect, spread over the drain window, and waits for them to
+    /// leave. Called before shutting down because no upstream connected within the hold window.
+    pub(super) async fn release_held_miners(&self) {
+        let was_holding = self.upstreams.holding_until().is_some();
+        self.upstreams.stop_holding();
+        if !was_holding || !self.sv1.started {
+            return;
+        }
+        let _ = self
+            .sv1
+            .generation_events
+            .try_send(GenerationEvent::Released);
+        let wait = self.translator.config.drain_window() + Duration::from_secs(2);
+        let server = self.sv1.server.clone();
+        if tokio::time::timeout(wait, async move {
+            while !server.downstreams.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            warn!("Held miners did not all leave within {wait:?}");
+        }
+    }
+
     fn payout_mode(&self, user_identity: &str) -> Result<Option<PayoutMode>, TproxyErrorKind> {
         let expected_payout_distribution = self
             .translator
@@ -174,6 +208,63 @@ impl<State> TranslatorRuntime<State> {
     }
 }
 
+/// `pause` scaled by a random factor in [0.8, 1.2), so translators that lost the same upstream
+/// do not retry in lockstep.
+fn jittered(pause: Duration) -> Duration {
+    let unit = (std::hash::BuildHasher::hash_one(
+        &std::collections::hash_map::RandomState::new(),
+        Instant::now(),
+    ) >> 11) as f64
+        / (1u64 << 53) as f64;
+    pause.mul_f64(0.8 + 0.4 * unit)
+}
+
+/// How long a fallback waits for the SV1 server to acknowledge [`GenerationEvent::Ended`].
+const GENERATION_END_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether the SV1 server acknowledged [`GenerationEvent::Ended`] within `within`. An event
+/// dropped unhandled, because the server is gone, is not an acknowledgement.
+async fn generation_end_acknowledged(
+    drained: tokio::sync::oneshot::Receiver<()>,
+    within: Duration,
+) -> bool {
+    matches!(tokio::time::timeout(within, drained).await, Ok(Ok(())))
+}
+
+/// Ends the upstream generation for the SV1 server and waits until it has acknowledged that
+/// nothing of the generation is left queued for the next channel manager.
+///
+/// Fails with [`TproxyErrorKind::GenerationEndUnacknowledged`] when the server does not answer
+/// in time, since the next channel manager would otherwise act on messages meant for the old
+/// one, and with [`TproxyErrorKind::CouldNotInitiateSystem`] when shutdown comes first.
+async fn await_generation_end(
+    sv1: &Sv1Side,
+    shutdown: &CancellationToken,
+) -> Result<(), TproxyErrorKind> {
+    let (drained, drained_receiver) = tokio::sync::oneshot::channel();
+    let _ = sv1.generation_events.try_send(GenerationEvent::Ended {
+        drained: Some(drained),
+    });
+    if !sv1.started {
+        return Ok(());
+    }
+    tokio::select! {
+        acknowledged = generation_end_acknowledged(
+            drained_receiver,
+            GENERATION_END_ACK_TIMEOUT,
+        ) => {
+            if acknowledged {
+                Ok(())
+            } else {
+                error!("SV1 server did not acknowledge the end of the upstream generation");
+                Err(TproxyErrorKind::GenerationEndUnacknowledged)
+            }
+        }
+        // The SV1 server stops without handling `Ended`, and no channel manager follows.
+        _ = shutdown.cancelled() => Err(TproxyErrorKind::CouldNotInitiateSystem),
+    }
+}
+
 impl TranslatorRuntime<Init> {
     pub(super) fn new(translator: TranslatorSv2) -> Result<Self, TproxyErrorKind> {
         let tproxy_mode = TproxyMode::from(translator.config.aggregate_channels);
@@ -186,7 +277,7 @@ impl TranslatorRuntime<Init> {
 
         let listen_addr = SocketAddr::new(downstream_addr_ip, translator.config.downstream_port);
 
-        let upstream_addresses = translator
+        let upstream_entries = translator
             .config
             .upstreams
             .iter()
@@ -194,19 +285,52 @@ impl TranslatorRuntime<Init> {
                 host: u.address.clone(),
                 port: u.port,
                 authority_pubkey: u.authority_pubkey,
-                tried_or_flagged: false,
                 user_identity: u.user_identity.clone(),
             })
             .collect();
+        let upstreams = UpstreamWalk::new(
+            upstream_entries,
+            translator.config.max_fallbacks,
+            translator.config.fallback_window(),
+        );
+
+        let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
+            unbounded();
+        let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
+            unbounded();
+        let (generation_events, generation_events_receiver) = unbounded();
+        let server = Arc::new(
+            Sv1Server::new(
+                listen_addr,
+                channel_manager_to_sv1_server_receiver,
+                sv1_server_to_channel_manager_sender,
+                translator.config.clone(),
+                tproxy_mode,
+            )
+            .with_generation_control(
+                generation_events_receiver,
+                sv1_server_to_channel_manager_receiver.clone(),
+            ),
+        );
+        let _ = translator.sv1_server.set(server.clone());
+        #[cfg(feature = "monitoring")]
+        translator.current_generation.set_sv1_server(server.clone());
 
         Ok(TranslatorRuntime {
             tproxy_mode,
             fallback_coordinator: FallbackCoordinator::new(),
             task_manager: Arc::new(TaskManager::new()),
             translator,
-            upstream_addresses,
+            upstreams,
             protocol_reconnect: SharedLock::new(ProtocolReconnect::default()),
             listen_addr,
+            sv1: Sv1Side {
+                server,
+                channel_manager_to_sv1_server_sender,
+                sv1_server_to_channel_manager_receiver,
+                generation_events,
+                started: false,
+            },
             state: Init,
         })
     }
@@ -219,7 +343,11 @@ impl TranslatorRuntime<Init> {
     pub(super) async fn bootstrap(self) -> Result<TranslatorRuntime<Running>, BootstrapError> {
         let runtime = self.bootstrap_io();
         let runtime = runtime.bootstrap_channel_manager();
-        let runtime = runtime.bootstrap_sv1_server();
+        #[cfg(feature = "monitoring")]
+        if let Err(e) = runtime.start_monitoring_server() {
+            error!("Failed to initialize monitoring server: {e}");
+            return Err(BootstrapError::from((e, runtime)));
+        }
         let runtime = runtime.try_upstream().await?;
         runtime.start_services().await
     }
@@ -229,29 +357,22 @@ impl TranslatorRuntime<Init> {
             unbounded();
         let (upstream_to_channel_manager_sender, upstream_to_channel_manager_receiver) =
             unbounded();
-        let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
-            unbounded();
-        let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
-            unbounded();
 
         TranslatorRuntime {
             tproxy_mode: self.tproxy_mode,
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: IoReady {
                 io: Io {
                     channel_manager_to_upstream_sender,
                     channel_manager_to_upstream_receiver,
                     upstream_to_channel_manager_sender,
                     upstream_to_channel_manager_receiver,
-                    channel_manager_to_sv1_server_sender,
-                    channel_manager_to_sv1_server_receiver,
-                    sv1_server_to_channel_manager_sender,
-                    sv1_server_to_channel_manager_receiver,
                 },
             },
         }
@@ -263,8 +384,8 @@ impl TranslatorRuntime<IoReady> {
         let channel_manager = Arc::new(ChannelManager::new(
             self.state.io.channel_manager_to_upstream_sender.clone(),
             self.state.io.upstream_to_channel_manager_receiver.clone(),
-            self.state.io.channel_manager_to_sv1_server_sender.clone(),
-            self.state.io.sv1_server_to_channel_manager_receiver.clone(),
+            self.sv1.channel_manager_to_sv1_server_sender.clone(),
+            self.sv1.sv1_server_to_channel_manager_receiver.clone(),
             self.translator.config.supported_extensions.clone(),
             self.translator.config.required_extensions.clone(),
             self.tproxy_mode,
@@ -274,6 +395,10 @@ impl TranslatorRuntime<IoReady> {
                 .config
                 .downstream_difficulty_config
                 .enable_vardiff,
+            #[cfg(feature = "monitoring")]
+            self.sv1.server.share_drops.clone(),
+            #[cfg(feature = "monitoring")]
+            self.sv1.server.blocks_found.clone(),
         ));
 
         TranslatorRuntime {
@@ -281,9 +406,10 @@ impl TranslatorRuntime<IoReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: ChannelManagerReady {
                 io: self.state.io,
                 channel_manager,
@@ -293,33 +419,6 @@ impl TranslatorRuntime<IoReady> {
 }
 
 impl TranslatorRuntime<ChannelManagerReady> {
-    fn bootstrap_sv1_server(self) -> TranslatorRuntime<Sv1ServerReady> {
-        let sv1_server = Arc::new(Sv1Server::new(
-            self.listen_addr,
-            self.state.io.channel_manager_to_sv1_server_receiver.clone(),
-            self.state.io.sv1_server_to_channel_manager_sender.clone(),
-            self.translator.config.clone(),
-            self.tproxy_mode,
-        ));
-
-        TranslatorRuntime {
-            tproxy_mode: self.tproxy_mode,
-            fallback_coordinator: self.fallback_coordinator,
-            task_manager: self.task_manager,
-            translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
-            protocol_reconnect: self.protocol_reconnect,
-            listen_addr: self.listen_addr,
-            state: Sv1ServerReady {
-                io: self.state.io,
-                channel_manager: self.state.channel_manager,
-                sv1_server,
-            },
-        }
-    }
-}
-
-impl TranslatorRuntime<Sv1ServerReady> {
     pub(super) async fn try_upstream(
         mut self,
     ) -> Result<TranslatorRuntime<UpstreamReady>, BootstrapError> {
@@ -336,13 +435,16 @@ impl TranslatorRuntime<Sv1ServerReady> {
     /// so it can only be another server of the same pool. It is tried on its own and does not join
     /// the configured list.
     pub(super) async fn try_reconnect(
-        self,
+        mut self,
         request: ReconnectRequest,
     ) -> Result<TranslatorRuntime<UpstreamReady>, BootstrapError> {
         let upstream = request.into_upstream();
         info!("Reconnecting to {}:{}", upstream.host, upstream.port);
         match self.connect_with_retries(&upstream).await {
-            Ok(true) => Ok(self.into_upstream_ready()),
+            Ok(true) => {
+                self.upstreams.mark_reconnected();
+                Ok(self.into_upstream_ready())
+            }
             Ok(false) => {
                 warn!(
                     "Could not reconnect to {}:{}; trying the configured upstreams",
@@ -360,51 +462,46 @@ impl TranslatorRuntime<Sv1ServerReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: UpstreamReady {
-                sv1_server: self.state.sv1_server,
                 channel_manager: self.state.channel_manager,
             },
         }
     }
 
-    /// Initializes the upstream connection list, handling retries, fallbacks, and flagging.
+    /// Walks the configured upstreams until one accepts the connection.
     ///
-    /// Upstreams are tried sequentially, each receiving a fixed number of retries before we
-    /// advance to the next entry. This ensures we exhaust every healthy upstream before shutting
-    /// the translator down.
+    /// Each entry gets [`MAX_UPSTREAM_RETRIES`] attempts before the walk moves on. See
+    /// [`UpstreamWalk`] for the order entries are visited in. Returns
+    /// [`TproxyErrorKind::CouldNotInitiateSystem`] once every entry has been tried in this walk.
     ///
-    /// The `tried_or_flagged` flag in the `UpstreamEntry` acts as the upstream's state machine:
-    ///  `false` means "never tried", while `true` means "already connected or marked as
-    /// malicious". Once an upstream is flagged we skip it on future loops
-    /// to avoid hammering known-bad endpoints during failover.
+    /// While miners are held after a fallback, walks repeat with a growing pause (1 s doubling to
+    /// [`MAX_WALK_PAUSE`], with jitter) until one connects or the hold window would end before
+    /// the next walk.
     async fn initialize_upstream(&mut self) -> Result<(), TproxyErrorKind> {
-        let upstream_len = self.upstream_addresses.len();
-
-        for i in 0..upstream_len {
-            if self.upstream_addresses[i].tried_or_flagged {
-                debug!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
-                );
-                continue;
-            }
-
-            info!(
-                "Trying upstream {} of {}: {}:{}",
-                i + 1,
-                upstream_len,
-                self.upstream_addresses[i].host,
-                self.upstream_addresses[i].port
-            );
-
-            let upstream = self.upstream_addresses[i].clone();
-            let connected = self.connect_with_retries(&upstream).await?;
-            self.upstream_addresses[i].tried_or_flagged = true;
-            if connected {
+        let mut pause = Duration::from_secs(1);
+        loop {
+            if self.walk_upstreams().await? {
                 return Ok(());
             }
+            let Some(until) = self.upstreams.holding_until() else {
+                break;
+            };
+            let delay = jittered(pause);
+            if Instant::now() + delay >= until {
+                break;
+            }
+            warn!("No upstream accepted the connection; holding miners, next attempt in {delay:?}");
+            tokio::select! {
+                _ = self.translator.cancellation_token.cancelled() => {
+                    return Err(TproxyErrorKind::CouldNotInitiateSystem);
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            pause = (pause * 2).min(MAX_WALK_PAUSE);
         }
 
         tracing::error!(
@@ -412,6 +509,29 @@ impl TranslatorRuntime<Sv1ServerReady> {
             MAX_UPSTREAM_RETRIES
         );
         Err(TproxyErrorKind::CouldNotInitiateSystem)
+    }
+
+    /// One walk over the configured upstreams. Returns whether one connected.
+    async fn walk_upstreams(&mut self) -> Result<bool, TproxyErrorKind> {
+        let upstream_len = self.upstreams.len();
+
+        for i in self.upstreams.order() {
+            let upstream = self.upstreams.entry(i).clone();
+            info!(
+                "Trying upstream {} of {}: {}:{}",
+                i + 1,
+                upstream_len,
+                upstream.host,
+                upstream.port
+            );
+
+            if self.connect_with_retries(&upstream).await? {
+                self.upstreams.mark_connected(i);
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Tries `upstream` up to [`MAX_UPSTREAM_RETRIES`] times and, once connected, configures the
@@ -434,7 +554,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
                     self.state
                         .channel_manager
                         .set_expected_payout_distribution(payout_mode);
-                    self.state.sv1_server.set_user_identity(user_identity);
+                    self.sv1.server.set_user_identity(user_identity);
                     return Ok(true);
                 }
                 Err(e) => {
@@ -472,6 +592,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
             self.task_manager.clone(),
             self.translator.config.required_extensions.clone(),
             self.protocol_reconnect.clone(),
+            UpstreamConnectOptions::from(&self.translator.config),
         )
         .await?;
 
@@ -489,22 +610,35 @@ impl TranslatorRuntime<Sv1ServerReady> {
 impl TranslatorRuntime<UpstreamReady> {
     /// Activates the background execution loops of the SV1 server, [`ChannelManager`], and
     /// monitoring server, transitioning the runtime to [`Running`].
-    pub(super) async fn start_services(self) -> Result<TranslatorRuntime<Running>, BootstrapError> {
-        info!("Launching SV1 server...");
-        if let Err(e) = self
-            .state
-            .sv1_server
-            .clone()
-            .start(
-                self.translator.cancellation_token.clone(),
-                self.fallback_coordinator.clone(),
-                self.task_manager.clone(),
-            )
-            .await
-        {
-            error!("SV1 server startup failed: {e:?}");
-            return Err(BootstrapError::from((e.kind, self)));
+    pub(super) async fn start_services(
+        mut self,
+    ) -> Result<TranslatorRuntime<Running>, BootstrapError> {
+        if !self.sv1.started {
+            info!("Launching SV1 server...");
+            if let Err(e) = self
+                .sv1
+                .server
+                .clone()
+                .start_with_drain(
+                    self.translator.cancellation_token.clone(),
+                    self.translator.drain_token.clone(),
+                    self.task_manager.clone(),
+                )
+                .await
+            {
+                error!("SV1 server startup failed: {e:?}");
+                return Err(BootstrapError::from((e.kind, self)));
+            }
+            self.sv1.started = true;
         }
+
+        // Queued ahead of anything the new channel manager sends the SV1 server.
+        let _ = self
+            .sv1
+            .generation_events
+            .try_send(GenerationEvent::Connected {
+                fallback_token: self.fallback_coordinator.token(),
+            });
 
         info!("Launching ChannelManager tasks...");
         ChannelManager::run_channel_manager_tasks(
@@ -516,11 +650,12 @@ impl TranslatorRuntime<UpstreamReady> {
         .await;
 
         #[cfg(feature = "monitoring")]
-        if let Some(monitoring_addr) = self.translator.config.monitoring_address() {
-            info!("Initializing monitoring server on http://{monitoring_addr}");
-            if let Err(e) = self.start_monitoring_tasks(monitoring_addr) {
-                error!("Failed to initialize monitoring tasks: {e}");
-                return Err(BootstrapError::from((e, self)));
+        {
+            self.translator
+                .current_generation
+                .set_channel_manager(self.state.channel_manager.clone());
+            if self.translator.config.monitoring_address().is_some() {
+                self.start_miner_telemetry();
             }
         }
 
@@ -529,63 +664,22 @@ impl TranslatorRuntime<UpstreamReady> {
             fallback_coordinator: self.fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: Running,
         })
     }
 
+    /// Runs the SV1 miner telemetry loop for this upstream generation.
     #[cfg(feature = "monitoring")]
-    fn start_monitoring_tasks(&self, monitoring_addr: SocketAddr) -> Result<(), TproxyErrorKind> {
-        let refresh_interval = Duration::from_secs(
-            self.translator
-                .config
-                .monitoring_cache_refresh_secs()
-                .unwrap_or(15),
-        );
-
-        let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
-            monitoring_addr,
-            Some(self.state.channel_manager.clone()),
-            None,
-            refresh_interval,
-        )
-        .map_err(|e| {
-            TproxyErrorKind::General(format!("failed to initialize monitoring server: {e}"))
-        })?
-        .with_sv1_monitoring(self.state.sv1_server.clone())
-        .map_err(|e| TproxyErrorKind::General(format!("failed to add SV1 monitoring: {e}")))?;
-
-        let cancellation_token_clone = self.translator.cancellation_token.clone();
-        let fallback_coordinator_token = self.fallback_coordinator.token();
-        let shutdown_signal = async move {
-            tokio::select! {
-                _ = cancellation_token_clone.cancelled() => {
-                    info!("Monitoring server: received shutdown signal.");
-                }
-                _ = fallback_coordinator_token.cancelled() => {
-                    info!("Monitoring server: fallback triggered.");
-                }
-            }
-        };
-
-        self.task_manager.spawn(self.fallback_coordinator.track({
-            let cancellation_token = self.translator.cancellation_token.clone();
-            async move {
-                if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                    error!("Monitoring server error: {:?}", e);
-                    cancellation_token.cancel();
-                }
-
-                info!("Monitoring server task exited");
-            }
-        }));
-
+    fn start_miner_telemetry(&self) {
+        let refresh_interval = self.monitoring_refresh_interval();
         self.task_manager.spawn(self.fallback_coordinator.track({
             let cancellation_token = self.translator.cancellation_token.clone();
             let fallback_token = self.fallback_coordinator.token();
-            let sv1_server = self.state.sv1_server.clone();
+            let sv1_server = self.sv1.server.clone();
             async move {
                 sv1_server
                     .run_miner_telemetry_loop(refresh_interval, cancellation_token, fallback_token)
@@ -594,6 +688,70 @@ impl TranslatorRuntime<UpstreamReady> {
                 info!("SV1 miner telemetry task exited");
             }
         }));
+    }
+}
+
+impl<State> TranslatorRuntime<State> {
+    #[cfg(feature = "monitoring")]
+    fn monitoring_refresh_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.translator
+                .config
+                .monitoring_cache_refresh_secs()
+                .unwrap_or(15),
+        )
+    }
+}
+
+impl TranslatorRuntime<ChannelManagerReady> {
+    /// Starts the monitoring HTTP server for the lifetime of the process.
+    ///
+    /// It runs before the first upstream connection and across fallbacks, reporting the upstream
+    /// generation through [`crate::monitoring::CurrentGeneration`]. `/api/v1/health` returns 503
+    /// whenever no upstream is connected, so a load balancer stops routing miners to a translator
+    /// that cannot serve them.
+    ///
+    /// "Connected" means the upstream accepted `SetupConnection`. Health does not prove that a
+    /// mining channel is open (an upstream that never answers `OpenExtendedMiningChannel` keeps
+    /// it at 200), nor that the SV1 listener accepts miners: it stays 200 while draining.
+    #[cfg(feature = "monitoring")]
+    fn start_monitoring_server(&self) -> Result<(), TproxyErrorKind> {
+        let Some(monitoring_addr) = self.translator.config.monitoring_address() else {
+            return Ok(());
+        };
+        info!("Initializing monitoring server on http://{monitoring_addr}");
+        let refresh_interval = self.monitoring_refresh_interval();
+        let current_generation = self.translator.current_generation.clone();
+
+        let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
+            monitoring_addr,
+            Some(current_generation.clone()),
+            None,
+            refresh_interval,
+        )
+        .map_err(|e| {
+            TproxyErrorKind::General(format!("failed to initialize monitoring server: {e}"))
+        })?
+        .with_sv1_monitoring(current_generation)
+        .map_err(|e| TproxyErrorKind::General(format!("failed to add SV1 monitoring: {e}")))?
+        .with_upstream_monitoring(self.upstreams.status())
+        .map_err(|e| TproxyErrorKind::General(format!("failed to add upstream monitoring: {e}")))?;
+
+        let cancellation_token = self.translator.cancellation_token.clone();
+        self.task_manager.spawn(async move {
+            let shutdown_signal = {
+                let cancellation_token = cancellation_token.clone();
+                async move {
+                    cancellation_token.cancelled().await;
+                    info!("Monitoring server: received shutdown signal.");
+                }
+            };
+            if let Err(e) = monitoring_server.run(shutdown_signal).await {
+                error!("Monitoring server error: {:?}", e);
+                cancellation_token.cancel();
+            }
+            info!("Monitoring server task exited");
+        });
 
         Ok(())
     }
@@ -630,8 +788,33 @@ impl TranslatorRuntime<Running> {
         }
     }
 
-    pub(super) async fn cleanup_for_fallback(self) -> TranslatorRuntime<Sv1ServerReady> {
+    /// Tears down the current upstream generation and prepares a fresh one.
+    ///
+    /// Fails with [`TproxyErrorKind::FallbackLoop`] when this fallback exceeds the configured
+    /// budget, or with [`TproxyErrorKind::GenerationEndUnacknowledged`] when the SV1 server does
+    /// not confirm it discarded the ended generation's messages; the caller then shuts the
+    /// translator down. When the translator is already shutting down it fails with
+    /// [`TproxyErrorKind::CouldNotInitiateSystem`] before recording the fallback.
+    pub(super) async fn cleanup_for_fallback(
+        mut self,
+    ) -> Result<TranslatorRuntime<ChannelManagerReady>, BootstrapError> {
+        // A shutdown or drain that has already cancelled the translator is not an upstream
+        // failure: it must not hold miners or count toward the fallback metric and budget.
+        if self.translator.cancellation_token.is_cancelled() {
+            return Err(BootstrapError::from((
+                TproxyErrorKind::CouldNotInitiateSystem,
+                self,
+            )));
+        }
         info!("Preparing fallback");
+        // Set before the teardown so health does not report the held miners' pod as down.
+        if let Some(hold) = self.translator.config.upstream_loss_hold() {
+            info!("Holding SV1 miners for up to {}s", hold.as_secs());
+            self.upstreams.hold_until(Instant::now() + hold);
+        }
+        let fallback_budget = self.upstreams.record_fallback(Instant::now());
+        #[cfg(feature = "monitoring")]
+        self.translator.current_generation.clear_channel_manager();
         self.fallback_coordinator.trigger_fallback_and_wait().await;
         info!("All components finished fallback cleanup");
         // `wait` already took the request that caused this teardown. One recorded while it was
@@ -640,20 +823,334 @@ impl TranslatorRuntime<Running> {
             .protocol_reconnect
             .with(|protocol_reconnect| protocol_reconnect.discard());
 
+        // The old channel manager has exited, so the `Ended` event lands behind everything it
+        // sent. The next one must not start before the SV1 server has discarded what is left of
+        // this generation in the queue they share.
+        if let Err(kind) =
+            await_generation_end(&self.sv1, &self.translator.cancellation_token).await
+        {
+            // The SV1 server would not act on a release either; shutting down disconnects the
+            // miners.
+            self.upstreams.stop_holding();
+            return Err(BootstrapError::from((kind, self)));
+        }
+
+        if let Err(fallbacks) = fallback_budget {
+            let window_secs = self.translator.config.fallback_window().as_secs();
+            error!(
+                "{fallbacks} fallbacks within {window_secs}s exceed max_fallbacks = {}",
+                self.translator.config.max_fallbacks
+            );
+            return Err(BootstrapError::from((
+                TproxyErrorKind::FallbackLoop {
+                    fallbacks,
+                    window_secs,
+                },
+                self,
+            )));
+        }
+
         let fresh_fallback_coordinator = FallbackCoordinator::new();
 
-        TranslatorRuntime {
+        Ok(TranslatorRuntime {
             tproxy_mode: self.tproxy_mode,
             fallback_coordinator: fresh_fallback_coordinator,
             task_manager: self.task_manager,
             translator: self.translator,
-            upstream_addresses: self.upstream_addresses,
+            upstreams: self.upstreams,
             protocol_reconnect: self.protocol_reconnect,
             listen_addr: self.listen_addr,
+            sv1: self.sv1,
             state: Init,
         }
         .bootstrap_io()
-        .bootstrap_channel_manager()
-        .bootstrap_sv1_server()
+        .bootstrap_channel_manager())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DownstreamDifficultyConfig, TranslatorConfig};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn walk_pauses_are_jittered_within_twenty_percent() {
+        let pause = Duration::from_secs(10);
+        for _ in 0..100 {
+            let jittered = jittered(pause);
+            assert!(jittered >= Duration::from_secs(8) && jittered < Duration::from_secs(12));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_generation_end_is_not_acknowledged() {
+        let (_drained, receiver) = oneshot::channel();
+        assert!(!generation_end_acknowledged(receiver, GENERATION_END_ACK_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn a_generation_end_dropped_unhandled_is_not_acknowledged() {
+        let (drained, receiver) = oneshot::channel();
+        drop(drained);
+        assert!(!generation_end_acknowledged(receiver, GENERATION_END_ACK_TIMEOUT).await);
+    }
+
+    #[tokio::test]
+    async fn an_answered_generation_end_is_acknowledged() {
+        let (drained, receiver) = oneshot::channel();
+        drained.send(()).unwrap();
+        assert!(generation_end_acknowledged(receiver, GENERATION_END_ACK_TIMEOUT).await);
+    }
+
+    /// An SV1 side whose server never handles the events sent to it, unless `answer` is set.
+    fn sv1_side(started: bool, answer: bool) -> Sv1Side {
+        let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
+            unbounded();
+        let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
+            unbounded();
+        let (generation_events, generation_events_receiver) = unbounded();
+        if answer {
+            tokio::spawn({
+                let generation_events_receiver = generation_events_receiver.clone();
+                async move {
+                    while let Ok(event) = generation_events_receiver.recv().await {
+                        if let GenerationEvent::Ended {
+                            drained: Some(drained),
+                        } = event
+                        {
+                            let _ = drained.send(());
+                        }
+                    }
+                }
+            });
+        }
+        let config = TranslatorConfig::new(
+            vec![],
+            "127.0.0.1".into(),
+            3333,
+            DownstreamDifficultyConfig::new(100.0, 5.0, true, 60),
+            2,
+            1,
+            4,
+            false,
+            true,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        let server = Arc::new(
+            Sv1Server::new(
+                "127.0.0.1:3333".parse().unwrap(),
+                channel_manager_to_sv1_server_receiver,
+                sv1_server_to_channel_manager_sender,
+                config,
+                TproxyMode::Aggregated,
+            )
+            .with_generation_control(
+                generation_events_receiver,
+                sv1_server_to_channel_manager_receiver.clone(),
+            ),
+        );
+        Sv1Side {
+            server,
+            channel_manager_to_sv1_server_sender,
+            sv1_server_to_channel_manager_receiver,
+            generation_events,
+            started,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unacknowledged_generation_end_fails_the_fallback() {
+        let sv1 = sv1_side(true, false);
+        let started = tokio::time::Instant::now();
+        let result = await_generation_end(&sv1, &CancellationToken::new()).await;
+        assert!(matches!(
+            result,
+            Err(TproxyErrorKind::GenerationEndUnacknowledged)
+        ));
+        assert!(started.elapsed() >= GENERATION_END_ACK_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_the_generation_end_wait_stops_the_translator() {
+        let sv1 = sv1_side(true, false);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let result = await_generation_end(&sv1, &shutdown).await;
+        assert!(matches!(
+            result,
+            Err(TproxyErrorKind::CouldNotInitiateSystem)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_acknowledged_generation_end_lets_the_next_channel_manager_start() {
+        let sv1 = sv1_side(true, true);
+        assert!(
+            await_generation_end(&sv1, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_started_has_nothing_to_acknowledge() {
+        let sv1 = sv1_side(false, false);
+        assert!(
+            await_generation_end(&sv1, &CancellationToken::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    fn init_runtime() -> TranslatorRuntime<Init> {
+        let config = TranslatorConfig::new(
+            vec![],
+            "127.0.0.1".into(),
+            3333,
+            DownstreamDifficultyConfig::new(100.0, 5.0, true, 60),
+            2,
+            1,
+            4,
+            false,
+            true,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        TranslatorRuntime::<Init>::new(TranslatorSv2::new(config)).unwrap()
+    }
+
+    fn running_runtime() -> TranslatorRuntime<Running> {
+        let runtime = init_runtime();
+        TranslatorRuntime {
+            tproxy_mode: runtime.tproxy_mode,
+            fallback_coordinator: runtime.fallback_coordinator,
+            task_manager: runtime.task_manager,
+            translator: runtime.translator,
+            upstreams: runtime.upstreams,
+            protocol_reconnect: runtime.protocol_reconnect,
+            listen_addr: runtime.listen_addr,
+            sv1: runtime.sv1,
+            state: Running,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_during_shutdown_is_not_counted() {
+        let runtime = running_runtime();
+        let status = runtime.upstreams.status();
+        runtime.translator.cancellation_token.cancel();
+
+        let Err(bootstrap_err) = runtime.cleanup_for_fallback().await else {
+            panic!("a translator that is shutting down does not fall back");
+        };
+
+        let (kind, runtime) = bootstrap_err.into_parts();
+        assert!(matches!(kind, TproxyErrorKind::CouldNotInitiateSystem));
+        assert_eq!(status.fallbacks(), 0);
+        assert!(runtime.upstreams.holding_until().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fallback_is_counted_while_the_translator_runs() {
+        let runtime = running_runtime();
+        let status = runtime.upstreams.status();
+
+        assert!(runtime.cleanup_for_fallback().await.is_ok());
+
+        assert_eq!(status.fallbacks(), 1);
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn every_channel_manager_reports_share_accounting_to_the_sv1_server() {
+        use stratum_apps::monitoring::Sv1BlockFound;
+
+        let ready = init_runtime().bootstrap_io().bootstrap_channel_manager();
+        let server = ready.sv1.server.clone();
+        let first = ready.state.channel_manager.clone();
+        let runtime = TranslatorRuntime {
+            tproxy_mode: ready.tproxy_mode,
+            fallback_coordinator: ready.fallback_coordinator,
+            task_manager: ready.task_manager,
+            translator: ready.translator,
+            upstreams: ready.upstreams,
+            protocol_reconnect: ready.protocol_reconnect,
+            listen_addr: ready.listen_addr,
+            sv1: ready.sv1,
+            state: Running,
+        };
+
+        let Ok(second) = runtime.cleanup_for_fallback().await else {
+            panic!("the fallback should succeed");
+        };
+        let second = &second.state.channel_manager;
+
+        assert!(Arc::ptr_eq(&first.share_drops, &server.share_drops));
+        assert!(Arc::ptr_eq(&second.share_drops, &server.share_drops));
+        second.blocks_found.record(Sv1BlockFound {
+            sv1_username: "acct.rig".into(),
+            worker: "rig".into(),
+            user_identity: "pool.rig".into(),
+            share_hash: "hash".into(),
+            height: None,
+            found_at_unix_secs: 1,
+        });
+        assert_eq!(server.blocks_found.total(), 1);
+        assert_eq!(first.blocks_found.total(), 1);
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn monitoring_reads_share_accounting_through_the_current_generation() {
+        use crate::monitoring::CurrentGeneration;
+        use stratum_apps::monitoring::{
+            Sv1BlockFound, Sv1ClientsMonitoring, Sv1ShareDropReason, Sv1ShareRejection,
+        };
+
+        let sv1 = sv1_side(false, false);
+        let current = CurrentGeneration::default();
+        assert_eq!(current.get_sv1_blocks_found_total(), 0);
+        current.set_sv1_server(sv1.server.clone());
+
+        {
+            let mut totals = sv1.server.share_totals.lock().unwrap();
+            totals.record(None);
+            totals.record(None);
+            totals.record(Some(Sv1ShareRejection::Duplicate));
+        }
+        {
+            let mut drops = sv1.server.share_drops.lock().unwrap();
+            drops.record(None);
+            drops.record(Some(Sv1ShareDropReason::UpstreamGone));
+        }
+        sv1.server.blocks_found.record(Sv1BlockFound {
+            sv1_username: "acct.rig".into(),
+            worker: "rig".into(),
+            user_identity: "pool.rig".into(),
+            share_hash: "hash".into(),
+            height: Some(7),
+            found_at_unix_secs: 1,
+        });
+
+        let totals = current.get_sv1_share_totals();
+        assert_eq!(totals.accepted, 2);
+        assert_eq!(totals.rejected_duplicate, 1);
+        let drops = current.get_sv1_share_drops();
+        assert_eq!(drops.below_upstream_target, 1);
+        assert_eq!(drops.dropped(Sv1ShareDropReason::UpstreamGone), 1);
+        let blocks = current.get_sv1_blocks_found();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].share_hash, "hash");
+        assert_eq!(current.get_sv1_blocks_found_total(), 1);
+
+        let summary = current.get_sv1_clients_summary();
+        assert_eq!(summary.shares, totals);
+        assert_eq!(summary.dropped, drops);
     }
 }

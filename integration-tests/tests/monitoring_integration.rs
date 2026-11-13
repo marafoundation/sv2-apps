@@ -741,6 +741,28 @@ async fn tproxy_api_endpoints_with_miner() {
         .await;
     assert_metric_eq(&metrics, "sv1_clients_total", 1.0);
 
+    // The miner's shares are counted as the translator answered them, per miner and in total.
+    let metrics = tproxy_mon
+        .poll_metric_gte("sv1_shares_accepted_total", 1.0, METRIC_POLL_TIMEOUT)
+        .await;
+    assert_metric_present(
+        &metrics,
+        Metric::with_labels("sv1_shares_rejected_total", &[("reason", "job-not-found")]),
+    );
+    assert_metric_present(&metrics, "sv1_shares_below_upstream_target_total");
+    assert_metric_present(
+        &metrics,
+        Metric::with_labels("sv1_shares_dropped_total", &[("reason", "stale")]),
+    );
+    assert_metric_present(
+        &metrics,
+        Metric::with_labels("sv1_shares_dropped_total", &[("reason", "upstream-gone")]),
+    );
+    let client: Sv1ClientInfo = tproxy_mon
+        .fetch_typed(&routes::sv1_client_by_id(sv1_client_id))
+        .await;
+    assert!(client.shares.accepted >= 1, "{:?}", client.shares);
+
     shutdown_all!(tproxy, pool);
 }
 

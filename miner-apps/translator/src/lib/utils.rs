@@ -22,12 +22,45 @@ use stratum_apps::{
             utils::{HexU32Be, VERSION_ROLLING_MASK},
         },
     },
-    utils::types::{ChannelId, DownstreamId},
+    utils::types::{ChannelId, DownstreamId, Hashrate},
 };
 
 use tracing::{debug, warn};
 
 use crate::error::TproxyErrorKind;
+
+/// The SV1 miner a share sent to the channel manager came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShareOrigin {
+    pub downstream_id: DownstreamId,
+    /// The miner's full SV1 username as authorized, e.g. `account.worker`.
+    pub sv1_username: String,
+    /// SV1 worker name, if the miner sent a non-empty one.
+    pub worker: Option<String>,
+}
+
+/// The block height a coinbase transaction commits to (BIP34), from the start of its
+/// serialization: the first push of the coinbase input's script.
+pub fn coinbase_height(coinbase_tx_prefix: &[u8]) -> Option<u32> {
+    let mut at = 4; // version
+    if coinbase_tx_prefix.get(at..at + 2) == Some(&[0x00, 0x01]) {
+        at += 2; // segwit marker and flag
+    }
+    // One input, its null outpoint, then a script length below 0xfd.
+    at += 1 + 32 + 4 + 1;
+    let script = coinbase_tx_prefix.get(at..)?;
+    match *script.first()? {
+        0x00 => Some(0),
+        op @ 0x51..=0x60 => Some(u32::from(op - 0x50)),
+        len @ 1..=4 => {
+            let bytes = script.get(1..1 + len as usize)?;
+            let mut le = [0u8; 4];
+            le[..bytes.len()].copy_from_slice(bytes);
+            Some(u32::from_le_bytes(le))
+        }
+        _ => None,
+    }
+}
 
 /// Channel ID used to broadcast messages to all downstreams in aggregated mode.
 /// This sentinel value distinguishes broadcast from a legitimate channel 0.
@@ -174,7 +207,6 @@ pub struct UpstreamEntry {
     pub host: String,
     pub port: u16,
     pub authority_pubkey: Secp256k1PublicKey,
-    pub tried_or_flagged: bool,
     pub user_identity: String,
 }
 
@@ -305,6 +337,22 @@ pub struct SubmitShareWithChannelId {
 /// Format: `{original_job_id}#{counter}`
 pub(crate) const KEEPALIVE_JOB_ID_DELIMITER: char = '#';
 
+/// Maximum keepalive nTime offset from the original upstream job.
+pub(crate) const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
+
+/// Difficulty below which `mining.set_difficulty` is not rounded to a power of two.
+pub(crate) const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
+
+/// A hashrate that can go out as a `nominal_hash_rate`: serializing a NaN, infinite or negative
+/// one is an error, which would drop the message carrying it.
+pub(crate) fn finite_hashrate(hashrate: Hashrate) -> Hashrate {
+    if hashrate.is_nan() {
+        0.0
+    } else {
+        hashrate.clamp(0.0, Hashrate::MAX)
+    }
+}
+
 /// Derives the SV1 worker name from the full `mining.authorize` username.
 pub(crate) fn sv1_worker_name_from_sv1_username(sv1_username: &str) -> &str {
     sv1_username
@@ -359,6 +407,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nominal_hashrates_are_finite_and_not_negative() {
+        assert_eq!(finite_hashrate(1.5e12), 1.5e12);
+        assert_eq!(finite_hashrate(0.0), 0.0);
+        assert_eq!(finite_hashrate(Hashrate::NAN), 0.0);
+        assert_eq!(finite_hashrate(-1.0), 0.0);
+        assert_eq!(finite_hashrate(Hashrate::NEG_INFINITY), 0.0);
+        assert_eq!(finite_hashrate(Hashrate::INFINITY), Hashrate::MAX);
+    }
+
+    #[test]
     fn derives_sv1_worker_name_from_first_dot() {
         assert_eq!(
             sv1_worker_name_from_sv1_username("account.worker1"),
@@ -394,5 +452,27 @@ mod tests {
 
         assert_eq!(tlv_user_identity.len(), MAX_USER_IDENTITY_LENGTH - 1);
         assert_eq!(tlv_user_identity.as_str(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn coinbase_height_reads_the_bip34_push() {
+        let prefix = |script: &[u8]| {
+            let mut tx = vec![2, 0, 0, 0, 1];
+            tx.extend([0; 32]);
+            tx.extend([0xff; 4]);
+            tx.push(script.len() as u8 + 10);
+            tx.extend(script);
+            tx
+        };
+        assert_eq!(coinbase_height(&prefix(&[0x00])), Some(0));
+        assert_eq!(coinbase_height(&prefix(&[0x52, 0x00])), Some(2));
+        assert_eq!(
+            coinbase_height(&prefix(&[0x03, 0x40, 0x0d, 0x03])),
+            Some(200_000)
+        );
+        let mut segwit = prefix(&[0x03, 0x8a, 0x4c, 0x0e]);
+        segwit.splice(4..4, [0x00, 0x01]);
+        assert_eq!(coinbase_height(&segwit), Some(937_098));
+        assert_eq!(coinbase_height(&[2, 0, 0, 0]), None);
     }
 }

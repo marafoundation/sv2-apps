@@ -2,6 +2,8 @@
 
 use prometheus::{Gauge, GaugeVec, Opts, Registry};
 
+use super::sv1::{Sv1ShareDropReason, Sv1ShareRejection};
+
 /// Prometheus metrics for the monitoring server.
 /// Metrics are optional - only registered when the corresponding monitoring type is enabled.
 #[derive(Clone)]
@@ -10,6 +12,10 @@ pub struct PrometheusMetrics {
     // System metrics
     pub sv2_uptime_seconds: Gauge,
     pub sv2_monitoring_snapshot_age_seconds: Gauge,
+    /// Allocator heap usage; present only where the allocator reports it (glibc).
+    pub sv2_heap_in_use_bytes: Option<Gauge>,
+    pub sv2_heap_free_bytes: Option<Gauge>,
+    pub sv2_heap_mapped_bytes: Option<Gauge>,
     // Server metrics (upstream connection)
     pub sv2_server_channels: Option<GaugeVec>,
     pub sv2_server_hashrate_total: Option<Gauge>,
@@ -29,6 +35,16 @@ pub struct PrometheusMetrics {
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
+    // Upstream metrics
+    pub sv2_upstream_connected: Option<GaugeVec>,
+    pub sv2_upstream_fallbacks_total: Option<Gauge>,
+    pub sv1_shares_accepted_total: Option<Gauge>,
+    pub sv1_shares_rejected_total: Option<GaugeVec>,
+    pub sv1_shares_below_upstream_target_total: Option<Gauge>,
+    pub sv1_shares_dropped_total: Option<GaugeVec>,
+    /// One series per recent block-finding share, valued at the Unix time it was submitted.
+    pub sv1_block_found_info: Option<GaugeVec>,
+    pub sv1_blocks_found_total: Option<Gauge>,
 }
 
 impl PrometheusMetrics {
@@ -36,6 +52,7 @@ impl PrometheusMetrics {
         enable_server_metrics: bool,
         enable_clients_metrics: bool,
         enable_sv1_metrics: bool,
+        enable_upstream_metrics: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let registry = Registry::new();
 
@@ -48,6 +65,27 @@ impl PrometheusMetrics {
             "Seconds since the monitoring snapshot was last refreshed",
         )?;
         registry.register(Box::new(sv2_monitoring_snapshot_age_seconds.clone()))?;
+        let (sv2_heap_in_use_bytes, sv2_heap_free_bytes, sv2_heap_mapped_bytes) =
+            if super::heap::heap_stats().is_some() {
+                let in_use = Gauge::new(
+                    "sv2_heap_in_use_bytes",
+                    "Heap bytes allocated and not yet freed",
+                )?;
+                registry.register(Box::new(in_use.clone()))?;
+                let free = Gauge::new(
+                    "sv2_heap_free_bytes",
+                    "Heap bytes freed but still held by the allocator",
+                )?;
+                registry.register(Box::new(free.clone()))?;
+                let mapped = Gauge::new(
+                    "sv2_heap_mapped_bytes",
+                    "Heap bytes obtained from the OS, in use or free",
+                )?;
+                registry.register(Box::new(mapped.clone()))?;
+                (Some(in_use), Some(free), Some(mapped))
+            } else {
+                (None, None, None)
+            };
 
         // Server metrics (upstream connection)
         let (
@@ -199,14 +237,116 @@ impl PrometheusMetrics {
         };
 
         // SV1 metrics
-        let (sv1_clients_total, sv1_hashrate_total) = if enable_sv1_metrics {
+        let (
+            sv1_clients_total,
+            sv1_hashrate_total,
+            sv1_shares_accepted_total,
+            sv1_shares_rejected_total,
+            sv1_shares_below_upstream_target_total,
+            sv1_shares_dropped_total,
+            sv1_block_found_info,
+            sv1_blocks_found_total,
+        ) = if enable_sv1_metrics {
             let clients = Gauge::new("sv1_clients_total", "Total number of SV1 clients")?;
             registry.register(Box::new(clients.clone()))?;
 
             let hashrate = Gauge::new("sv1_hashrate_total", "Total hashrate from SV1 clients")?;
             registry.register(Box::new(hashrate.clone()))?;
 
-            (Some(clients), Some(hashrate))
+            let accepted = Gauge::new(
+                "sv1_shares_accepted_total",
+                "SV1 shares accepted by the SV1 server since the process started",
+            )?;
+            registry.register(Box::new(accepted.clone()))?;
+
+            let rejected = GaugeVec::new(
+                Opts::new(
+                    "sv1_shares_rejected_total",
+                    "SV1 shares rejected by the SV1 server since the process started, by reason",
+                ),
+                &["reason"],
+            )?;
+            registry.register(Box::new(rejected.clone()))?;
+            // Every reason is exported from the start, so a rate over it never starts mid-way.
+            for rejection in Sv1ShareRejection::ALL {
+                rejected.with_label_values(&[rejection.label()]).set(0.0);
+            }
+
+            let block_found = GaugeVec::new(
+                Opts::new(
+                    "sv1_block_found_info",
+                    "Recent SV1 shares that met the network target (block candidates, before the \
+                     pool confirms them), valued at the Unix time they were submitted",
+                ),
+                &[
+                    "sv1_username",
+                    "worker",
+                    "user_identity",
+                    "share_hash",
+                    "height",
+                ],
+            )?;
+            registry.register(Box::new(block_found.clone()))?;
+
+            let blocks_found = Gauge::new(
+                "sv1_blocks_found_total",
+                "SV1 shares that met the network target since the process started (block \
+                 candidates, before the pool confirms them)",
+            )?;
+            registry.register(Box::new(blocks_found.clone()))?;
+
+            let below_target = Gauge::new(
+                "sv1_shares_below_upstream_target_total",
+                "Accepted SV1 shares not sent upstream because they do not meet the upstream \
+                 channel's target, since the process started",
+            )?;
+            registry.register(Box::new(below_target.clone()))?;
+
+            let dropped = GaugeVec::new(
+                Opts::new(
+                    "sv1_shares_dropped_total",
+                    "Accepted SV1 shares not sent upstream for any other reason, since the process \
+                     started, by reason",
+                ),
+                &["reason"],
+            )?;
+            registry.register(Box::new(dropped.clone()))?;
+            for reason in Sv1ShareDropReason::ALL {
+                dropped.with_label_values(&[reason.label()]).set(0.0);
+            }
+
+            (
+                Some(clients),
+                Some(hashrate),
+                Some(accepted),
+                Some(rejected),
+                Some(below_target),
+                Some(dropped),
+                Some(block_found),
+                Some(blocks_found),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
+
+        // Upstream metrics
+        let (sv2_upstream_connected, sv2_upstream_fallbacks_total) = if enable_upstream_metrics {
+            let connected = GaugeVec::new(
+                Opts::new(
+                    "sv2_upstream_connected",
+                    "Whether the app is connected to each configured upstream (1) or not (0)",
+                ),
+                &["pool_address"],
+            )?;
+            registry.register(Box::new(connected.clone()))?;
+
+            let fallbacks = Gauge::new(
+                "sv2_upstream_fallbacks_total",
+                "Number of fallbacks to another upstream since the process started",
+            )?;
+            registry.register(Box::new(fallbacks.clone()))?;
+
+            (Some(connected), Some(fallbacks))
         } else {
             (None, None)
         };
@@ -215,6 +355,9 @@ impl PrometheusMetrics {
             registry,
             sv2_uptime_seconds,
             sv2_monitoring_snapshot_age_seconds,
+            sv2_heap_in_use_bytes,
+            sv2_heap_free_bytes,
+            sv2_heap_mapped_bytes,
             sv2_server_channels,
             sv2_server_hashrate_total,
             sv2_server_channel_hashrate,
@@ -231,6 +374,14 @@ impl PrometheusMetrics {
             sv2_client_blocks_found_total,
             sv1_clients_total,
             sv1_hashrate_total,
+            sv2_upstream_connected,
+            sv2_upstream_fallbacks_total,
+            sv1_shares_accepted_total,
+            sv1_shares_rejected_total,
+            sv1_shares_below_upstream_target_total,
+            sv1_shares_dropped_total,
+            sv1_block_found_info,
+            sv1_blocks_found_total,
         })
     }
 }
@@ -242,7 +393,7 @@ mod tests {
 
     #[test]
     fn uptime_metric_always_registered() {
-        let m = PrometheusMetrics::new(false, false, false).unwrap();
+        let m = PrometheusMetrics::new(false, false, false, false).unwrap();
         m.sv2_uptime_seconds.set(42.0);
 
         let families = m.registry.gather();
@@ -252,7 +403,7 @@ mod tests {
 
     #[test]
     fn server_metrics_enabled() {
-        let m = PrometheusMetrics::new(true, false, false).unwrap();
+        let m = PrometheusMetrics::new(true, false, false, false).unwrap();
         assert!(m.sv2_server_channels.is_some());
         assert!(m.sv2_server_hashrate_total.is_some());
         assert!(m.sv2_server_channel_hashrate.is_some());
@@ -266,7 +417,7 @@ mod tests {
 
     #[test]
     fn clients_metrics_enabled() {
-        let m = PrometheusMetrics::new(false, true, false).unwrap();
+        let m = PrometheusMetrics::new(false, true, false, false).unwrap();
         assert!(m.sv2_clients_total.is_some());
         assert!(m.sv2_client_channels.is_some());
         assert!(m.sv2_client_hashrate_total.is_some());
@@ -280,7 +431,7 @@ mod tests {
 
     #[test]
     fn sv1_metrics_enabled() {
-        let m = PrometheusMetrics::new(false, false, true).unwrap();
+        let m = PrometheusMetrics::new(false, false, true, false).unwrap();
         assert!(m.sv1_clients_total.is_some());
         assert!(m.sv1_hashrate_total.is_some());
         // server and clients should be None
@@ -289,24 +440,43 @@ mod tests {
     }
 
     #[test]
-    fn all_metrics_disabled_only_system_metrics() {
-        let m = PrometheusMetrics::new(false, false, false).unwrap();
+    fn upstream_metrics_enabled() {
+        let m = PrometheusMetrics::new(false, false, false, true).unwrap();
+        assert!(m.sv2_upstream_connected.is_some());
+        assert!(m.sv2_upstream_fallbacks_total.is_some());
+        // server, clients and sv1 should be None
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv2_clients_total.is_none());
         assert!(m.sv1_clients_total.is_none());
+    }
+
+    #[test]
+    fn all_metrics_disabled_only_system_metrics() {
+        let m = PrometheusMetrics::new(false, false, false, false).unwrap();
+        assert!(m.sv2_server_channels.is_none());
+        assert!(m.sv2_clients_total.is_none());
+        assert!(m.sv1_clients_total.is_none());
+        assert!(m.sv2_upstream_connected.is_none());
+        assert!(m.sv2_upstream_fallbacks_total.is_none());
 
         let families = m.registry.gather();
         // Only the system metrics should be registered (with default value 0)
         let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
-        assert_eq!(
-            names,
-            ["sv2_monitoring_snapshot_age_seconds", "sv2_uptime_seconds"]
-        );
+        let mut expected = vec!["sv2_monitoring_snapshot_age_seconds", "sv2_uptime_seconds"];
+        if super::super::heap::heap_stats().is_some() {
+            expected.extend([
+                "sv2_heap_free_bytes",
+                "sv2_heap_in_use_bytes",
+                "sv2_heap_mapped_bytes",
+            ]);
+        }
+        expected.sort_unstable();
+        assert_eq!(names, expected);
     }
 
     #[test]
     fn metrics_encode_to_prometheus_text_format() {
-        let m = PrometheusMetrics::new(true, true, true).unwrap();
+        let m = PrometheusMetrics::new(true, true, true, true).unwrap();
         m.sv2_uptime_seconds.set(123.0);
         m.sv2_server_hashrate_total.as_ref().unwrap().set(1000.0);
         m.sv2_clients_total.as_ref().unwrap().set(5.0);

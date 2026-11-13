@@ -22,21 +22,26 @@ use crate::{
     config::TranslatorConfig,
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     sv1::{
-        downstream::{Downstream, Sv1Difficulty, Sv1ServerEvent, Sv1SetupRequest},
+        downstream::{
+            Downstream, ReattachCounters, Sv1Difficulty, Sv1ServerEvent, Sv1SetupRequest,
+        },
         job_store::Sv1JobStore,
     },
     utils::{
-        AGGREGATED_CHANNEL_ID, KEEPALIVE_JOB_ID_DELIMITER, SubmitShareWithChannelId, TproxyMode,
+        AGGREGATED_CHANNEL_ID, KEEPALIVE_JOB_ID_DELIMITER, MAX_FUTURE_BLOCK_TIME,
+        SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING, ShareOrigin,
+        SubmitShareWithChannelId, TproxyMode,
     },
 };
 use async_channel::{Receiver, Sender, unbounded};
 #[cfg(feature = "monitoring")]
 use std::net::IpAddr;
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -44,7 +49,6 @@ use std::{
 use stratum_apps::monitoring::{MinerTelemetry, MinerTelemetryStatus};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
-    fallback_coordinator::FallbackCoordinator,
     network_helpers::sv1_connection::ConnectionSV1,
     stratum_core::{
         binary_sv2::Str0255Owned,
@@ -81,8 +85,6 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
-
 /// Builds the `mining.set_difficulty` advertising `target`, paired with the target shares are
 /// validated against once it is sent: the advertised difficulty, after SV1 power-of-two rounding.
 fn sv1_difficulty(target: Target) -> Result<Sv1Difficulty, StratumTranslationError> {
@@ -97,9 +99,6 @@ fn sv1_difficulty(target: Target) -> Result<Sv1Difficulty, StratumTranslationErr
     .unwrap_or(target);
     Ok(Sv1Difficulty { message, target })
 }
-
-// Maximum keepalive nTime offset from the original upstream job.
-const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
 
 #[derive(Clone, Debug)]
 struct StoredSv1Job {
@@ -147,15 +146,15 @@ struct Sv1ServerIo {
     downstream_to_sv1_server_sender: Sender<(DownstreamId, json_rpc::Message)>,
     downstream_to_sv1_server_receiver: Receiver<(DownstreamId, json_rpc::Message)>,
     channel_manager_receiver: Receiver<MiningOwned>,
-    // Option<String> carries non-empty sv1_worker_name metadata for SubmitSharesExtended.
-    channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+    // Where a SubmitSharesExtended came from; `None` for every other message.
+    channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Sv1ServerIo {
     fn new(
         channel_manager_receiver: Receiver<MiningOwned>,
-        channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+        channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
     ) -> Self {
         let (downstream_to_sv1_server_sender, downstream_to_sv1_server_receiver) = unbounded();
 
@@ -257,11 +256,129 @@ pub struct Sv1Server {
     #[cfg(feature = "monitoring")]
     pub(crate) miner_telemetry: MinerTelemetryState,
     pub(crate) request_id_to_downstream_id: SharedMap<RequestId, DownstreamId>,
+    /// When each channel open was sent, for [`CHANNEL_OPEN_TIMEOUT`]. Entries for answered
+    /// requests are dropped by the next sweep.
+    open_requested_at: SharedMap<RequestId, Instant>,
     /// The state kept for each SV2 channel, see [`ChannelState`].
     channels: SharedMap<ChannelId, ChannelState>,
     pub(crate) vardiff: SharedMap<DownstreamId, VardiffState>,
     pub(crate) mode: TproxyMode,
-    user_identity: Arc<OnceLock<String>>,
+    user_identity: Arc<RwLock<Option<String>>>,
+    /// Outcomes of every share answered since the process started.
+    #[cfg(feature = "monitoring")]
+    pub(crate) share_totals: Arc<Mutex<stratum_apps::monitoring::Sv1ShareCounts>>,
+    /// Accepted shares the channel managers did not send upstream, since the process started.
+    #[cfg(feature = "monitoring")]
+    pub(crate) share_drops: Arc<Mutex<stratum_apps::monitoring::Sv1ShareDrops>>,
+    /// Recent shares that found a block, recorded by the channel managers.
+    #[cfg(feature = "monitoring")]
+    pub(crate) blocks_found: crate::monitoring::BlocksFound,
+    /// The upstream generation currently serving miners, if any. See [`GenerationSlot`].
+    generation: Arc<Mutex<GenerationSlot>>,
+    generation_control: Option<GenerationControl>,
+    hold: HoldState,
+}
+
+/// Miners kept connected between upstream generations, and their move onto the next one.
+#[derive(Clone, Default)]
+struct HoldState {
+    /// Set from the end of a generation, when miners are held, until the next one connects.
+    holding: Arc<AtomicBool>,
+    /// Miners whose channel has yet to be opened on the connected generation, opened at most
+    /// [`MAX_CHANNEL_OPENS_IN_FLIGHT`] at a time.
+    pending_opens: Arc<Mutex<VecDeque<DownstreamId>>>,
+    /// Set while held miners are being moved onto a new generation.
+    reattaching: Arc<AtomicBool>,
+    rejected_shares: Arc<AtomicU64>,
+    reattach_counters: Arc<ReattachCounters>,
+}
+
+/// What the server loop does after a generation event.
+enum GenerationFollowUp {
+    None,
+    /// Restart the hold keep-alive timer.
+    StartHold,
+    /// Ask every miner to reconnect, then let the runtime shut down.
+    Release,
+}
+
+/// Bounds the channel opens outstanding at once. In non-aggregated mode each one is an upstream
+/// `OpenExtendedMiningChannel`, sent to a pool that has often just restarted.
+const MAX_CHANNEL_OPENS_IN_FLIGHT: usize = 256;
+
+/// How often pending channel opens are sent.
+const CHANNEL_OPEN_PACING: Duration = Duration::from_millis(10);
+
+/// How long a channel open may go unanswered before the miner that asked for it is sent
+/// `client.reconnect`, freeing its slot.
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Which upstream generation the SV1 server is talking to.
+///
+/// `epoch` changes at every boundary. A message for the channel manager is tagged with the epoch
+/// its contents were read under and is only queued, under this lock, while that epoch is still
+/// current and connected, and its fallback has not started. [`GenerationEvent::Ended`] advances
+/// the epoch under the same lock before discarding the queue, so nothing read from one generation
+/// (a channel id, a share, an aggregate) can reach the channel manager of the next, where the
+/// same channel id usually belongs to another miner.
+#[derive(Debug, Default)]
+struct GenerationSlot {
+    epoch: u64,
+    /// Cancelling it ends the connected generation, before [`GenerationEvent::Ended`] is sent;
+    /// `None` between generations.
+    fallback_token: Option<CancellationToken>,
+}
+
+/// Marks the boundary between upstream generations for the SV1 server, which outlives them.
+pub(crate) enum GenerationEvent {
+    /// A new channel manager is about to start; cancelling `fallback_token` ends its generation.
+    Connected { fallback_token: CancellationToken },
+    /// The previous channel manager has exited, so everything it sent is already queued.
+    /// `drained` is signalled once nothing of that generation is left queued for the next
+    /// channel manager, which must not start before then.
+    Ended {
+        drained: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// No upstream will connect within the hold window: ask held miners to reconnect.
+    Released,
+}
+
+/// How the runtime tells a long-lived SV1 server about upstream generations.
+#[derive(Clone)]
+struct GenerationControl {
+    events: Receiver<GenerationEvent>,
+    /// The receiving end of the server's own channel-manager queue, used to discard requests
+    /// meant for a generation that has ended.
+    to_channel_manager: Receiver<(MiningOwned, Option<ShareOrigin>)>,
+}
+
+fn drain_queue<T>(receiver: &Receiver<T>) -> usize {
+    std::iter::from_fn(|| receiver.try_recv().ok()).count()
+}
+
+/// Next generation event, or pending forever when the server has no generation control.
+async fn next_generation_event(control: &Option<GenerationControl>) -> Option<GenerationEvent> {
+    match control {
+        Some(control) => control.events.recv().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Accepts on the listener while it is open; pending forever once it has been closed.
+async fn accept(
+    listener: &Option<TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The part of a drain window that disconnects are spread over: the window less a tenth, at most
+/// 1s, so the last disconnect lands before [`crate::TranslatorSv2::drain_and_shutdown`]'s
+/// deadline instead of racing it.
+fn drain_span(window: Duration) -> Duration {
+    window - (window / 10).min(Duration::from_secs(1))
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -271,7 +388,6 @@ impl Sv1Server {
         context: &str,
         e: &TproxyError<error::Sv1Server>,
         cancellation_token: &CancellationToken,
-        fallback_token: &CancellationToken,
     ) -> LoopControl {
         if cancellation_token.is_cancelled() {
             debug!(
@@ -281,10 +397,15 @@ impl Sv1Server {
             return LoopControl::Continue;
         }
 
-        if fallback_token.is_cancelled() {
+        let generation = self.current_generation();
+        if generation
+            .as_ref()
+            .is_none_or(CancellationToken::is_cancelled)
+            && matches!(e.action, Action::Fallback | Action::Reconnect)
+        {
             debug!(
                 error_kind = ?e.kind,
-                "{context} returned an error during fallback"
+                "{context} returned an error between upstream generations"
             );
             return LoopControl::Continue;
         }
@@ -317,14 +438,17 @@ impl Sv1Server {
                     }
                 }
             }
-            // Only the upstream can request a reconnect; anywhere else it means a fallback.
+            // Only the upstream can request a reconnect; anywhere else it means a fallback. This
+            // server outlives the generation it ends.
             Action::Fallback | Action::Reconnect => {
                 warn!(
                     error_kind = ?e.kind,
                     "{context} requested fallback"
                 );
-                fallback_token.cancel();
-                LoopControl::Break
+                if let Some(generation) = generation {
+                    generation.cancel();
+                }
+                LoopControl::Continue
             }
             Action::Shutdown => {
                 warn!(
@@ -433,7 +557,7 @@ impl Sv1Server {
     pub fn new(
         listener_addr: SocketAddr,
         channel_manager_receiver: Receiver<MiningOwned>,
-        channel_manager_sender: Sender<(MiningOwned, Option<String>)>,
+        channel_manager_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
         config: TranslatorConfig,
         mode: TproxyMode,
     ) -> Self {
@@ -454,23 +578,407 @@ impl Sv1Server {
             #[cfg(feature = "monitoring")]
             miner_telemetry: MinerTelemetryState::new(),
             request_id_to_downstream_id: SharedMap::new(),
+            open_requested_at: SharedMap::new(),
             channels: SharedMap::new(),
             vardiff: SharedMap::new(),
             mode,
-            user_identity: Arc::new(OnceLock::new()),
+            user_identity: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "monitoring")]
+            share_totals: Default::default(),
+            #[cfg(feature = "monitoring")]
+            share_drops: Default::default(),
+            #[cfg(feature = "monitoring")]
+            blocks_found: Default::default(),
+            generation: Arc::new(Mutex::new(GenerationSlot {
+                epoch: 0,
+                fallback_token: Some(CancellationToken::new()),
+            })),
+            generation_control: None,
+            hold: HoldState::default(),
         }
     }
 
-    pub fn set_user_identity(&self, user_identity: String) {
-        self.user_identity
-            .set(user_identity)
-            .expect("user identity already set");
+    /// Lets the runtime drive upstream generations through `events`, so this server and its
+    /// miners outlive any one channel manager. `to_channel_manager` must be the receiving end of
+    /// the channel-manager sender given to [`Sv1Server::new`].
+    ///
+    /// The server starts between generations: requests for the channel manager are dropped and
+    /// channel opens wait until the first [`GenerationEvent::Connected`].
+    pub(crate) fn with_generation_control(
+        mut self,
+        events: Receiver<GenerationEvent>,
+        to_channel_manager: Receiver<(MiningOwned, Option<ShareOrigin>)>,
+    ) -> Self {
+        self.generation = Arc::new(Mutex::new(GenerationSlot::default()));
+        self.generation_control = Some(GenerationControl {
+            events,
+            to_channel_manager,
+        });
+        self
     }
 
-    fn user_identity(&self) -> &String {
+    /// Sets the user identity used for the channels opened from now on.
+    pub fn set_user_identity(&self, user_identity: String) {
+        *self
+            .user_identity
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(user_identity);
+    }
+
+    fn user_identity(&self) -> String {
         self.user_identity
-            .get()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
             .expect("user identity should exist")
+    }
+
+    fn generation_slot(&self) -> std::sync::MutexGuard<'_, GenerationSlot> {
+        self.generation.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn current_generation(&self) -> Option<CancellationToken> {
+        self.generation_slot().fallback_token.clone()
+    }
+
+    /// The current generation epoch, to tag a message whose contents are read now and sent
+    /// later. See [`GenerationSlot`].
+    pub(crate) fn generation_epoch(&self) -> u64 {
+        self.generation_slot().epoch
+    }
+
+    /// Sends to the channel manager of the current generation; dropped between generations.
+    ///
+    /// For the server's own loop, which handles generation events in between messages, so
+    /// anything it read belongs to the current epoch. Other tasks use
+    /// [`Sv1Server::send_to_channel_manager_in`].
+    #[allow(clippy::result_unit_err)]
+    fn send_to_channel_manager(
+        &self,
+        message: (MiningOwned, Option<ShareOrigin>),
+    ) -> Result<(), ()> {
+        self.send_to_channel_manager_in(self.generation_epoch(), message)
+    }
+
+    /// Sends to the channel manager only if generation `epoch` is still current and connected,
+    /// and its fallback has not started: that channel manager is going away, and the queue may
+    /// be handed to the next one.
+    #[allow(clippy::result_unit_err)]
+    fn send_to_channel_manager_in(
+        &self,
+        epoch: u64,
+        message: (MiningOwned, Option<ShareOrigin>),
+    ) -> Result<(), ()> {
+        let slot = self.generation_slot();
+        let live = slot
+            .fallback_token
+            .as_ref()
+            .is_some_and(|token| !token.is_cancelled());
+        if slot.epoch != epoch || !live {
+            drop(slot);
+            debug!(
+                "Dropping {} for the channel manager of generation {epoch}",
+                message.0
+            );
+            #[cfg(feature = "monitoring")]
+            if matches!(message.0, MiningOwned::SubmitSharesExtended(_)) {
+                self.count_shares_upstream_gone(1);
+            }
+            return Ok(());
+        }
+        // Unbounded, so this never waits while the lock is held.
+        self.sv1_server_io
+            .channel_manager_sender
+            .try_send(message)
+            .map_err(|_| ())
+    }
+
+    /// Discards what is queued for the channel manager of an ended generation and returns how
+    /// many messages that was. The accepted shares among them never reach an upstream, and are
+    /// counted as dropped.
+    fn discard_unsent(&self, queue: &Receiver<(MiningOwned, Option<ShareOrigin>)>) -> usize {
+        let mut discarded = 0;
+        let mut shares = 0;
+        while let Ok((message, _)) = queue.try_recv() {
+            discarded += 1;
+            shares += usize::from(matches!(message, MiningOwned::SubmitSharesExtended(_)));
+        }
+        #[cfg(feature = "monitoring")]
+        self.count_shares_upstream_gone(shares);
+        #[cfg(not(feature = "monitoring"))]
+        let _ = shares;
+        discarded
+    }
+
+    /// Applies a generation boundary.
+    ///
+    /// On [`GenerationEvent::Ended`] every message of the ended generation still queued in
+    /// either direction is discarded and its channel state is cleared. Miners are then either
+    /// held (`upstream_loss_hold_secs > 0`) or disconnected. On [`GenerationEvent::Connected`]
+    /// the channel opens that waited for an upstream, held miners included, are queued.
+    async fn handle_generation_event(
+        &self,
+        event: GenerationEvent,
+    ) -> TproxyResult<GenerationFollowUp, error::Sv1Server> {
+        match event {
+            GenerationEvent::Ended { drained } => {
+                {
+                    let mut slot = self.generation_slot();
+                    slot.epoch += 1;
+                    slot.fallback_token = None;
+                }
+                let discarded_from = drain_queue(&self.sv1_server_io.channel_manager_receiver);
+                let discarded_to = self.generation_control.as_ref().map_or(0, |control| {
+                    self.discard_unsent(&control.to_channel_manager)
+                });
+                if let Some(drained) = drained {
+                    let _ = drained.send(());
+                }
+                info!(
+                    discarded_from,
+                    discarded_to, "SV1 server: upstream generation ended"
+                );
+                self.hold
+                    .pending_opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.hold.reattaching.store(false, Ordering::Release);
+                if self.config.upstream_loss_hold().is_some() {
+                    self.hold_miners().await?;
+                    return Ok(GenerationFollowUp::StartHold);
+                }
+                self.clear_generation_state()?;
+                self.downstreams
+                    .for_each(|_, downstream| downstream.disconnect());
+            }
+            GenerationEvent::Connected { fallback_token } => {
+                {
+                    let mut slot = self.generation_slot();
+                    slot.epoch += 1;
+                    slot.fallback_token = Some(fallback_token);
+                }
+                let held = self.hold.holding.swap(false, Ordering::AcqRel);
+                let waiting = self.downstreams_waiting_for_a_channel()?;
+                info!(
+                    waiting = waiting.len(),
+                    "SV1 server: upstream generation connected"
+                );
+                self.hold
+                    .reattaching
+                    .store(held && !waiting.is_empty(), Ordering::Release);
+                self.hold
+                    .pending_opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(waiting);
+            }
+            GenerationEvent::Released => {
+                self.hold.holding.store(false, Ordering::Release);
+                return Ok(GenerationFollowUp::Release);
+            }
+        }
+        Ok(GenerationFollowUp::None)
+    }
+
+    /// Keeps every miner with an open channel connected without one.
+    ///
+    /// Each held miner is told through its own event queue, behind everything queued for it by
+    /// the ended generation.
+    async fn hold_miners(&self) -> TproxyResult<(), error::Sv1Server> {
+        let mut held = Vec::new();
+        self.downstreams.try_for_each(|downstream_id, downstream| {
+            let is_held = downstream
+                .downstream_data
+                .with(|data| {
+                    data.held |= data.channel_id.take().is_some();
+                    data.held
+                })
+                .map_err(TproxyError::<error::Sv1Server>::shutdown)?;
+            if is_held {
+                held.push(downstream_id);
+            }
+            Ok::<_, TproxyError<error::Sv1Server>>(())
+        })?;
+        self.clear_generation_state()?;
+        self.hold.holding.store(true, Ordering::Release);
+        info!(
+            held = held.len(),
+            "SV1 server: holding miners until an upstream connects"
+        );
+        for downstream_id in held {
+            self.send_to_downstream(downstream_id, Sv1ServerEvent::Hold);
+        }
+        Ok(())
+    }
+
+    /// Asks every held miner for its next keep-alive job. All of them use the same job-id
+    /// counter value, drawn from the counter normal keep-alive jobs use.
+    async fn send_hold_keepalives(&self, interval: Duration) {
+        let interval_secs = u32::try_from(interval.as_secs()).unwrap_or(u32::MAX);
+        let counter = self
+            .keepalive_job_id_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let mut held = Vec::new();
+        self.downstreams.for_each(|downstream_id, downstream| {
+            if downstream
+                .downstream_data
+                .with(|data| data.held)
+                .unwrap_or(false)
+            {
+                held.push(downstream_id);
+            }
+        });
+        for downstream_id in held {
+            self.send_to_downstream(
+                downstream_id,
+                Sv1ServerEvent::HoldKeepalive {
+                    counter,
+                    interval_secs,
+                },
+            );
+        }
+    }
+
+    /// Sends `client.reconnect` to every miner whose channel open has gone unanswered for
+    /// [`CHANNEL_OPEN_TIMEOUT`], so one lost answer cannot keep it, or a re-attach, waiting.
+    fn expire_channel_opens(&self, now: Instant) {
+        let mut expired = Vec::new();
+        self.open_requested_at.retain(|request_id, requested_at| {
+            if !self.request_id_to_downstream_id.contains_key(request_id) {
+                return false;
+            }
+            if now.duration_since(*requested_at) < CHANNEL_OPEN_TIMEOUT {
+                return true;
+            }
+            expired.push(*request_id);
+            false
+        });
+        for request_id in expired {
+            let Some((_, downstream_id)) = self.request_id_to_downstream_id.remove(&request_id)
+            else {
+                continue;
+            };
+            warn!(
+                downstream_id,
+                request_id,
+                "Channel open unanswered for {CHANNEL_OPEN_TIMEOUT:?}; asking the miner to reconnect"
+            );
+            if let Some(downstream) = self.downstreams.get_cloned(&downstream_id) {
+                downstream.reconnect();
+            }
+        }
+    }
+
+    /// Opens queued channels while fewer than [`MAX_CHANNEL_OPENS_IN_FLIGHT`] are outstanding,
+    /// then reports a finished re-attach.
+    async fn send_pending_channel_opens(&self) -> TproxyResult<(), error::Sv1Server> {
+        loop {
+            if self.current_generation().is_none()
+                || self.request_id_to_downstream_id.len() >= MAX_CHANNEL_OPENS_IN_FLIGHT
+            {
+                return Ok(());
+            }
+            let next = self
+                .hold
+                .pending_opens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            let Some(downstream_id) = next else {
+                break;
+            };
+            if !self.downstreams.contains_key(&downstream_id) {
+                continue;
+            }
+            if let Err(e) = self.handle_open_channel_request(downstream_id).await {
+                // Only `DownstreamNotPresent`: the miner left after it was queued.
+                if !matches!(e.action, Action::Disconnect(_)) {
+                    return Err(e);
+                }
+            }
+        }
+        if self.request_id_to_downstream_id.is_empty()
+            && self.hold.reattaching.swap(false, Ordering::AcqRel)
+        {
+            let counters = &self.hold.reattach_counters;
+            info!(
+                unchanged = counters.unchanged.load(Ordering::Relaxed),
+                set_extranonce = counters.set_extranonce.load(Ordering::Relaxed),
+                reconnect = counters.reconnect.load(Ordering::Relaxed),
+                rejected_shares = self.hold.rejected_shares.load(Ordering::Relaxed),
+                "SV1 server: held miners re-attached (totals since start)"
+            );
+            if self.mode.is_aggregated() && self.config.downstream_difficulty_config.enable_vardiff
+            {
+                self.send_update_channel_on_downstream_state_change()
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn has_pending_channel_opens(&self) -> bool {
+        !self
+            .hold
+            .pending_opens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || self.hold.reattaching.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_holding(&self) -> bool {
+        self.hold.holding.load(Ordering::Acquire)
+    }
+
+    /// Queues `event` for a miner. Its queue is unbounded, so this only fails once the miner is
+    /// gone.
+    fn send_to_downstream(&self, downstream_id: DownstreamId, event: Sv1ServerEvent) -> bool {
+        self.sv1_server_io
+            .sv1_server_to_downstream_sender
+            .get_cloned(&downstream_id)
+            .is_some_and(|sender| sender.try_send(event).is_ok())
+    }
+
+    /// Clears everything tied to the channels of an upstream generation, including each
+    /// miner's channel id, so nothing from it can reach the next channel manager.
+    #[allow(clippy::result_large_err)]
+    fn clear_generation_state(&self) -> TproxyResult<(), error::Sv1Server> {
+        self.channels.clear();
+        let _ = self.aggregated_job_mutation_time.set(None);
+        self.request_id_to_downstream_id.clear();
+        self.open_requested_at.clear();
+        self.downstreams.try_for_each(|_, downstream| {
+            downstream
+                .downstream_data
+                .with(|data| data.channel_id = None)
+                .map_err(TproxyError::shutdown)
+        })
+    }
+
+    /// Miners that need a channel on the connected generation: held ones, and ones whose setup
+    /// messages are queued for a channel that has not been requested yet.
+    #[allow(clippy::result_large_err)]
+    fn downstreams_waiting_for_a_channel(
+        &self,
+    ) -> TproxyResult<Vec<DownstreamId>, error::Sv1Server> {
+        let mut waiting = Vec::new();
+        self.downstreams.try_for_each(|downstream_id, downstream| {
+            let wants_channel = downstream
+                .downstream_data
+                .with(|data| {
+                    data.channel_id.is_none()
+                        && (data.held || !data.queued_sv1_handshake_messages.is_empty())
+                })
+                .map_err(TproxyError::<error::Sv1Server>::shutdown)?;
+            if wants_channel {
+                waiting.push(downstream_id);
+            }
+            Ok::<_, TproxyError<error::Sv1Server>>(())
+        })?;
+        waiting.sort_unstable();
+        Ok(waiting)
     }
 
     /// Starts the SV1 server and begins accepting connections.
@@ -488,7 +996,6 @@ impl Sv1Server {
     ///
     /// # Arguments
     /// * `cancellation_token` - Global application cancellation token
-    /// * `fallback_coordinator` - Fallback coordinator
     /// * `task_manager` - Manager for spawned async tasks
     ///
     /// # Returns
@@ -497,7 +1004,19 @@ impl Sv1Server {
     pub async fn start(
         self: Arc<Self>,
         cancellation_token: CancellationToken,
-        fallback_coordinator: FallbackCoordinator,
+        task_manager: Arc<TaskManager>,
+    ) -> TproxyResult<(), error::Sv1Server> {
+        self.start_with_drain(cancellation_token, CancellationToken::new(), task_manager)
+            .await
+    }
+
+    /// Like [`Sv1Server::start`], plus a `drain_token`: cancelling it closes the listener and
+    /// drains downstreams (see [`Sv1Server::drain_downstreams`]), and the global token is
+    /// cancelled once drained.
+    pub async fn start_with_drain(
+        self: Arc<Self>,
+        cancellation_token: CancellationToken,
+        drain_token: CancellationToken,
         task_manager: Arc<TaskManager>,
     ) -> TproxyResult<(), error::Sv1Server> {
         info!("Starting SV1 server on {}", self.listener_addr);
@@ -521,6 +1040,8 @@ impl Sv1Server {
         })?;
 
         info!("Translator Proxy: listening on {}", self.listener_addr);
+        // Dropped when a drain starts, so new connections are refused from then on.
+        let mut listener = Some(listener);
 
         let task_manager_clone = task_manager.clone();
         let vardiff_enabled = self.config.downstream_difficulty_config.enable_vardiff;
@@ -529,14 +1050,26 @@ impl Sv1Server {
             .downstream_difficulty_config
             .job_keepalive_interval_secs
             > 0;
-        let fallback_token = fallback_coordinator.token();
-        task_manager_clone.spawn(fallback_coordinator.clone().track(async move {
+        let hold_keepalive_interval = self.config.hold_keepalive_interval();
+        let mut hold_keepalive_timer =
+            tokio::time::interval(hold_keepalive_interval.unwrap_or(Duration::from_secs(3600)));
+        hold_keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut channel_open_timer = tokio::time::interval(CHANNEL_OPEN_PACING);
+        channel_open_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut open_timeout_timer = tokio::time::interval(Duration::from_secs(1));
+        open_timeout_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        task_manager_clone.spawn(async move {
             tokio::pin!(vardiff_future);
             tokio::pin!(keepalive_future);
             // Set after a failed accept() to pause accepting until this instant, while the other
             // arms keep relaying for downstreams that are already connected.
             let mut accept_retry_at: Option<tokio::time::Instant> = None;
             loop {
+                // Generation events are handled by this loop only, and every arm below yields
+                // only before it reads anything: all its sends are on unbounded channels. So an
+                // arm cannot straddle a generation boundary and its sends to the channel manager
+                // belong to the current epoch. An await on a bounded channel or async lock inside
+                // an arm would break that.
                 tokio::select! {
                     biased;
                     // Handle app shutdown signal
@@ -546,16 +1079,92 @@ impl Sv1Server {
                         break;
                     }
 
-                    // Handle fallback trigger
-                    _ = fallback_token.cancelled() => {
-                        info!("SV1 Server: fallback triggered, clearing state");
-                        self.cleanup();
-                        break;
+                    // Polled before upstream messages, so a generation boundary is handled
+                    // before the first message of the channel manager that follows it.
+                    event = next_generation_event(&self.generation_control) => {
+                        let Some(event) = event else {
+                            debug!("SV1 Server: generation control closed. Exiting.");
+                            self.cleanup();
+                            break;
+                        };
+                        match self.handle_generation_event(event).await {
+                            Ok(GenerationFollowUp::None) => {}
+                            Ok(GenerationFollowUp::StartHold) => hold_keepalive_timer.reset_immediately(),
+                            Ok(GenerationFollowUp::Release) => {
+                                let span = drain_span(self.config.drain_window());
+                                info!(
+                                    "SV1 Server: no upstream within the hold window; asking {} miners to reconnect over {:?}",
+                                    self.downstreams.len(),
+                                    span
+                                );
+                                let sv1_server = self.clone();
+                                let cancellation_token = cancellation_token.clone();
+                                task_manager.spawn(async move {
+                                    tokio::select! {
+                                        _ = cancellation_token.cancelled() => {}
+                                        _ = sv1_server.drain_downstreams_with(span, true) => {}
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                if let LoopControl::Break = self.handle_error_action(
+                                    "Sv1Server::handle_generation_event",
+                                    &e,
+                                    &cancellation_token,
+                                ).await {
+                                    self.cleanup();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = hold_keepalive_timer.tick(), if hold_keepalive_interval.is_some()
+                        && (self.is_holding() || self.hold.reattaching.load(Ordering::Acquire)) => {
+                        if let Some(interval) = hold_keepalive_interval {
+                            self.send_hold_keepalives(interval).await;
+                        }
+                    }
+                    _ = open_timeout_timer.tick(), if !self.open_requested_at.is_empty() => {
+                        self.expire_channel_opens(Instant::now());
+                    }
+                    _ = channel_open_timer.tick(), if self.has_pending_channel_opens() => {
+                        if let Err(e) = self.send_pending_channel_opens().await {
+                            if let LoopControl::Break = self.handle_error_action(
+                                "Sv1Server::send_pending_channel_opens",
+                                &e,
+                                &cancellation_token,
+                            ).await {
+                                self.cleanup();
+                                break;
+                            }
+                        }
+                    }
+                    _ = drain_token.cancelled(), if listener.is_some() => {
+                        listener = None;
+                        let span = drain_span(self.config.drain_window());
+                        info!(
+                            "SV1 Server: drain started, listener closed; disconnecting {} downstreams over {:?}",
+                            self.downstreams.len(),
+                            span
+                        );
+                        // Runs across upstream fallbacks: miners dropped by a fallback simply
+                        // leave the drain early.
+                        let sv1_server = self.clone();
+                        let cancellation_token = cancellation_token.clone();
+                        task_manager.spawn(async move {
+                            tokio::select! {
+                                _ = cancellation_token.cancelled() => {}
+                                _ = sv1_server.drain_downstreams(span) => {
+                                    info!("SV1 Server: all downstreams drained, shutting down");
+                                    cancellation_token.cancel();
+                                }
+                            }
+                        });
                     }
                     _ = tokio::time::sleep_until(accept_retry_at.unwrap_or_else(tokio::time::Instant::now)), if accept_retry_at.is_some() => {
                         accept_retry_at = None;
                     }
-                    result = listener.accept(), if accept_retry_at.is_none() => {
+                    result = accept(&listener), if accept_retry_at.is_none() => {
                         match result {
                             Ok((stream, addr)) => {
                                 info!("New SV1 downstream connection from {}", addr);
@@ -582,7 +1191,8 @@ impl Sv1Server {
                                     #[cfg(feature = "monitoring")]
                                     addr.ip(),
                                     connection_token,
-                                );
+                                )
+                                .with_reattach_counters(self.hold.reattach_counters.clone());
                                 self.downstreams.insert(downstream_id, downstream.clone());
                                 info!("Downstream {} registered successfully (channel will be opened after first message)", downstream_id);
 
@@ -591,7 +1201,6 @@ impl Sv1Server {
                                 Downstream::start(
                                     downstream,
                                     cancellation_token.clone(),
-                                    fallback_coordinator.clone(),
                                     task_manager.clone(),
                                     move || async move {
                                         // Cleanup only ever fails with `Shutdown` (poisoned
@@ -626,7 +1235,6 @@ impl Sv1Server {
                                 "Sv1Server::handle_downstream_message",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ).await {
                                 self.cleanup();
                                 break;
@@ -641,7 +1249,6 @@ impl Sv1Server {
                                 "Sv1Server::handle_upstream_message",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ).await {
                                 self.cleanup();
                                 break;
@@ -657,7 +1264,6 @@ impl Sv1Server {
                                 "Sv1Server::spawn_vardiff_loop",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ).await {
                                 self.cleanup();
                                 break;
@@ -673,7 +1279,6 @@ impl Sv1Server {
                                 "Sv1Server::spawn_job_keepalive_loop",
                                 &e,
                                 &cancellation_token,
-                                &fallback_token,
                             ).await {
                                 self.cleanup();
                                 break;
@@ -683,9 +1288,80 @@ impl Sv1Server {
                 }
             }
             debug!("SV1 Server main listener loop exited.");
-        }));
+        });
 
         Ok(())
+    }
+
+    /// Registers a downstream that never sends or receives anything, for tests that only care
+    /// whether a miner is connected.
+    #[cfg(test)]
+    pub(crate) fn insert_idle_downstream(&self, downstream_id: DownstreamId) {
+        let (sv1_sender, _sv1_receiver) = unbounded();
+        let (_miner_sender, miner_receiver) = unbounded();
+        let (_event_sender, event_receiver) = unbounded();
+        let hashrate = 1.0e12;
+        let downstream = Downstream::new(
+            downstream_id,
+            sv1_sender,
+            miner_receiver,
+            self.sv1_server_io.downstream_to_sv1_server_sender.clone(),
+            event_receiver,
+            hash_rate_to_target(hashrate, 5.0).unwrap(),
+            Some(hashrate as Hashrate),
+            self.config.max_past_jobs,
+            #[cfg(feature = "monitoring")]
+            "127.0.0.1".parse().unwrap(),
+            CancellationToken::new(),
+        );
+        self.downstreams.insert(downstream_id, downstream);
+    }
+
+    /// Disconnects the downstreams registered when called one at a time, spread evenly across
+    /// `window`, then waits until they have all been removed.
+    ///
+    /// The window is split into one slot per downstream and each disconnect lands at a random
+    /// point inside its slot, so miners reconnect elsewhere in a steady trickle instead of all at
+    /// once. If `drain_send_reconnect` is set each miner is sent `client.reconnect` first.
+    pub(crate) async fn drain_downstreams(&self, window: Duration) {
+        self.drain_downstreams_with(window, self.config.drain_send_reconnect)
+            .await
+    }
+
+    /// [`Sv1Server::drain_downstreams`], with `send_reconnect` deciding whether each miner is
+    /// sent `client.reconnect` before its connection is closed.
+    pub(crate) async fn drain_downstreams_with(&self, window: Duration, send_reconnect: bool) {
+        const POLL: Duration = Duration::from_millis(100);
+        let mut ids = self.downstreams.keys();
+        ids.sort_unstable();
+        let start = tokio::time::Instant::now();
+        let slot = window / (ids.len().max(1) as u32);
+        let jitter = std::collections::hash_map::RandomState::new();
+        for (i, id) in ids.into_iter().enumerate() {
+            // Uniform in [0, 1) from a randomly keyed hash; avoids a new dependency for one value.
+            let unit =
+                (std::hash::BuildHasher::hash_one(&jitter, i) >> 11) as f64 / (1u64 << 53) as f64;
+            // Wake early if every miner has already left, so the drain ends with the last one.
+            let at = start + slot * i as u32 + slot.mul_f64(unit);
+            while tokio::time::Instant::now() < at && !self.downstreams.is_empty() {
+                tokio::time::sleep_until(at.min(tokio::time::Instant::now() + POLL)).await;
+            }
+            if self.downstreams.is_empty() {
+                break;
+            }
+            let Some(downstream) = self.downstreams.get_cloned(&id) else {
+                continue;
+            };
+            info!("Draining downstream {id}");
+            if send_reconnect {
+                downstream.reconnect();
+            } else {
+                downstream.disconnect();
+            }
+        }
+        while !self.downstreams.is_empty() {
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     /// Handles messages received from downstream SV1 miners.
@@ -707,7 +1383,7 @@ impl Sv1Server {
             .await
             .map_err(TproxyError::shutdown)?;
 
-        let (channel_id, subscribed, opening) =
+        let (channel_id, subscribed, opening, held) =
             match self.with_registered_downstream(downstream_id, |downstream| {
                 downstream
                     .downstream_data
@@ -716,6 +1392,7 @@ impl Sv1Server {
                             data.channel_id,
                             data.session_state.is_subscribed(),
                             !data.queued_sv1_handshake_messages.is_empty(),
+                            data.held,
                         )
                     })
                     .map_err(TproxyError::shutdown)
@@ -742,6 +1419,8 @@ impl Sv1Server {
                 let response = submit
                     .clone()
                     .respond(SubmitOutcome::Rejected(SubmitError::NotSubscribed));
+                #[cfg(feature = "monitoring")]
+                self.record_share_outcome(downstream_id, &response);
                 let downstream_sender = self
                     .with_registered_downstream(downstream_id, |downstream| {
                         Ok(downstream.downstream_io.downstream_sv1_sender.clone())
@@ -758,6 +1437,27 @@ impl Sv1Server {
                 return Ok(());
             }
         }
+        // A held miner has no channel until the next upstream generation. Its shares are stale
+        // (that channel's jobs will differ) and are rejected at once; anything else waits for
+        // the channel like setup traffic does.
+        if held {
+            if let Client2Server::Submit(submit) = &request {
+                self.hold.rejected_shares.fetch_add(1, Ordering::Relaxed);
+                let response = submit
+                    .clone()
+                    .respond(SubmitOutcome::Rejected(SubmitError::JobNotFound));
+                #[cfg(feature = "monitoring")]
+                self.record_share_outcome(downstream_id, &response);
+                let downstream_sender = self
+                    .with_registered_downstream(downstream_id, |downstream| {
+                        Ok(downstream.downstream_io.downstream_sv1_sender.clone())
+                    })?;
+                downstream_sender.send(response.into()).await.map_err(|_| {
+                    TproxyError::disconnect(TproxyErrorKind::ChannelErrorSender, downstream_id)
+                })?;
+                return Ok(());
+            }
+        }
         // Configure is optional; subscribe and authorize may arrive in either order. Ancillary
         // setup requests may follow the opening request. A submit cannot start a session; the
         // not-subscribed case was answered above, while an unauthorized worker is rejected by
@@ -766,7 +1466,7 @@ impl Sv1Server {
             request,
             Client2Server::Configure(_) | Client2Server::Subscribe(_) | Client2Server::Authorize(_)
         );
-        if channel_id.is_none() && !opening && !can_start {
+        if channel_id.is_none() && !opening && !can_start && !held {
             return Err(TproxyError::disconnect(
                 TproxyErrorKind::Sv1RequestBeforeSetup,
                 downstream_id,
@@ -791,7 +1491,7 @@ impl Sv1Server {
                     })
                     .map_err(TproxyError::shutdown)?
             })?;
-            if !opening {
+            if !opening && !held && self.current_generation().is_some() {
                 self.handle_open_channel_request(downstream_id).await?;
             }
             debug!("Down: Queuing Sv1 message until channel is established");
@@ -819,6 +1519,8 @@ impl Sv1Server {
             Client2Server::Authorize(_) => Some(Sv1SetupRequest::Authorize),
             _ => None,
         };
+        #[cfg(feature = "monitoring")]
+        let is_submit = matches!(downstream_message, Client2Server::Submit(_));
         let response = self
             .clone()
             .handle_parsed_request(Some(downstream_id), downstream_message)
@@ -827,6 +1529,12 @@ impl Sv1Server {
         match response {
             Ok(Some(response_msg)) => {
                 debug!("Down: Sending Sv1 message to downstream: {}", response_msg);
+                // Counted here, where the answer is final: sv1_api rejects some submits (an
+                // unauthorized worker, a wrong extranonce2 size) before they reach this server.
+                #[cfg(feature = "monitoring")]
+                if is_submit {
+                    self.record_share_outcome(downstream_id, &response_msg);
+                }
                 let downstream_sender = self
                     .with_registered_downstream(downstream_id, |downstream| {
                         Ok(downstream.downstream_io.downstream_sv1_sender.clone())
@@ -947,16 +1655,16 @@ impl Sv1Server {
         )
         .map_err(TproxyError::shutdown)?;
 
-        let worker_name = match self.with_registered_downstream(
+        let (sv1_username, worker_name) = match self.with_registered_downstream(
             message.downstream_id,
             |downstream| {
                 downstream
                     .downstream_data
-                    .with(|data| data.sv1_worker_name.clone())
+                    .with(|data| (data.sv1_username.clone(), data.sv1_worker_name.clone()))
                     .map_err(TproxyError::shutdown)
             },
         ) {
-            Ok(worker_name) => worker_name,
+            Ok(names) => names,
             Err(e) if matches!(e.kind, TproxyErrorKind::DownstreamNotPresent(_)) => {
                 warn!(
                     "Downstream {} disconnected before its share could be forwarded; dropping share",
@@ -966,16 +1674,17 @@ impl Sv1Server {
             }
             Err(e) => return Err(e),
         };
-        let sv1_worker_name = (!worker_name.is_empty()).then_some(worker_name);
+        let origin = ShareOrigin {
+            downstream_id: message.downstream_id,
+            sv1_username,
+            worker: (!worker_name.is_empty()).then_some(worker_name),
+        };
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((
-                MiningOwned::SubmitSharesExtended(submit_share_extended),
-                sv1_worker_name,
-            ))
-            .await
-            .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
+        self.send_to_channel_manager((
+            MiningOwned::SubmitSharesExtended(submit_share_extended),
+            Some(origin),
+        ))
+        .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
 
         Ok(())
     }
@@ -1004,6 +1713,7 @@ impl Sv1Server {
         let request_id = self.request_id_factory.fetch_add(1, Ordering::Relaxed);
         self.request_id_to_downstream_id
             .insert(request_id, downstream_id);
+        self.open_requested_at.insert(request_id, Instant::now());
 
         self.forward_pending_open_channel_request(request_id, downstream_id)
             .await
@@ -1065,22 +1775,17 @@ impl Sv1Server {
                     // success races with that cleanup, release the resulting unclaimed channel.
                     // Do not close a channel already routed by an earlier success.
                     if self.channel_owner(m.channel_id).is_none() {
-                        self.sv1_server_io
-                            .channel_manager_sender
-                            .send((
-                                MiningOwned::CloseChannel(CloseChannelOwned {
-                                    channel_id: m.channel_id,
-                                    reason_code: Str0255Owned::try_from(
-                                        "downstream disconnected".to_string(),
-                                    )
-                                    .unwrap(),
-                                }),
-                                None,
-                            ))
-                            .await
-                            .map_err(|_| {
-                                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
-                            })?;
+                        self.send_to_channel_manager((
+                            MiningOwned::CloseChannel(CloseChannelOwned {
+                                channel_id: m.channel_id,
+                                reason_code: Str0255Owned::try_from(
+                                    "downstream disconnected".to_string(),
+                                )
+                                .unwrap(),
+                            }),
+                            None,
+                        ))
+                        .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
                     }
                     return Err(TproxyError::log(TproxyErrorKind::RequestIdNotFound(
                         m.request_id,
@@ -1093,30 +1798,55 @@ impl Sv1Server {
                 } else {
                     self.hashrate_from_upstream_target(initial_target)
                 };
-                let extranonce1 = m
+                let extranonce1: Extranonce = m
                     .extranonce_prefix
                     .to_owned_bytes()
                     .try_into()
                     .map_err(TproxyError::fallback)?;
+                let extranonce2_len: usize = m.extranonce_size.into();
+                let epoch = self.generation_epoch();
                 let downstream_setup =
                     self.with_registered_downstream(downstream_id, |downstream| {
-                        downstream
+                        // A held miner already has an extranonce; its own task compares it with
+                        // the new one, behind any change still queued for it.
+                        let reattach = downstream
                             .downstream_data
                             .with(|d| {
-                                d.extranonce1 = extranonce1;
-                                d.extranonce2_len = m.extranonce_size.into();
+                                let reattach = std::mem::take(&mut d.held);
+                                if !reattach {
+                                    d.extranonce1 = extranonce1.clone();
+                                    d.extranonce2_len = extranonce2_len;
+                                } else {
+                                    // Jobs broadcast while the miner was held were recorded
+                                    // with the extranonce the miner was told; shares on them
+                                    // cannot be credited under a different one. That is
+                                    // compared, not `extranonce1`, which the miner's task only
+                                    // resets to it once it has processed `Hold`.
+                                    let (told, told_len) =
+                                        d.miner_extranonce.clone().unwrap_or_else(|| {
+                                            (d.extranonce1.clone(), d.extranonce2_len)
+                                        });
+                                    if told != extranonce1 || told_len != extranonce2_len {
+                                        d.job_validation_contexts.clear();
+                                    }
+                                }
                                 d.channel_id = Some(m.channel_id);
+                                d.channel_epoch = epoch;
                                 // Set the initial upstream target from
                                 // OpenExtendedMiningChannelSuccess
                                 d.set_upstream_target(initial_target, downstream_id);
                                 if vardiff_enabled {
-                                    // Vardiff starts from the configured minimum hashrate.
-                                    d.desired_target = Some(first_target);
+                                    // Vardiff starts from the configured minimum hashrate; a
+                                    // re-attached miner keeps the target it had learned.
+                                    if !reattach {
+                                        d.desired_target = Some(first_target);
+                                    }
                                 } else if let Some(hashrate) = upstream_hashrate {
                                     // Without vardiff the upstream sets the difficulty, so
                                     // the reported hashrate is the one its target implies.
                                     d.hashrate = Some(hashrate);
                                 }
+                                reattach
                             })
                             .map_err(TproxyError::shutdown)?;
 
@@ -1128,11 +1858,11 @@ impl Sv1Server {
                             channel.owner = Some(downstream_id)
                         });
 
-                        Ok(queued_messages)
+                        Ok((queued_messages, reattach))
                     });
 
                 match downstream_setup {
-                    Ok(queued_messages) => {
+                    Ok((queued_messages, reattach)) => {
                         // A downstream starts contributing shares only after its SV2 channel is
                         // open. Register vardiff at the same lifecycle boundary so the periodic
                         // update does not include a miner that is still opening its channel.
@@ -1142,9 +1872,26 @@ impl Sv1Server {
                             self.vardiff.insert(downstream_id, vardiff);
                         }
 
+                        if reattach
+                            && !self.send_to_downstream(
+                                downstream_id,
+                                Sv1ServerEvent::Reattach {
+                                    extranonce1,
+                                    extranonce2_len,
+                                },
+                            )
+                        {
+                            return Err(TproxyError::disconnect(
+                                TproxyErrorKind::ChannelErrorSender,
+                                downstream_id,
+                            ));
+                        }
+
                         // Queue the initial difficulty before replaying the setup messages:
                         // completing setup releases any job cached while the channel was opening,
-                        // and that job must reach the miner with its difficulty.
+                        // and that job must reach the miner with its difficulty. A re-attached
+                        // miner is advertised the difficulty again, bounded by the new upstream's
+                        // target.
                         self.update_difficulty(downstream_id)?;
 
                         // Process all queued messages now that channel is established
@@ -1162,8 +1909,11 @@ impl Sv1Server {
 
                         // Opening a downstream changes the aggregate just like disconnecting one.
                         // Refresh it now so the newly active hashrate is not left out until the
-                        // next vardiff update.
-                        if self.mode.is_aggregated() && vardiff_enabled {
+                        // next vardiff update. A re-attach refreshes it once, when it finishes.
+                        if self.mode.is_aggregated()
+                            && vardiff_enabled
+                            && !self.hold.reattaching.load(Ordering::Acquire)
+                        {
                             self.send_update_channel_on_downstream_state_change()
                                 .await?;
                         }
@@ -1174,19 +1924,16 @@ impl Sv1Server {
                             let reason_code =
                                 Str0255Owned::try_from("downstream disconnected".to_string())
                                     .unwrap();
-                            self.sv1_server_io
-                                .channel_manager_sender
-                                .send((
-                                    MiningOwned::CloseChannel(CloseChannelOwned {
-                                        channel_id: m.channel_id,
-                                        reason_code,
-                                    }),
-                                    None,
-                                ))
-                                .await
-                                .map_err(|_| {
-                                    TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
-                                })?;
+                            self.send_to_channel_manager((
+                                MiningOwned::CloseChannel(CloseChannelOwned {
+                                    channel_id: m.channel_id,
+                                    reason_code,
+                                }),
+                                None,
+                            ))
+                            .map_err(|_| {
+                                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+                            })?;
                         } else {
                             return Err(e);
                         }
@@ -1470,20 +2217,39 @@ impl Sv1Server {
             ));
         }
 
-        let hashrate = config.min_individual_miner_hashrate as f64;
+        let (miner_id, held_hashrate) =
+            self.with_registered_downstream(downstream_id, |downstream| {
+                downstream
+                    .downstream_data
+                    .with(|data| {
+                        let miner_id = *data.miner_id.get_or_insert_with(|| {
+                            self.miner_counter.fetch_add(1, Ordering::SeqCst) + 1
+                        });
+                        (miner_id, data.held.then_some(data.hashrate).flatten())
+                    })
+                    .map_err(TproxyError::shutdown)
+            })?;
+        // A re-attached miner keeps the hashrate vardiff learned for it, so the pool's view of
+        // it matches the difficulty it keeps working at. Only a usable one is carried over.
+        let hashrate = held_hashrate
+            .filter(|hashrate| hashrate.is_finite() && *hashrate > 0.0)
+            .unwrap_or(config.min_individual_miner_hashrate) as f64;
         let shares_per_min = config.shares_per_minute as f64;
         let min_extranonce_size = self.config.downstream_extranonce2_size;
         let vardiff_enabled = config.enable_vardiff;
 
         let max_target = if vardiff_enabled {
-            hash_rate_to_target(hashrate, shares_per_min).unwrap()
+            hash_rate_to_target(hashrate, shares_per_min)
+                .or_else(|_| {
+                    hash_rate_to_target(config.min_individual_miner_hashrate as f64, shares_per_min)
+                })
+                .unwrap()
         } else {
             // If translator doesn't manage vardiff, we rely on upstream to do that,
             // so we give it more freedom by setting max_target to maximum possible value
             Target::from_le_bytes([0xff; 32])
         };
 
-        let miner_id = self.miner_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let user_identity = self.user_identity();
         // SRI patterns use `/`-delimited segments for payout mode parsing, so appending
         // a suffix would break pool-side validation.
@@ -1503,14 +2269,11 @@ impl Sv1Server {
         )
         .map_err(TproxyError::shutdown)?;
 
-        self.sv1_server_io
-            .channel_manager_sender
-            .send((
-                MiningOwned::OpenExtendedMiningChannel(open_channel_msg),
-                None,
-            ))
-            .await
-            .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
+        self.send_to_channel_manager((
+            MiningOwned::OpenExtendedMiningChannel(open_channel_msg),
+            None,
+        ))
+        .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
 
         Ok(())
     }
@@ -1528,6 +2291,20 @@ impl Sv1Server {
     /// * `downstream_id` - The ID of the downstream that disconnected
     pub async fn handle_downstream_disconnect(
         &self,
+        downstream_id: DownstreamId,
+    ) -> TproxyResult<(), error::Sv1Server> {
+        // Runs in the miner's own task, so a generation boundary can pass while it does. What it
+        // tells the channel manager is read now and must not reach a later one.
+        let epoch = self.generation_epoch();
+        self.handle_downstream_disconnect_in(epoch, downstream_id)
+            .await
+    }
+
+    /// [`Sv1Server::handle_downstream_disconnect`], telling only the channel manager of
+    /// generation `epoch` about it.
+    async fn handle_downstream_disconnect_in(
+        &self,
+        epoch: u64,
         downstream_id: DownstreamId,
     ) -> TproxyResult<(), error::Sv1Server> {
         if self.config.downstream_difficulty_config.enable_vardiff {
@@ -1550,7 +2327,7 @@ impl Sv1Server {
             // In aggregated mode, send UpdateChannel to reflect the new state (only if vardiff
             // enabled)
             if self.config.downstream_difficulty_config.enable_vardiff {
-                if let Err(e) = self.send_update_channel_on_downstream_state_change().await {
+                if let Err(e) = self.send_update_channel_on_downstream_state_change_in(epoch) {
                     error!(
                         "Failed to send UpdateChannel after downstream {} disconnect: {:?}",
                         downstream_id, e
@@ -1558,14 +2335,17 @@ impl Sv1Server {
                 }
             }
 
-            let channel_id = downstream
+            let (channel_id, channel_epoch) = downstream
                 .downstream_data
-                .with(|d| d.channel_id)
+                .with(|d| (d.channel_id, d.channel_epoch))
                 .map_err(TproxyError::shutdown)?;
             if let Some(channel_id) = channel_id {
                 // The channel is the downstream's own: dropping its entry releases its job
                 // state in non-aggregated mode, and never touches the shared aggregated channel.
-                self.channels.remove(&channel_id);
+                // The id may already belong to another miner's channel in a later generation.
+                self.channels.remove_if(&channel_id, |_, channel| {
+                    channel.owner == Some(downstream_id)
+                });
                 // Send `CloseChannel` to the channel manager in both modes so
                 // it can free the per-downstream `ExtendedChannel` (and, in
                 // aggregated mode, the allocator-minted `ExtranoncePrefix`
@@ -1576,17 +2356,18 @@ impl Sv1Server {
                 info!("Sending CloseChannel message: {channel_id} for downstream: {downstream_id}");
                 let reason_code =
                     Str0255Owned::try_from("downstream disconnected".to_string()).unwrap();
-                _ = self
-                    .sv1_server_io
-                    .channel_manager_sender
-                    .send((
+                // Tagged with the generation the channel belongs to, which can be later than
+                // `epoch` if the miner re-attached in between.
+                _ = self.send_to_channel_manager_in(
+                    channel_epoch,
+                    (
                         MiningOwned::CloseChannel(CloseChannelOwned {
                             channel_id,
                             reason_code,
                         }),
                         None,
-                    ))
-                    .await;
+                    ),
+                );
             }
         }
         Ok(())
@@ -2058,7 +2839,10 @@ mod tests {
             Sv1ServerEvent::Notify(notify) => (*notify).clone().into(),
             Sv1ServerEvent::SetDifficulty(difficulty) => difficulty.message,
             Sv1ServerEvent::SetExtranonce { message, .. } => message.into(),
-            Sv1ServerEvent::SetupComplete => panic!("expected a server notification"),
+            Sv1ServerEvent::SetupComplete
+            | Sv1ServerEvent::HoldKeepalive { .. }
+            | Sv1ServerEvent::Hold
+            | Sv1ServerEvent::Reattach { .. } => panic!("expected a server notification"),
         }
     }
 
@@ -2083,6 +2867,119 @@ mod tests {
             unreachable!();
         };
         server_to_client::Notify::try_from(notification).unwrap()
+    }
+
+    /// Each downstream is disconnected inside its own slot of the window, so disconnects are
+    /// spread across it instead of landing together.
+    #[tokio::test(start_paused = true)]
+    async fn drain_disconnects_downstreams_one_slot_apart() {
+        let server = Arc::new(create_test_sv1_server());
+        let ids: Vec<DownstreamId> = (1..=4).collect();
+        for &id in &ids {
+            register_test_downstream(&server, id, None, 100.0, false);
+        }
+        let window = Duration::from_secs(40);
+        let slot = window / ids.len() as u32;
+        let start = tokio::time::Instant::now();
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(window).await }
+        });
+
+        let tick = Duration::from_millis(100);
+        let mut disconnected_at = vec![None; ids.len()];
+        while disconnected_at.iter().any(Option::is_none) {
+            assert!(start.elapsed() <= window, "drain overran its window");
+            tokio::time::sleep(tick).await;
+            for (i, id) in ids.iter().enumerate() {
+                let gone = server
+                    .downstreams
+                    .with(id, |d| d.is_disconnected())
+                    .unwrap();
+                if gone && disconnected_at[i].is_none() {
+                    disconnected_at[i] = Some(start.elapsed());
+                }
+            }
+        }
+        for (i, at) in disconnected_at.into_iter().enumerate() {
+            let at = at.unwrap();
+            let slot_start = slot * i as u32;
+            assert!(
+                at >= slot_start && at <= slot_start + slot + tick,
+                "downstream {} disconnected at {at:?}, outside slot {i}",
+                ids[i]
+            );
+        }
+
+        // Drain returns only once the downstream tasks have removed themselves.
+        assert!(!drain.is_finished());
+        server.downstreams.clear();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should finish once downstreams are gone")
+            .unwrap();
+    }
+
+    /// Miners that leave on their own end the drain early instead of it sleeping out the window.
+    #[tokio::test(start_paused = true)]
+    async fn drain_ends_once_downstreams_leave_on_their_own() {
+        let server = Arc::new(create_test_sv1_server());
+        for id in 1..=2 {
+            register_test_downstream(&server, id, None, 100.0, false);
+        }
+        let start = tokio::time::Instant::now();
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(Duration::from_secs(40)).await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        server.downstreams.clear();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should end once every downstream has left")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The span leaves a tenth of the window, capped at 1s, before the shutdown deadline.
+    #[test]
+    fn drain_span_ends_before_the_window() {
+        assert_eq!(drain_span(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            drain_span(Duration::from_secs(4)),
+            Duration::from_millis(3600)
+        );
+        assert_eq!(drain_span(Duration::from_secs(10)), Duration::from_secs(9));
+        assert_eq!(
+            drain_span(Duration::from_secs(600)),
+            Duration::from_secs(599)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_with_reconnect_sends_client_reconnect_then_closes() {
+        let mut server = create_test_sv1_server();
+        server.config.drain_send_reconnect = true;
+        let (_, miner_rx) =
+            register_test_downstream_with_sv1_receiver(&server, 1, None, 100.0, false);
+        let server = Arc::new(server);
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(Duration::from_secs(10)).await }
+        });
+
+        let json_rpc::Message::Notification(msg) = miner_rx.recv().await.unwrap() else {
+            panic!("expected a notification");
+        };
+        assert_eq!(msg.method, "client.reconnect");
+        assert!(
+            miner_rx.recv().await.is_err(),
+            "outbound channel should close after reconnect"
+        );
+
+        server.downstreams.clear();
+        drain.await.unwrap();
     }
 
     #[test]
@@ -2711,7 +3608,7 @@ mod tests {
                         wire.try_recv().unwrap();
                     }
                     downstream.handle_sv1_server_message().await.unwrap();
-                    assert_eq!(downstream.is_disconnected(), !announce_support);
+                    assert_eq!(downstream.was_asked_to_reconnect(), !announce_support);
                     if announce_support {
                         let json_rpc::Message::Notification(update) = wire.try_recv().unwrap()
                         else {
@@ -2731,6 +3628,11 @@ mod tests {
                             update.extra_nonce1
                         );
                     } else {
+                        let json_rpc::Message::Notification(reconnect) = wire.try_recv().unwrap()
+                        else {
+                            panic!("expected client.reconnect");
+                        };
+                        assert_eq!(reconnect.method, "client.reconnect");
                         assert!(
                             downstream
                                 .downstream_data
@@ -2857,14 +3759,12 @@ mod tests {
         );
 
         let cancellation_token = CancellationToken::new();
-        let fallback_token = CancellationToken::new();
         assert_eq!(
             server
                 .handle_error_action(
                     "pre_channel_sv1_message_queue_disconnects_at_limit",
                     &error,
                     &cancellation_token,
-                    &fallback_token,
                 )
                 .await,
             LoopControl::Continue
@@ -2926,14 +3826,8 @@ mod tests {
         assert!(server.request_id_to_downstream_id.is_empty());
 
         let cancellation_token = CancellationToken::new();
-        let fallback_token = CancellationToken::new();
         let control = server
-            .handle_error_action(
-                "rejected open request",
-                &error,
-                &cancellation_token,
-                &fallback_token,
-            )
+            .handle_error_action("rejected open request", &error, &cancellation_token)
             .await;
         assert!(matches!(control, LoopControl::Continue));
         assert!(!server.downstreams.contains_key(&7));
@@ -3047,7 +3941,7 @@ mod tests {
             .unwrap();
         sender.send(Sv1ServerEvent::SetupComplete).await.unwrap();
         downstream.handle_sv1_server_message().await.unwrap();
-        assert!(downstream.is_disconnected());
+        assert!(downstream.was_asked_to_reconnect());
         assert_eq!(server.channel_owner(42), Some(7));
         assert_eq!(
             downstream
@@ -3199,8 +4093,7 @@ mod tests {
         let target = hash_rate_to_target(100.0, 5.0).unwrap();
 
         server
-            .send_aggregated_update_channel(vec![(1, 1, target, 100.0)])
-            .await
+            .send_aggregated_update_channel(server.generation_epoch(), vec![(1, 1, target, 100.0)])
             .unwrap();
 
         let (message, _) = channel_manager_receiver.recv().await.unwrap();
@@ -4306,7 +5199,7 @@ mod tests {
     type TestChannels = (
         Sv1Server,
         Sender<MiningOwned>,
-        Receiver<(MiningOwned, Option<String>)>,
+        Receiver<(MiningOwned, Option<ShareOrigin>)>,
     );
 
     pub(super) fn server_with_channels(aggregated: bool) -> TestChannels {
@@ -4601,12 +5494,7 @@ mod tests {
                     })
                     .unwrap();
                 server
-                    .handle_error_action(
-                        "admission test",
-                        &error,
-                        &CancellationToken::new(),
-                        &CancellationToken::new(),
-                    )
+                    .handle_error_action("admission test", &error, &CancellationToken::new())
                     .await;
                 assert!(server.downstreams.is_empty());
                 assert!(
@@ -4636,6 +5524,12 @@ mod tests {
         assert_eq!(response.error.unwrap().code, 25);
         assert!(from_server.is_empty());
         assert!(server.request_id_to_downstream_id.is_empty());
+        #[cfg(feature = "monitoring")]
+        assert_eq!(
+            stratum_apps::monitoring::Sv1ClientsMonitoring::get_sv1_share_totals(&server)
+                .rejected_not_subscribed,
+            1
+        );
         server
             .downstreams
             .with(&7, |downstream| {
@@ -4934,7 +5828,7 @@ mod tests {
         server: &Sv1Server,
         downstream_id: usize,
         responses: &Receiver<json_rpc::Message>,
-        forwarded: &Receiver<(MiningOwned, Option<String>)>,
+        forwarded: &Receiver<(MiningOwned, Option<ShareOrigin>)>,
         nonce: u32,
         expected_error: Option<i32>,
     ) {
@@ -5071,5 +5965,1097 @@ mod tests {
                 submit_old_job(&server, 8, &miners[1], &forwarded, 4, None).await;
             }
         }
+    }
+
+    type GenerationTestChannels = (
+        Sv1Server,
+        Sender<MiningOwned>,
+        Receiver<(MiningOwned, Option<ShareOrigin>)>,
+        Sender<GenerationEvent>,
+    );
+
+    fn server_with_generation_control(aggregated: bool) -> GenerationTestChannels {
+        let (server, to_server, from_server) = server_with_channels(aggregated);
+        let (events, events_receiver) = unbounded();
+        let server = server.with_generation_control(events_receiver, from_server.clone());
+        (server, to_server, from_server, events)
+    }
+
+    fn close_channel(channel_id: ChannelId) -> MiningOwned {
+        MiningOwned::CloseChannel(CloseChannelOwned {
+            channel_id,
+            reason_code: Str0255Owned::try_from("test".to_string()).unwrap(),
+        })
+    }
+
+    async fn connect(server: &Sv1Server) {
+        server
+            .handle_generation_event(GenerationEvent::Connected {
+                fallback_token: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn end_generation(server: &Sv1Server) {
+        server
+            .handle_generation_event(GenerationEvent::Ended { drained: None })
+            .await
+            .unwrap();
+    }
+
+    /// Registers a ready miner 7 on channel `channel_id` whose job channel has `job_id` active.
+    fn ready_miner_with_job(
+        server: &Sv1Server,
+        channel_id: ChannelId,
+        job_id: &str,
+    ) -> (Receiver<Sv1ServerEvent>, Receiver<json_rpc::Message>) {
+        let (events, wire) =
+            register_test_downstream_with_sv1_receiver(server, 7, Some(channel_id), 100.0, false);
+        let epoch = server.generation_epoch();
+        server
+            .downstreams
+            .with(&7, |downstream| {
+                downstream
+                    .downstream_data
+                    .with(|data| {
+                        data.session_state = Sv1SessionState::Ready;
+                        data.channel_epoch = epoch;
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        with_test_jobs(server, server.resolve_channel_id(channel_id), |jobs| {
+            jobs.activate(
+                job_id.to_string(),
+                StoredSv1Job::upstream(test_sv1_notify(job_id, true)),
+                true,
+            )
+        });
+        (events, wire)
+    }
+
+    #[tokio::test]
+    async fn generation_end_discards_its_messages_and_disconnects_miners() {
+        let (server, to_server, from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        register_test_downstream(&server, 7, Some(9), 100.0, false);
+        server.request_id_to_downstream_id.insert(3, 7);
+        to_server.send(close_channel(9)).await.unwrap();
+        server
+            .send_to_channel_manager((close_channel(9), None))
+            .unwrap();
+
+        end_generation(&server).await;
+
+        assert!(
+            to_server.is_empty(),
+            "the ended generation's messages are discarded"
+        );
+        assert!(
+            from_server.is_empty(),
+            "requests for the ended generation are discarded"
+        );
+        assert!(server.channels.is_empty());
+        assert!(server.request_id_to_downstream_id.is_empty());
+        let downstream = server.downstreams.get_cloned(&7).unwrap();
+        assert_eq!(
+            downstream.downstream_data.with(|d| d.channel_id).unwrap(),
+            None
+        );
+        assert!(downstream.is_disconnected());
+
+        server
+            .send_to_channel_manager((close_channel(9), None))
+            .unwrap();
+        assert!(
+            from_server.is_empty(),
+            "nothing reaches a channel manager between generations"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_opens_wait_for_the_next_generation() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        register_test_downstream(&server, 7, None, 100.0, false);
+        receive_request(
+            &server,
+            serde_json::from_str(r#"{"id":1,"method":"mining.subscribe","params":[]}"#).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            from_server.is_empty(),
+            "no channel manager to open a channel with"
+        );
+
+        connect(&server).await;
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(matches!(
+            from_server.try_recv(),
+            Ok((MiningOwned::OpenExtendedMiningChannel(_), _))
+        ));
+        assert!(from_server.is_empty(), "one open per waiting miner");
+    }
+
+    #[tokio::test]
+    async fn fallback_request_ends_only_the_current_generation() {
+        let (server, _to_server, _from_server, _events) = server_with_generation_control(false);
+        let token = CancellationToken::new();
+        server
+            .handle_generation_event(GenerationEvent::Connected {
+                fallback_token: token.clone(),
+            })
+            .await
+            .unwrap();
+        let cancellation_token = CancellationToken::new();
+        let control = server
+            .handle_error_action(
+                "fallback test",
+                &TproxyError::fallback(TproxyErrorKind::ChannelNotFound),
+                &cancellation_token,
+            )
+            .await;
+        assert!(matches!(control, LoopControl::Continue));
+        assert!(token.is_cancelled());
+        assert!(!cancellation_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn without_a_hold_window_a_generation_end_disconnects_miners() {
+        let (server, _to_server, _from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        let _ = ready_miner_with_job(&server, 9, "job");
+        end_generation(&server).await;
+        assert!(server.downstreams.get_cloned(&7).unwrap().is_disconnected());
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_racing_a_generation_end_tells_no_later_channel_manager() {
+        for aggregated in [false, true] {
+            let (mut server, _to_server, from_server, _events) =
+                server_with_generation_control(aggregated);
+            server.config.downstream_difficulty_config.enable_vardiff = true;
+            connect(&server).await;
+            let _miner = ready_miner_with_job(&server, 9, "job");
+            // The miner's task reads its channel under this generation...
+            let epoch = server.generation_epoch();
+
+            // ...the generation ends and the next one connects before it sends anything...
+            end_generation(&server).await;
+            connect(&server).await;
+            assert!(from_server.is_empty());
+            // ...still holding channel 9 as it read it, which the new channel manager may
+            // already have handed to another miner...
+            server
+                .downstreams
+                .with(&7, |downstream| {
+                    downstream
+                        .downstream_data
+                        .with(|data| {
+                            data.channel_id = Some(9);
+                            data.channel_epoch = epoch;
+                        })
+                        .unwrap()
+                })
+                .unwrap();
+
+            // ...so neither the CloseChannel for channel 9 nor the aggregate without this miner
+            // may reach the new channel manager.
+            server
+                .handle_downstream_disconnect_in(epoch, 7)
+                .await
+                .unwrap();
+            assert!(
+                from_server.is_empty(),
+                "stale message reached the next channel manager: {:?}",
+                from_server.try_recv()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_closes_a_channel_reattached_in_a_later_generation() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        let _miner = ready_miner_with_job(&server, 9, "job");
+        let epoch = server.generation_epoch();
+        end_generation(&server).await;
+        connect(&server).await;
+        // The miner re-attached to channel 9 of the new generation after its task read `epoch`.
+        let current = server.generation_epoch();
+        server
+            .downstreams
+            .with(&7, |downstream| {
+                downstream
+                    .downstream_data
+                    .with(|data| {
+                        data.channel_id = Some(9);
+                        data.channel_epoch = current;
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+
+        server
+            .handle_downstream_disconnect_in(epoch, 7)
+            .await
+            .unwrap();
+        assert!(matches!(
+            from_server.try_recv(),
+            Ok((MiningOwned::CloseChannel(close), _)) if close.channel_id == 9
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_within_its_generation_closes_the_channel() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        let _miner = ready_miner_with_job(&server, 9, "job");
+        server.handle_downstream_disconnect(7).await.unwrap();
+        assert!(matches!(
+            from_server.try_recv(),
+            Ok((MiningOwned::CloseChannel(close), _)) if close.channel_id == 9
+        ));
+    }
+
+    #[tokio::test]
+    async fn generation_end_is_acknowledged_once_the_shared_queue_is_drained() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        server
+            .send_to_channel_manager((close_channel(9), None))
+            .unwrap();
+        let (drained, drained_receiver) = tokio::sync::oneshot::channel();
+        server
+            .handle_generation_event(GenerationEvent::Ended {
+                drained: Some(drained),
+            })
+            .await
+            .unwrap();
+        drained_receiver.await.unwrap();
+        assert!(from_server.is_empty());
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn shares_whose_upstream_went_away_are_counted_as_dropped() {
+        use stratum_apps::{
+            monitoring::{Sv1ClientsMonitoring, Sv1ShareDropReason},
+            stratum_core::mining_sv2::SubmitSharesExtendedOwned,
+        };
+
+        let share = || {
+            (
+                MiningOwned::SubmitSharesExtended(SubmitSharesExtendedOwned {
+                    channel_id: 9,
+                    sequence_number: 0,
+                    job_id: 1,
+                    nonce: 0,
+                    ntime: 1,
+                    version: 0x2000_0000,
+                    extranonce: vec![0; 4].try_into().unwrap(),
+                }),
+                None,
+            )
+        };
+        let gone = |server: &Sv1Server| {
+            server
+                .get_sv1_share_drops()
+                .dropped(Sv1ShareDropReason::UpstreamGone)
+        };
+
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        let fallback_token = CancellationToken::new();
+        server
+            .handle_generation_event(GenerationEvent::Connected {
+                fallback_token: fallback_token.clone(),
+            })
+            .await
+            .unwrap();
+        let epoch = server.generation_epoch();
+
+        // Queued for a live generation: handed to its channel manager, not counted.
+        server.send_to_channel_manager_in(epoch, share()).unwrap();
+        assert_eq!(gone(&server), 0);
+
+        // The fallback has started: refused. Other messages are refused too, but are no shares.
+        fallback_token.cancel();
+        server.send_to_channel_manager_in(epoch, share()).unwrap();
+        server
+            .send_to_channel_manager_in(epoch, (close_channel(9), None))
+            .unwrap();
+        assert_eq!(gone(&server), 1);
+
+        // The first share was still queued when the generation ended.
+        assert_eq!(from_server.len(), 1);
+        end_generation(&server).await;
+        assert!(from_server.is_empty());
+        assert_eq!(gone(&server), 2);
+
+        // Between generations nothing is accepted by an upstream.
+        server.send_to_channel_manager(share()).unwrap();
+        server
+            .send_to_channel_manager((close_channel(9), None))
+            .unwrap();
+        assert_eq!(gone(&server), 3);
+        assert_eq!(server.get_sv1_share_drops().below_upstream_target, 0);
+    }
+
+    #[tokio::test]
+    async fn nothing_reaches_the_channel_manager_once_its_fallback_has_started() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        let fallback_token = CancellationToken::new();
+        server
+            .handle_generation_event(GenerationEvent::Connected {
+                fallback_token: fallback_token.clone(),
+            })
+            .await
+            .unwrap();
+        let epoch = server.generation_epoch();
+        // The fallback has started but the server has not handled `Ended` yet.
+        fallback_token.cancel();
+
+        server
+            .send_to_channel_manager_in(epoch, (close_channel(9), None))
+            .unwrap();
+        assert!(
+            from_server.is_empty(),
+            "a message reached a channel manager that is going away: {:?}",
+            from_server.try_recv()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_disconnect_leaves_the_next_owner_of_its_channel_id_mapped() {
+        let (server, _to_server, _from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        let _miner = ready_miner_with_job(&server, 9, "job");
+        let epoch = server.generation_epoch();
+        end_generation(&server).await;
+        connect(&server).await;
+        // Miner 7's task still holds channel 9 from the old generation, which the new one has
+        // handed to miner 8.
+        server
+            .downstreams
+            .with(&7, |downstream| {
+                downstream
+                    .downstream_data
+                    .with(|data| {
+                        data.channel_id = Some(9);
+                        data.channel_epoch = epoch;
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        set_test_channel_owner(&server, 9, 8);
+
+        server
+            .handle_downstream_disconnect_in(epoch, 7)
+            .await
+            .unwrap();
+        assert_eq!(server.channel_owner(9), Some(8));
+    }
+
+    #[tokio::test]
+    async fn unanswered_channel_open_asks_the_miner_to_reconnect() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        let (_events, _wire) =
+            register_test_downstream_with_sv1_receiver(&server, 7, None, 100.0, false);
+        server.handle_open_channel_request(7).await.unwrap();
+        assert!(from_server.try_recv().is_ok());
+        let downstream = server.downstreams.get_cloned(&7).unwrap();
+
+        server.expire_channel_opens(Instant::now());
+        assert!(!downstream.was_asked_to_reconnect());
+        server.expire_channel_opens(Instant::now() + CHANNEL_OPEN_TIMEOUT);
+        assert!(downstream.was_asked_to_reconnect());
+        assert!(server.request_id_to_downstream_id.is_empty());
+        assert!(server.open_requested_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vardiff_updates_read_before_a_generation_end_do_not_reach_the_next_one() {
+        for aggregated in [false, true] {
+            let (mut server, _to_server, from_server, _events) =
+                server_with_generation_control(aggregated);
+            server.config.downstream_difficulty_config.enable_vardiff = true;
+            connect(&server).await;
+            let _miner = ready_miner_with_job(&server, 9, "job");
+            let epoch = server.generation_epoch();
+            let target = hash_rate_to_target(100.0, 5.0).unwrap();
+
+            end_generation(&server).await;
+            connect(&server).await;
+            server
+                .send_update_channel_messages(epoch, vec![(7, 9, target, 100.0)])
+                .unwrap();
+            assert!(
+                from_server.is_empty(),
+                "stale UpdateChannel reached the next channel manager"
+            );
+
+            // The miner has a channel again under the new generation.
+            server
+                .downstreams
+                .with(&7, |downstream| {
+                    downstream
+                        .downstream_data
+                        .with(|data| data.channel_id = Some(9))
+                        .unwrap()
+                })
+                .unwrap();
+            server
+                .send_update_channel_messages(
+                    server.generation_epoch(),
+                    vec![(7, 9, target, 100.0)],
+                )
+                .unwrap();
+            assert!(matches!(
+                from_server.try_recv(),
+                Ok((MiningOwned::UpdateChannel(_), _))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_share_accepted_between_generations_is_not_forwarded() {
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        connect(&server).await;
+        let _miner = ready_miner_with_job(&server, 9, "1");
+        end_generation(&server).await;
+        let share = SubmitShareWithChannelId {
+            channel_id: 9,
+            downstream_id: 7,
+            share: client_to_server::Submit {
+                user_name: "worker".to_string(),
+                job_id: "1".to_string(),
+                extra_nonce2: vec![0; 4].try_into().unwrap(),
+                time: HexU32Be(1),
+                nonce: HexU32Be(1),
+                version_bits: None,
+                id: 1,
+            },
+            extranonce: vec![0; 12],
+            extranonce2_len: 4,
+            version_rolling_mask: None,
+            job_version: Some(0x2000_0000),
+        };
+
+        server.handle_submit_shares(share).await.unwrap();
+        assert!(from_server.is_empty());
+    }
+
+    fn holding_server(aggregated: bool) -> GenerationTestChannels {
+        let (server, to_server, from_server) = server_with_channels(aggregated);
+        let (events, events_receiver) = unbounded();
+        let mut server = server.with_generation_control(events_receiver, from_server.clone());
+        server.config.upstream_loss_hold_secs = 60;
+        (server, to_server, from_server, events)
+    }
+
+    /// A holding server with vardiff on, whose miner 7 is ready on channel 9 working at the
+    /// difficulty vardiff wants for it.
+    async fn holding_vardiff_miner(
+        aggregated: bool,
+        desired_target: Target,
+    ) -> (GenerationTestChannels, Receiver<Sv1ServerEvent>) {
+        let (server, to_server, from_server) = vardiff_server(aggregated);
+        let (events, events_receiver) = unbounded();
+        let mut server = server.with_generation_control(events_receiver, from_server.clone());
+        server.config.upstream_loss_hold_secs = 60;
+        connect(&server).await;
+        let (miner_events, _wire) = ready_miner_with_job(&server, 9, "job");
+        read_test_data(&server, 7, |data| {
+            data.desired_target = Some(desired_target);
+            data.target = advertised(desired_target);
+            data.advertised_target = Some(advertised(desired_target));
+            data.set_upstream_target(desired_target, 7);
+        });
+        ((server, to_server, from_server, events), miner_events)
+    }
+
+    /// Moves the held miner 7 onto a new generation whose channel 11 has `upstream_target`, and
+    /// returns what its task is told.
+    async fn reattach_held_miner(
+        server: &Sv1Server,
+        to_server: &Sender<MiningOwned>,
+        from_server: &Receiver<(MiningOwned, Option<ShareOrigin>)>,
+        upstream_target: Target,
+    ) -> MiningOwned {
+        connect(server).await;
+        server.send_pending_channel_opens().await.unwrap();
+        let Ok((MiningOwned::OpenExtendedMiningChannel(open), _)) = from_server.try_recv() else {
+            panic!("expected the held miner's channel to be reopened");
+        };
+        to_server
+            .send(MiningOwned::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccessOwned {
+                    request_id: open.request_id,
+                    channel_id: 11,
+                    target: upstream_target.to_le_bytes().into(),
+                    extranonce_size: 4,
+                    extranonce_prefix: vec![5; 4].try_into().unwrap(),
+                    group_channel_id: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        server
+            .handle_upstream_message(Target::from_le_bytes([0xff; 32]))
+            .await
+            .unwrap();
+        MiningOwned::OpenExtendedMiningChannel(open)
+    }
+
+    #[tokio::test]
+    async fn generation_end_holds_miners_and_rejects_their_shares() {
+        for aggregated in [false, true] {
+            let (server, _to_server, from_server, _events) = holding_server(aggregated);
+            connect(&server).await;
+            let (events, wire) = ready_miner_with_job(&server, 9, "job");
+
+            let follow_up = server
+                .handle_generation_event(GenerationEvent::Ended { drained: None })
+                .await
+                .unwrap();
+            assert!(matches!(follow_up, GenerationFollowUp::StartHold));
+            assert!(server.is_holding());
+            let downstream = server.downstreams.get_cloned(&7).unwrap();
+            assert!(
+                !downstream.is_disconnected(),
+                "a held miner stays connected"
+            );
+            downstream
+                .downstream_data
+                .with(|data| {
+                    assert!(data.held);
+                    assert_eq!(data.channel_id, None);
+                })
+                .unwrap();
+            assert!(matches!(events.try_recv(), Ok(Sv1ServerEvent::Hold)));
+
+            receive_request(
+                &server,
+                serde_json::from_str(
+                    r#"{"id":5,"method":"mining.submit","params":["worker","job","00000000","00000001","00000000"]}"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let response = serde_json::to_value(wire.try_recv().unwrap()).unwrap();
+            assert_eq!(response["id"], serde_json::json!(5));
+            assert_eq!(response["error"][0], serde_json::json!(21), "{response}");
+            assert!(
+                from_server.is_empty(),
+                "held shares never reach a channel manager"
+            );
+            assert!(
+                !downstream.is_disconnected(),
+                "a submit while held is not a protocol error"
+            );
+            assert_eq!(server.hold.rejected_shares.load(Ordering::Relaxed), 1);
+            #[cfg(feature = "monitoring")]
+            assert_eq!(
+                stratum_apps::monitoring::Sv1ClientsMonitoring::get_sv1_share_totals(&server)
+                    .rejected_job_not_found,
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn held_miners_are_asked_for_keepalive_jobs_until_reattached() {
+        let (server, _to_server, _from_server, _events) = holding_server(false);
+        connect(&server).await;
+        let (events, _wire) = ready_miner_with_job(&server, 9, "job");
+        end_generation(&server).await;
+        assert!(matches!(events.try_recv(), Ok(Sv1ServerEvent::Hold)));
+
+        server.send_hold_keepalives(Duration::from_secs(30)).await;
+        server.send_hold_keepalives(Duration::from_secs(30)).await;
+        let mut counters = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            let Sv1ServerEvent::HoldKeepalive {
+                counter,
+                interval_secs,
+            } = event
+            else {
+                panic!("expected keep-alive requests only");
+            };
+            assert_eq!(interval_secs, 30);
+            counters.push(counter);
+        }
+        assert_eq!(counters.len(), 2);
+        assert_ne!(counters[0], counters[1], "each keep-alive is a new job");
+
+        // Still held after the next generation connects, until its channel is re-opened.
+        connect(&server).await;
+        server.send_hold_keepalives(Duration::from_secs(30)).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Sv1ServerEvent::HoldKeepalive { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn held_miners_reopen_their_channel_with_the_same_identity_and_difficulty() {
+        let desired = hash_rate_to_target(100.0, 5.0).unwrap();
+        let ((server, to_server, from_server, _events), events) =
+            holding_vardiff_miner(false, desired).await;
+        server.set_user_identity("test_user".to_string());
+        read_test_data(&server, 7, |data| data.miner_id = Some(4));
+        let retained_target = read_test_data(&server, 7, |data| data.target);
+        let old_extranonce = read_test_data(&server, 7, |data| data.extranonce1.clone());
+        end_generation(&server).await;
+        server
+            .downstreams
+            .get_cloned(&7)
+            .unwrap()
+            .handle_sv1_server_message()
+            .await
+            .unwrap();
+
+        // The new upstream opens the channel at the target requested for it, as the learned
+        // hashrate implies.
+        let open = reattach_held_miner(&server, &to_server, &from_server, desired).await;
+        let MiningOwned::OpenExtendedMiningChannel(open) = open else {
+            unreachable!()
+        };
+        assert!(!server.is_holding());
+        assert_eq!(open.user_identity.as_utf8_or_hex(), "test_user.miner4");
+        assert_eq!(open.nominal_hash_rate, 100.0, "the learned hashrate");
+
+        let Ok(Sv1ServerEvent::Reattach {
+            extranonce1,
+            extranonce2_len,
+        }) = events.try_recv()
+        else {
+            panic!("expected the re-attach");
+        };
+        assert_eq!(extranonce1, vec![5; 4].try_into().unwrap());
+        assert_eq!(extranonce2_len, 4);
+        assert_eq!(
+            queued_target(&events),
+            Some(retained_target),
+            "the difficulty is repeated"
+        );
+        read_test_data(&server, 7, |data| {
+            assert!(!data.held);
+            assert_eq!(data.channel_id, Some(11));
+            assert_eq!(data.target, retained_target);
+            assert_eq!(
+                data.desired_target,
+                Some(desired),
+                "vardiff's target is kept"
+            );
+            assert_eq!(data.miner_id, Some(4));
+            assert_eq!(
+                data.extranonce1, old_extranonce,
+                "the miner's own task compares the new extranonce with the one it has"
+            );
+        });
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(!server.has_pending_channel_opens(), "re-attach finished");
+    }
+
+    /// Holds miner 7 with a job recorded while it was held, as an aggregated broadcast does, and
+    /// moves it onto a generation that assigns `vec![5; 4]`. Returns whether the job's context
+    /// survived the re-attach.
+    async fn held_job_context_survives_reattach(
+        aggregated: bool,
+        miner_prefix: Extranonce,
+        miner_extranonce2_len: usize,
+    ) -> bool {
+        let told = (miner_prefix.clone(), miner_extranonce2_len);
+        held_job_context_survives_reattach_of(aggregated, miner_prefix, miner_extranonce2_len, told)
+            .await
+    }
+
+    /// Like `held_job_context_survives_reattach`, with the miner's task not yet having processed
+    /// `Hold`: `extranonce1` still holds `miner_prefix`, while `told` is what the miner was
+    /// actually given.
+    async fn held_job_context_survives_reattach_of(
+        aggregated: bool,
+        miner_prefix: Extranonce,
+        miner_extranonce2_len: usize,
+        told: (Extranonce, usize),
+    ) -> bool {
+        let (server, to_server, from_server, _events) = holding_server(aggregated);
+        connect(&server).await;
+        let _miner = ready_miner_with_job(&server, 9, "job");
+        end_generation(&server).await;
+        read_test_data(&server, 7, |data| {
+            data.extranonce1 = miner_prefix.clone();
+            data.extranonce2_len = miner_extranonce2_len;
+            data.miner_extranonce = Some(told.clone());
+            data.job_validation_contexts.activate(
+                "broadcast".to_string(),
+                Sv1JobValidationContext {
+                    extranonce: told.0,
+                    extranonce2_len: miner_extranonce2_len,
+                    target: Target::from_le_bytes([0xff; 32]),
+                },
+                false,
+            );
+        });
+        reattach_held_miner(
+            &server,
+            &to_server,
+            &from_server,
+            Target::from_le_bytes([0xff; 32]),
+        )
+        .await;
+        read_test_data(&server, 7, |data| {
+            data.job_validation_context("broadcast").is_some()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_reattach_to_a_new_prefix_invalidates_jobs_recorded_while_held() {
+        for aggregated in [false, true] {
+            let old_prefix: Extranonce = vec![1; 4].try_into().unwrap();
+            assert!(
+                !held_job_context_survives_reattach(aggregated, old_prefix.clone(), 4).await,
+                "a different prefix"
+            );
+            let longer_prefix: Extranonce = vec![5; 6].try_into().unwrap();
+            assert!(
+                !held_job_context_survives_reattach(aggregated, longer_prefix, 4).await,
+                "a different prefix length"
+            );
+            assert!(
+                !held_job_context_survives_reattach(aggregated, vec![5; 4].try_into().unwrap(), 6)
+                    .await,
+                "a different extranonce2 length"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reattach_is_judged_by_the_extranonce_the_miner_was_told() {
+        let told: Extranonce = vec![5; 4].try_into().unwrap();
+        let stale: Extranonce = vec![1; 4].try_into().unwrap();
+        for aggregated in [false, true] {
+            assert!(
+                held_job_context_survives_reattach_of(
+                    aggregated,
+                    stale.clone(),
+                    4,
+                    (told.clone(), 4)
+                )
+                .await,
+                "the new prefix is the one the miner was told"
+            );
+            assert!(
+                !held_job_context_survives_reattach_of(
+                    aggregated,
+                    told.clone(),
+                    4,
+                    (stale.clone(), 4)
+                )
+                .await,
+                "the new prefix is not the one the miner was told"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reattach_to_the_same_prefix_keeps_jobs_recorded_while_held() {
+        for aggregated in [false, true] {
+            assert!(
+                held_job_context_survives_reattach(aggregated, vec![5; 4].try_into().unwrap(), 4)
+                    .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_miner_is_advertised_no_harder_a_difficulty_than_the_new_upstream_allows() {
+        // vardiff wants a harder target than the new upstream's channel accepts.
+        let desired = hash_rate_to_target(1_000_000.0, 5.0).unwrap();
+        let upstream_target = hash_rate_to_target(100.0, 5.0).unwrap();
+        let ((server, to_server, from_server, _events), events) =
+            holding_vardiff_miner(false, desired).await;
+        end_generation(&server).await;
+        server
+            .downstreams
+            .get_cloned(&7)
+            .unwrap()
+            .handle_sv1_server_message()
+            .await
+            .unwrap();
+
+        reattach_held_miner(&server, &to_server, &from_server, upstream_target).await;
+        let _ = events.try_recv();
+        assert_eq!(queued_target(&events), Some(advertised(upstream_target)));
+        read_test_data(&server, 7, |data| {
+            assert_eq!(
+                data.desired_target,
+                Some(desired),
+                "vardiff keeps its target"
+            );
+            assert_eq!(data.upstream_target, Some(upstream_target));
+        });
+    }
+
+    #[tokio::test]
+    async fn a_held_miner_without_vardiff_follows_the_new_upstream_target() {
+        let (server, to_server, from_server, _events) = holding_server(false);
+        connect(&server).await;
+        let (events, _wire) = ready_miner_with_job(&server, 9, "job");
+        let old_upstream_target = hash_rate_to_target(100.0, 5.0).unwrap();
+        read_test_data(&server, 7, |data| {
+            data.set_upstream_target(old_upstream_target, 7);
+            data.advertised_target = Some(advertised(old_upstream_target));
+        });
+        end_generation(&server).await;
+        server
+            .downstreams
+            .get_cloned(&7)
+            .unwrap()
+            .handle_sv1_server_message()
+            .await
+            .unwrap();
+
+        let new_upstream_target = hash_rate_to_target(5_000.0, 5.0).unwrap();
+        reattach_held_miner(&server, &to_server, &from_server, new_upstream_target).await;
+        let _ = events.try_recv();
+        assert_eq!(
+            queued_target(&events),
+            Some(advertised(new_upstream_target))
+        );
+        read_test_data(&server, 7, |data| assert_eq!(data.desired_target, None));
+    }
+
+    #[tokio::test]
+    async fn a_difficulty_waiting_for_its_job_when_the_generation_ends_is_dropped() {
+        let desired = hash_rate_to_target(100.0, 5.0).unwrap();
+        let ((server, _to_server, _from_server, _events), _miner_events) =
+            holding_vardiff_miner(false, desired).await;
+        let downstream = server.downstreams.get_cloned(&7).unwrap();
+        let sender = server
+            .sv1_server_io
+            .sv1_server_to_downstream_sender
+            .get_cloned(&7)
+            .unwrap();
+        let pending = sv1_difficulty(hash_rate_to_target(1.0, 5.0).unwrap()).unwrap();
+        sender
+            .send(Sv1ServerEvent::SetDifficulty(pending))
+            .await
+            .unwrap();
+        end_generation(&server).await;
+        let kept = read_test_data(&server, 7, |data| data.target);
+
+        downstream.handle_sv1_server_message().await.unwrap();
+        downstream.handle_sv1_server_message().await.unwrap();
+        read_test_data(&server, 7, |data| {
+            assert!(data.cached_set_difficulty.is_none());
+            assert_eq!(data.advertised_target, None);
+            assert_eq!(
+                data.target, kept,
+                "the miner keeps the difficulty it works at"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn a_held_miners_unusable_hashrate_is_not_sent_upstream() {
+        for unusable in [Hashrate::NAN, Hashrate::INFINITY, -1.0, 0.0] {
+            let (server, _to_server, from_server, _events) = holding_server(false);
+            connect(&server).await;
+            let _miner = ready_miner_with_job(&server, 9, "job");
+            read_test_data(&server, 7, |data| data.hashrate = Some(unusable));
+            end_generation(&server).await;
+            connect(&server).await;
+            server.send_pending_channel_opens().await.unwrap();
+
+            let Ok((MiningOwned::OpenExtendedMiningChannel(open), _)) = from_server.try_recv()
+            else {
+                panic!("expected the held miner's channel to be reopened");
+            };
+            assert_eq!(
+                open.nominal_hash_rate,
+                server
+                    .config
+                    .downstream_difficulty_config
+                    .min_individual_miner_hashrate,
+                "{unusable} falls back to the configured minimum"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reattach_refreshes_the_aggregate_once_when_it_finishes() {
+        let (server, to_server, from_server) = vardiff_server(true);
+        let (events, events_receiver) = unbounded();
+        let mut server = server.with_generation_control(events_receiver, from_server.clone());
+        server.config.upstream_loss_hold_secs = 60;
+        let _events = events;
+        connect(&server).await;
+        register_test_downstream(&server, 7, Some(9), 100.0, false);
+        register_test_downstream(&server, 8, Some(10), 100.0, false);
+        end_generation(&server).await;
+        connect(&server).await;
+        assert!(server.hold.reattaching.load(Ordering::Acquire));
+
+        server.send_pending_channel_opens().await.unwrap();
+        let mut requests = Vec::new();
+        while let Ok((MiningOwned::OpenExtendedMiningChannel(open), _)) = from_server.try_recv() {
+            requests.push(open.request_id);
+        }
+        assert_eq!(requests.len(), 2);
+        for (i, request_id) in requests.into_iter().enumerate() {
+            to_server
+                .send(MiningOwned::OpenExtendedMiningChannelSuccess(
+                    OpenExtendedMiningChannelSuccessOwned {
+                        request_id,
+                        channel_id: 20 + i as u32,
+                        target: Target::from_le_bytes([0xff; 32]).to_le_bytes().into(),
+                        extranonce_size: 4,
+                        extranonce_prefix: vec![i as u8; 4].try_into().unwrap(),
+                        group_channel_id: 0,
+                    },
+                ))
+                .await
+                .unwrap();
+            server
+                .handle_upstream_message(Target::from_le_bytes([0xff; 32]))
+                .await
+                .unwrap();
+        }
+        assert!(
+            from_server.is_empty(),
+            "no aggregate update per re-attached miner"
+        );
+
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(matches!(
+            from_server.try_recv(),
+            Ok((MiningOwned::UpdateChannel(_), _))
+        ));
+        assert!(from_server.is_empty());
+        assert!(!server.has_pending_channel_opens());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_while_holding_ends_the_hold() {
+        let (server, _to_server, _from_server, _events) = holding_server(false);
+        connect(&server).await;
+        let _miner = ready_miner_with_job(&server, 9, "job");
+        end_generation(&server).await;
+        assert!(server.is_holding());
+        let server = Arc::new(server);
+
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams(Duration::from_secs(10)).await }
+        });
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert!(
+            server.downstreams.get_cloned(&7).unwrap().is_disconnected(),
+            "held miners are drained like any other"
+        );
+        server.downstreams.clear();
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("drain should finish once the miners are gone")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_release_asks_held_miners_to_reconnect() {
+        let (server, _to_server, _from_server, _events) = holding_server(false);
+        connect(&server).await;
+        let (_events, wire) = ready_miner_with_job(&server, 9, "job");
+        end_generation(&server).await;
+
+        let follow_up = server
+            .handle_generation_event(GenerationEvent::Released)
+            .await
+            .unwrap();
+        assert!(matches!(follow_up, GenerationFollowUp::Release));
+        assert!(!server.is_holding());
+
+        let server = Arc::new(server);
+        let drain = tokio::spawn({
+            let server = server.clone();
+            async move { server.drain_downstreams_with(Duration::ZERO, true).await }
+        });
+        let json_rpc::Message::Notification(reconnect) = wire.recv().await.unwrap() else {
+            panic!("expected client.reconnect");
+        };
+        assert_eq!(reconnect.method, "client.reconnect");
+        server.downstreams.clear();
+        drain.await.unwrap();
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn share_outcomes_are_counted_per_miner_and_since_start() {
+        use stratum_apps::monitoring::{Sv1ClientsMonitoring, Sv1ShareCounts};
+
+        let (server, _to_server, _from_server) = server_with_channels(true);
+        let (_events, wire) =
+            register_test_downstream_with_sv1_receiver(&server, 7, Some(9), 100.0, false);
+        server
+            .downstreams
+            .with(&7, |downstream| {
+                downstream
+                    .downstream_data
+                    .with(|data| {
+                        data.session_state = Sv1SessionState::Ready;
+                        data.sv1_username = "worker".to_string();
+                        data.extranonce1 = vec![1, 2, 3, 4].try_into().unwrap();
+                        data.extranonce2_len = 16;
+                        // Any hash meets it.
+                        data.target = Target::from_le_bytes([0xff; 32]);
+                        data.version_rolling_mask = None;
+                    })
+                    .unwrap()
+            })
+            .unwrap();
+        with_test_jobs(&server, AGGREGATED_CHANNEL_ID, |jobs| {
+            let job = test_sv1_notify("1", false);
+            jobs.activate("1".to_string(), StoredSv1Job::upstream(job), false);
+        });
+        advertise_job(&server, 7, &wire, test_sv1_notify("1", false), None).await;
+        let submit = |id: u32, worker: &str, job: &str| {
+            serde_json::from_str::<json_rpc::Message>(&format!(
+                r#"{{"id":{id},"method":"mining.submit","params":["{worker}","{job}","00000000000000000000000000000000","00000001","00000000"]}}"#
+            ))
+            .unwrap()
+        };
+        for message in [
+            submit(1, "worker", "1"),
+            // The same share again.
+            submit(2, "worker", "1"),
+            submit(3, "worker", "2"),
+            // Rejected by sv1_api before the server sees it.
+            submit(4, "someone-else", "1"),
+            // Answered `true` too, but not a share.
+            serde_json::from_str(r#"{"id":5,"method":"mining.extranonce.subscribe","params":[]}"#)
+                .unwrap(),
+        ] {
+            receive_request(&server, message).await.unwrap();
+            wire.recv().await.unwrap();
+        }
+
+        let expected = Sv1ShareCounts {
+            accepted: 1,
+            rejected_duplicate: 1,
+            rejected_job_not_found: 1,
+            rejected_unauthorized_worker: 1,
+            ..Default::default()
+        };
+        assert_eq!(server.get_sv1_client_by_id(7).unwrap().shares, expected);
+        assert_eq!(server.get_sv1_share_totals(), expected);
+
+        // The totals outlive the miner.
+        server.handle_downstream_disconnect(7).await.unwrap();
+        assert!(server.get_sv1_client_by_id(7).is_none());
+        assert_eq!(server.get_sv1_share_totals(), expected);
     }
 }

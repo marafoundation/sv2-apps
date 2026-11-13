@@ -15,6 +15,7 @@ use super::{
     },
     snapshot_cache::SnapshotCache,
     sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
+    upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring},
 };
 use axum::{
     Router,
@@ -74,6 +75,8 @@ use utoipa_swagger_ui::SwaggerUi;
         StandardChannelInfo,
         Sv1ClientInfo,
         Sv1ClientsSummary,
+        UpstreamInfo,
+        UpstreamEndpointInfo,
         HealthResponse,
         ErrorResponse,
         ServerResponse,
@@ -172,7 +175,7 @@ impl MonitoringServer {
         let has_server = server_monitoring.is_some();
         let has_sv2_clients = sv2_clients_monitoring.is_some();
 
-        let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, false)?;
+        let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, false, false)?;
 
         // Create the snapshot cache with metrics attached so refresh()
         // updates Prometheus gauges atomically alongside the snapshot data.
@@ -206,9 +209,10 @@ impl MonitoringServer {
         let snapshot = self.state.cache.get_snapshot();
         let has_server = snapshot.server_info.is_some();
         let has_sv2_clients = snapshot.sv2_clients_summary.is_some();
+        let has_upstream = snapshot.upstream_info.is_some();
 
         // Create metrics with SV1 monitoring enabled
-        let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, true)?;
+        let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, true, has_upstream)?;
 
         // Add Sv1 clients source and attach new metrics to the cache
         let cache = Arc::new(
@@ -219,6 +223,43 @@ impl MonitoringServer {
         );
 
         // Refresh cache with new SV1 data (also updates Prometheus gauges)
+        cache.refresh();
+
+        self.state.metrics = metrics;
+        self.state.cache = cache;
+
+        Ok(self)
+    }
+
+    /// Add upstream connection monitoring (optional)
+    ///
+    /// Besides exposing the upstream connection state, this makes `/api/v1/health` answer
+    /// `503` while the source reports no connected upstream. Apps that do not call this keep
+    /// a health endpoint that always answers `200`.
+    ///
+    /// This must be called before `run()`. It can be combined with `with_sv1_monitoring` in
+    /// any order.
+    pub fn with_upstream_monitoring(
+        mut self,
+        upstream_monitoring: Arc<dyn UpstreamMonitoring + Send + Sync + 'static>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let snapshot = self.state.cache.get_snapshot();
+        let has_server = snapshot.server_info.is_some();
+        let has_sv2_clients = snapshot.sv2_clients_summary.is_some();
+        let has_sv1 = snapshot.sv1_clients_summary.is_some();
+
+        // Create metrics with upstream monitoring enabled
+        let metrics = PrometheusMetrics::new(has_server, has_sv2_clients, has_sv1, true)?;
+
+        // Add upstream source and attach new metrics to the cache
+        let cache = Arc::new(
+            Arc::try_unwrap(self.state.cache)
+                .unwrap_or_else(|arc| (*arc).clone())
+                .with_upstream_source(upstream_monitoring)
+                .with_metrics(metrics.clone()),
+        );
+
+        // Refresh cache with new upstream data (also updates Prometheus gauges)
         cache.refresh();
 
         self.state.metrics = metrics;
@@ -460,17 +501,32 @@ async fn handle_root() -> Json<RootResponse> {
     path = "/api/v1/health",
     tag = "health",
     responses(
-        (status = 200, description = "Service is healthy", body = HealthResponse)
+        (status = 200, description = "Service is healthy", body = HealthResponse),
+        (
+            status = 503,
+            description = "Upstream monitoring is enabled and no upstream is connected; `status` is `upstream_disconnected`",
+            body = HealthResponse
+        )
     )
 )]
-async fn handle_health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    })
+async fn handle_health(State(state): State<ServerState>) -> (StatusCode, Json<HealthResponse>) {
+    // Checked against the live source: the snapshot can be a whole refresh interval old.
+    let (code, status) = match state.cache.upstream_source() {
+        Some(upstream) if !upstream.is_connected() => {
+            (StatusCode::SERVICE_UNAVAILABLE, "upstream_disconnected")
+        }
+        _ => (StatusCode::OK, "ok"),
+    };
+    (
+        code,
+        Json(HealthResponse {
+            status: status.to_string(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }),
+    )
 }
 
 /// Get global statistics
@@ -481,6 +537,8 @@ async fn handle_health() -> Json<HealthResponse> {
 /// **Typical responses:**
 /// - **Pool/JDC**: `server` + `clients` (Sv2 downstream)
 /// - **tProxy**: `server` + `sv1_clients` (Sv1 miners)
+///
+/// `upstream` is `null` unless the app opts into upstream monitoring.
 #[utoipa::path(
     get,
     path = "/api/v1/global",
@@ -502,6 +560,7 @@ async fn handle_global(State(state): State<ServerState>) -> Json<GlobalInfo> {
         server: snapshot.server_summary,
         sv2_clients: snapshot.sv2_clients_summary,
         sv1_clients: snapshot.sv1_clients_summary,
+        upstream: snapshot.upstream_info,
         uptime_secs,
     })
 }
@@ -838,7 +897,7 @@ async fn handle_prometheus_metrics(State(state): State<ServerState>) -> Response
         .as_secs()
         - state.start_time;
     state.metrics.sv2_uptime_seconds.set(uptime_secs as f64);
-    if let Some(refreshed) = state.cache.get_snapshot().timestamp {
+    if let Some(refreshed) = state.cache.snapshot_timestamp() {
         state
             .metrics
             .sv2_monitoring_snapshot_age_seconds
@@ -1019,6 +1078,7 @@ mod tests {
             extranonce2_len: 8,
             version_rolling_mask: Some("ffffffff".into()),
             version_rolling_min_bit: Some("00000000".into()),
+            shares: Default::default(),
         }
     }
 
@@ -1043,17 +1103,68 @@ mod tests {
         }
     }
 
+    struct MockUpstream {
+        endpoints: Vec<UpstreamEndpointInfo>,
+        fallbacks: u64,
+        connected: std::sync::atomic::AtomicBool,
+    }
+    impl MockUpstream {
+        /// `connected_index` is the endpoint reported as connected, if any.
+        fn new(addresses: &[&str], connected_index: Option<usize>, fallbacks: u64) -> Arc<Self> {
+            Arc::new(Self {
+                endpoints: addresses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, address)| UpstreamEndpointInfo {
+                        address: address.to_string(),
+                        connected: connected_index == Some(i),
+                    })
+                    .collect(),
+                fallbacks,
+                connected: std::sync::atomic::AtomicBool::new(connected_index.is_some()),
+            })
+        }
+
+        fn set_connected(&self, connected: bool) {
+            self.connected
+                .store(connected, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl UpstreamMonitoring for MockUpstream {
+        fn get_upstream_info(&self) -> UpstreamInfo {
+            UpstreamInfo {
+                upstreams: self.endpoints.clone(),
+                fallbacks: self.fallbacks,
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
     /// Build a full Router with mock data for integration testing.
     fn build_test_app(
         server: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
         clients: Option<Arc<dyn Sv2ClientsMonitoring + Send + Sync>>,
         sv1: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync>>,
     ) -> Router {
+        build_test_app_with_upstream(server, clients, sv1, None)
+    }
+
+    fn build_test_app_with_upstream(
+        server: Option<Arc<dyn ServerMonitoring + Send + Sync>>,
+        clients: Option<Arc<dyn Sv2ClientsMonitoring + Send + Sync>>,
+        sv1: Option<Arc<dyn Sv1ClientsMonitoring + Send + Sync>>,
+        upstream: Option<Arc<dyn UpstreamMonitoring + Send + Sync>>,
+    ) -> Router {
         let has_server = server.is_some();
         let has_clients = clients.is_some();
         let has_sv1 = sv1.is_some();
+        let has_upstream = upstream.is_some();
 
-        let metrics = PrometheusMetrics::new(has_server, has_clients, has_sv1).unwrap();
+        let metrics =
+            PrometheusMetrics::new(has_server, has_clients, has_sv1, has_upstream).unwrap();
 
         let cache = Arc::new(
             SnapshotCache::new(Duration::from_secs(60), server, clients)
@@ -1065,6 +1176,16 @@ mod tests {
                 Arc::try_unwrap(cache)
                     .unwrap_or_else(|arc| (*arc).clone())
                     .with_sv1_clients_source(sv1_source),
+            )
+        } else {
+            cache
+        };
+
+        let cache = if let Some(upstream_source) = upstream {
+            Arc::new(
+                Arc::try_unwrap(cache)
+                    .unwrap_or_else(|arc| (*arc).clone())
+                    .with_upstream_source(upstream_source),
             )
         } else {
             cache
@@ -1083,6 +1204,10 @@ mod tests {
             metrics,
         };
 
+        build_test_router(state)
+    }
+
+    fn build_test_router(state: ServerState) -> Router {
         let api_v1 = Router::new()
             .route(routes::segments::HEALTH, get(handle_health))
             .route(routes::segments::GLOBAL, get(handle_global))
@@ -1215,6 +1340,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_endpoint_ok_when_upstream_connected() {
+        let upstream = MockUpstream::new(&["a.example:34254", "b.example:34254"], Some(1), 0);
+        let app = build_test_app_with_upstream(None, None, None, Some(upstream));
+        let response = app.oneshot(make_request(routes::HEALTH)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let resp: HealthResponse = serde_json::from_str(&get_body(response).await).unwrap();
+        assert_eq!(resp.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_unavailable_when_upstream_disconnected() {
+        let upstream = MockUpstream::new(&["a.example:34254"], None, 3);
+        let app = build_test_app_with_upstream(None, None, None, Some(upstream));
+        let response = app.oneshot(make_request(routes::HEALTH)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp: HealthResponse = serde_json::from_str(&get_body(response).await).unwrap();
+        assert_eq!(resp.status, "upstream_disconnected");
+        assert!(resp.timestamp > 0);
+    }
+
+    /// The snapshot is only refreshed periodically, so health must ask the source directly.
+    #[tokio::test]
+    async fn health_endpoint_reads_live_upstream_state() {
+        let upstream = MockUpstream::new(&["a.example:34254"], Some(0), 0);
+        let app = build_test_app_with_upstream(None, None, None, Some(upstream.clone()));
+
+        let response = app
+            .clone()
+            .oneshot(make_request(routes::HEALTH))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        upstream.set_connected(false);
+        let response = app
+            .clone()
+            .oneshot(make_request(routes::HEALTH))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        upstream.set_connected(true);
+        let response = app.oneshot(make_request(routes::HEALTH)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn root_endpoint_lists_endpoints() {
         let app = build_test_app(None, None, None);
         let response = app.oneshot(make_request(routes::ROOT)).await.unwrap();
@@ -1285,6 +1459,33 @@ mod tests {
         let resp: GlobalInfo = serde_json::from_str(&body).unwrap();
         assert!(resp.server.is_none());
         assert!(resp.sv2_clients.is_none());
+        assert!(resp.upstream.is_none());
+    }
+
+    #[tokio::test]
+    async fn global_endpoint_includes_upstream() {
+        let upstream = MockUpstream::new(&["a.example:34254", "b.example:34254"], Some(1), 4);
+        let app = build_test_app_with_upstream(None, None, None, Some(upstream));
+        let response = app.oneshot(make_request(routes::GLOBAL)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let resp: GlobalInfo = serde_json::from_str(&get_body(response).await).unwrap();
+        assert_eq!(
+            resp.upstream,
+            Some(UpstreamInfo {
+                upstreams: vec![
+                    UpstreamEndpointInfo {
+                        address: "a.example:34254".into(),
+                        connected: false,
+                    },
+                    UpstreamEndpointInfo {
+                        address: "b.example:34254".into(),
+                        connected: true,
+                    },
+                ],
+                fallbacks: 4,
+            })
+        );
     }
 
     #[tokio::test]
@@ -1687,6 +1888,127 @@ mod tests {
         assert!(body.contains("sv2_clients_total"));
     }
 
+    use crate::monitoring::sv1::{Sv1BlockFound, Sv1ShareCounts, Sv1ShareDrops};
+
+    struct MockSv1Shares(Sv1ShareCounts, Sv1ShareDrops);
+    impl Sv1ClientsMonitoring for MockSv1Shares {
+        fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+            vec![]
+        }
+
+        fn get_sv1_share_totals(&self) -> Sv1ShareCounts {
+            self.0
+        }
+
+        fn get_sv1_share_drops(&self) -> Sv1ShareDrops {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_sv1_share_outcomes_by_reason() {
+        let shares = Sv1ShareCounts {
+            accepted: 7,
+            rejected_job_not_found: 3,
+            rejected_low_difficulty: 2,
+            ..Default::default()
+        };
+        let app = build_test_app(
+            None,
+            None,
+            Some(Arc::new(MockSv1Shares(
+                shares,
+                Sv1ShareDrops {
+                    below_upstream_target: 40,
+                    stale: 4,
+                    ..Default::default()
+                },
+            ))
+                as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        assert!(body.contains("sv1_shares_accepted_total 7"), "{body}");
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="job-not-found"} 3"#));
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="low-difficulty"} 2"#));
+        // Reasons nobody has hit yet are exported too.
+        assert!(body.contains(r#"sv1_shares_rejected_total{reason="duplicate"} 0"#));
+        assert!(body.contains("sv1_shares_below_upstream_target_total 40"));
+        assert!(body.contains(r#"sv1_shares_dropped_total{reason="stale"} 4"#));
+        assert!(body.contains(r#"sv1_shares_dropped_total{reason="unknown-channel"} 0"#));
+    }
+
+    struct MockSv1Blocks(Vec<Sv1BlockFound>);
+    impl Sv1ClientsMonitoring for MockSv1Blocks {
+        fn get_sv1_clients(&self) -> Vec<Sv1ClientInfo> {
+            vec![]
+        }
+
+        fn get_sv1_blocks_found(&self) -> Vec<Sv1BlockFound> {
+            self.0.clone()
+        }
+
+        fn get_sv1_blocks_found_total(&self) -> u64 {
+            40
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exports_blocks_found_with_their_miner() {
+        let block = |worker: &str, height| Sv1BlockFound {
+            sv1_username: format!("acct.{worker}"),
+            worker: worker.to_string(),
+            user_identity: format!("pool.{worker}"),
+            share_hash: format!("{worker}-hash"),
+            height,
+            found_at_unix_secs: 1_700_000_000,
+        };
+        let app = build_test_app(
+            None,
+            None,
+            Some(Arc::new(MockSv1Blocks(vec![
+                block("rig1", Some(900_000)),
+                block("rig2", None),
+            ]))
+                as Arc<dyn Sv1ClientsMonitoring + Send + Sync>),
+        );
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        let line = |worker: &str| {
+            body.lines()
+                .find(|l| l.starts_with("sv1_block_found_info{") && l.contains(worker))
+                .unwrap_or_else(|| panic!("no block-found series for {worker} in {body}"))
+                .to_string()
+        };
+        let rig1 = line("rig1");
+        for label in [
+            r#"sv1_username="acct.rig1""#,
+            r#"worker="rig1""#,
+            r#"user_identity="pool.rig1""#,
+            r#"share_hash="rig1-hash""#,
+            r#"height="900000""#,
+        ] {
+            assert!(rig1.contains(label), "{label} missing from {rig1}");
+        }
+        assert!(rig1.ends_with(" 1700000000"), "{rig1}");
+        // An unknown height is an empty label.
+        assert!(line("rig2").contains(r#"height="""#));
+        // The total keeps counting past the blocks still listed.
+        assert!(body.contains("sv1_blocks_found_total 40"), "{body}");
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn metrics_endpoint_exports_heap_usage() {
+        let app = build_test_app(None, None, None);
+        let body = get_body(app.oneshot(make_request(routes::METRICS)).await.unwrap()).await;
+        for name in [
+            "sv2_heap_in_use_bytes",
+            "sv2_heap_free_bytes",
+            "sv2_heap_mapped_bytes",
+        ] {
+            assert!(body.contains(name), "{name} missing from {body}");
+        }
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_with_no_sources() {
         let app = build_test_app(None, None, None);
@@ -1699,6 +2021,85 @@ mod tests {
         // Server/client metrics should NOT be present when sources are None
         assert!(!body.contains("sv2_server_channels"));
         assert!(!body.contains("sv2_clients_total"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_upstream_gauges() {
+        let upstream = MockUpstream::new(
+            &["a.example:34254", "b.example:34254", "c.example:34254"],
+            Some(1),
+            5,
+        );
+        let app = build_test_app_with_upstream(None, None, None, Some(upstream));
+        let response = app.oneshot(make_request(routes::METRICS)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = get_body(response).await;
+        assert!(body.contains("sv2_upstream_connected{pool_address=\"a.example:34254\"} 0"));
+        assert!(body.contains("sv2_upstream_connected{pool_address=\"b.example:34254\"} 1"));
+        assert!(body.contains("sv2_upstream_connected{pool_address=\"c.example:34254\"} 0"));
+        assert_eq!(body.matches("sv2_upstream_connected{").count(), 3);
+        assert!(body.contains("sv2_upstream_fallbacks_total 5"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_omits_upstream_gauges_without_source() {
+        let app = build_test_app(None, None, None);
+        let response = app.oneshot(make_request(routes::METRICS)).await.unwrap();
+        let body = get_body(response).await;
+        assert!(!body.contains("sv2_upstream_"));
+    }
+
+    /// `with_sv1_monitoring` and `with_upstream_monitoring` each rebuild the Prometheus
+    /// metrics from what the cache already has, so neither may drop the other's gauges.
+    #[tokio::test]
+    async fn upstream_and_sv1_monitoring_compose_in_either_order() {
+        let new_server = || {
+            MonitoringServer::new(
+                "127.0.0.1:0".parse().unwrap(),
+                Some(Arc::new(MockServer(ServerInfo {
+                    coinbase_outputs: vec![],
+                    extended_channels: vec![],
+                    standard_channels: vec![],
+                }))),
+                None,
+                Duration::from_secs(60),
+            )
+            .unwrap()
+        };
+        let sv1 = || Arc::new(MockSv1Clients(vec![create_sv1_client_info(1, Some(10.0))]));
+        let upstream = || MockUpstream::new(&["a.example:34254"], Some(0), 1);
+
+        let upstream_first = new_server()
+            .with_upstream_monitoring(upstream())
+            .unwrap()
+            .with_sv1_monitoring(sv1())
+            .unwrap();
+        let sv1_first = new_server()
+            .with_sv1_monitoring(sv1())
+            .unwrap()
+            .with_upstream_monitoring(upstream())
+            .unwrap();
+
+        for server in [upstream_first, sv1_first] {
+            let app = build_test_router(server.state);
+            let response = app
+                .clone()
+                .oneshot(make_request(routes::METRICS))
+                .await
+                .unwrap();
+            let body = get_body(response).await;
+            assert!(body.contains("sv2_server_channels"));
+            assert!(body.contains("sv1_clients_total 1"));
+            assert!(body.contains("sv2_upstream_connected{pool_address=\"a.example:34254\"} 1"));
+            assert!(body.contains("sv2_upstream_fallbacks_total 1"));
+
+            let response = app.oneshot(make_request(routes::GLOBAL)).await.unwrap();
+            let resp: GlobalInfo = serde_json::from_str(&get_body(response).await).unwrap();
+            assert!(resp.server.is_some());
+            assert!(resp.sv1_clients.is_some());
+            assert!(resp.upstream.is_some());
+        }
     }
 
     // Mutable mock that allows changing data between requests
@@ -1736,7 +2137,7 @@ mod tests {
         }];
 
         let mock_clients = Arc::new(MutableMockClients(Mutex::new(initial_clients)));
-        let metrics = PrometheusMetrics::new(false, true, false).unwrap();
+        let metrics = PrometheusMetrics::new(false, true, false, false).unwrap();
         let cache = Arc::new(
             SnapshotCache::new(
                 Duration::from_secs(60),

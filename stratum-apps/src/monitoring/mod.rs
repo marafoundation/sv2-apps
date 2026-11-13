@@ -8,8 +8,10 @@
 //! - **Server**: The upstream connection (pool, JDS) - typically one per app
 //! - **Clients**: Downstream connections (miners) - multiple per app
 //! - **SV1 clients**: Legacy SV1 connections (Translator only)
+//! - **Upstream**: Connection state of the configured upstream endpoints (opt-in)
 
 pub mod client;
+pub mod heap;
 pub mod http_server;
 #[cfg(feature = "asic-rs-telemetry")]
 pub mod miner_telemetry;
@@ -18,6 +20,7 @@ pub mod routes;
 pub mod server;
 pub mod snapshot_cache;
 pub mod sv1;
+pub mod upstream;
 
 pub use client::{
     ExtendedChannelInfo, StandardChannelInfo, Sv2ClientInfo, Sv2ClientMetadata,
@@ -38,7 +41,11 @@ pub use server::{
     ServerStandardChannelInfo, ServerSummary,
 };
 pub use snapshot_cache::{MonitoringSnapshot, SnapshotCache};
-pub use sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary};
+pub use sv1::{
+    Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareCounts,
+    Sv1ShareDropReason, Sv1ShareDrops, Sv1ShareRejection,
+};
+pub use upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -60,6 +67,8 @@ pub struct GlobalInfo {
     pub sv2_clients: Option<Sv2ClientsSummary>,
     /// Sv1 clients summary - `None` if Sv1 monitoring is not enabled (e.g., Pool/JDC)
     pub sv1_clients: Option<Sv1ClientsSummary>,
+    /// Upstream endpoints connection state - `None` if upstream monitoring is not enabled
+    pub upstream: Option<UpstreamInfo>,
     /// Uptime in seconds since the application started
     pub uptime_secs: u64,
 }

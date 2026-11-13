@@ -53,6 +53,7 @@ jobs:
           for crate in pool_sv2 jd_client_sv2 translator_sv2; do
             cargo clippy -p "$crate" --all-targets --no-default-features -- -D warnings
           done
+          cargo clippy -p translator_sv2 --all-targets --features jemalloc -- -D warnings
 
   fmt:
     name: Format Check
