@@ -6,8 +6,8 @@ use crate::{
     TproxyMode,
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     utils::{
-        AGGREGATED_CHANNEL_ID, AggregatedState, AtomicAggregatedState,
-        aggregated_upstream_user_identity, tlv_user_identity_from_sv1_worker_name,
+        AGGREGATED_CHANNEL_ID, AggregatedState, AtomicAggregatedState, ShareOrigin,
+        aggregated_upstream_user_identity, coinbase_height, tlv_user_identity_from_sv1_worker_name,
     },
 };
 use async_channel::{Receiver, Sender};
@@ -87,8 +87,8 @@ struct ChannelManagerIo {
     upstream_sender: Sender<OutboundFrame>,
     upstream_receiver: Receiver<InboundFrame>,
     sv1_server_sender: Sender<MiningOwned>,
-    // Option<String> carries non-empty sv1_worker_name metadata for SubmitSharesExtended.
-    sv1_server_receiver: Receiver<(MiningOwned, Option<String>)>,
+    // Where a SubmitSharesExtended came from; `None` for every other message.
+    sv1_server_receiver: Receiver<(MiningOwned, Option<ShareOrigin>)>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -97,7 +97,7 @@ impl ChannelManagerIo {
         upstream_sender: Sender<OutboundFrame>,
         upstream_receiver: Receiver<InboundFrame>,
         sv1_server_sender: Sender<MiningOwned>,
-        sv1_server_receiver: Receiver<(MiningOwned, Option<String>)>,
+        sv1_server_receiver: Receiver<(MiningOwned, Option<ShareOrigin>)>,
     ) -> Self {
         Self {
             upstream_sender,
@@ -214,6 +214,13 @@ pub struct ChannelManager {
     /// Required to show or not show hashrate on monitoring.
     #[cfg(feature = "monitoring")]
     pub(crate) report_hashrate: bool,
+    /// Accepted shares not sent upstream, counted by reason. Owned by the SV1 server, which
+    /// reports them.
+    #[cfg(feature = "monitoring")]
+    pub(crate) share_drops: Arc<std::sync::Mutex<stratum_apps::monitoring::Sv1ShareDrops>>,
+    /// Block-finding shares. Owned by the SV1 server, which reports them.
+    #[cfg(feature = "monitoring")]
+    pub(crate) blocks_found: crate::monitoring::BlocksFound,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -444,20 +451,26 @@ impl ChannelManager {
     ///   by server)
     /// * `required_extensions` - Extensions that the translator requires (must be supported by
     ///   server)
+    /// * `share_drops`, `blocks_found` - Share accounting owned by the SV1 server, so it outlives
+    ///   this channel manager
     ///
     /// # Returns
     /// A new ChannelManager instance ready to handle message routing
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         upstream_sender: Sender<OutboundFrame>,
         upstream_receiver: Receiver<InboundFrame>,
         sv1_server_sender: Sender<MiningOwned>,
-        sv1_server_receiver: Receiver<(MiningOwned, Option<String>)>,
+        sv1_server_receiver: Receiver<(MiningOwned, Option<ShareOrigin>)>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
         tproxy_mode: TproxyMode,
         max_past_jobs: Option<usize>,
         #[cfg(feature = "monitoring")] report_hashrate: bool,
+        #[cfg(feature = "monitoring")] share_drops: Arc<
+            std::sync::Mutex<stratum_apps::monitoring::Sv1ShareDrops>,
+        >,
+        #[cfg(feature = "monitoring")] blocks_found: crate::monitoring::BlocksFound,
     ) -> Self {
         // Record the cap actually in force. When unset it comes from the `channels_sv2`
         // default, so it appears nowhere in this application's own config and is
@@ -493,7 +506,94 @@ impl ChannelManager {
             mode: tproxy_mode,
             #[cfg(feature = "monitoring")]
             report_hashrate,
+            #[cfg(feature = "monitoring")]
+            share_drops,
+            #[cfg(feature = "monitoring")]
+            blocks_found,
         }
+    }
+
+    /// Counts a share accepted from an SV1 miner that is not sent upstream: below the upstream
+    /// channel's target, or rejected by its validation for `error`, or for an unknown channel.
+    #[cfg_attr(not(feature = "monitoring"), allow(unused_variables))]
+    fn count_dropped_share(&self, error: Option<&ShareValidationError>) {
+        #[cfg(feature = "monitoring")]
+        {
+            use stratum_apps::monitoring::Sv1ShareDropReason as Reason;
+            let reason = match error {
+                Some(ShareValidationError::DoesNotMeetTarget(_)) => None,
+                Some(ShareValidationError::Stale(_)) => Some(Reason::Stale),
+                Some(ShareValidationError::InvalidJobId(_)) => Some(Reason::InvalidJobId),
+                Some(ShareValidationError::Invalid(_)) => Some(Reason::Invalid),
+                Some(ShareValidationError::DuplicateShare(_)) => Some(Reason::Duplicate),
+                Some(ShareValidationError::BadExtranonceSize(_)) => Some(Reason::BadExtranonceSize),
+                Some(ShareValidationError::VersionRollingNotAllowed(_)) => {
+                    Some(Reason::VersionRollingNotAllowed)
+                }
+                Some(ShareValidationError::NoChainTip) => Some(Reason::NoChainTip),
+                None => Some(Reason::UnknownChannel),
+            };
+            self.share_drops
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(reason);
+        }
+    }
+
+    /// Logs a share that met the network target and records it for monitoring.
+    ///
+    /// `job_channel_id` is the channel the share was validated on, whose job carries the block
+    /// height; `channel_id` is the miner's own channel.
+    fn report_block_found(
+        &self,
+        share_hash: impl std::fmt::Display,
+        job_channel_id: ChannelId,
+        job_id: u32,
+        channel_id: ChannelId,
+        upstream_channel_id: Option<ChannelId>,
+        origin: Option<&ShareOrigin>,
+    ) {
+        let user_identity = self
+            .extended_channels
+            .with(&channel_id, |c| c.get_user_identity().to_string())
+            .unwrap_or_default();
+        let height = self
+            .extended_channels
+            .with(&job_channel_id, |channel| {
+                channel
+                    .get_active_job()
+                    .filter(|job| job.job_message.job_id == job_id)
+                    .or_else(|| channel.get_past_job(job_id))
+                    .and_then(|job| coinbase_height(job.job_message.coinbase_tx_prefix.as_ref()))
+            })
+            .flatten();
+        let worker = origin.and_then(|origin| origin.worker.as_deref());
+        let sv1_username = origin.map_or("", |origin| origin.sv1_username.as_str());
+        info!(
+            // Plain values, not `?`: an `Option` field is then logged as its value, or left out
+            // when `None`, which keeps the line's format for existing log queries.
+            downstream_id = origin.map(|origin| origin.downstream_id),
+            sv1_username = ?sv1_username,
+            channel_id,
+            upstream_channel_id,
+            user_identity = ?user_identity,
+            share_user_identity = ?worker.unwrap_or_default(),
+            height,
+            "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
+        );
+        #[cfg(feature = "monitoring")]
+        self.blocks_found
+            .record(stratum_apps::monitoring::Sv1BlockFound {
+                sv1_username: sv1_username.to_string(),
+                worker: worker.unwrap_or_default().to_string(),
+                user_identity,
+                share_hash: share_hash.to_string(),
+                height,
+                found_at_unix_secs: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
     }
 
     /// Spawns and runs the main channel manager task loop.
@@ -635,12 +735,13 @@ impl ChannelManager {
     /// * `Ok(())` - Message processed successfully
     /// * `Err(TproxyError)` - Error processing the message
     async fn handle_downstream_message(self: Arc<Self>) -> TproxyResult<(), error::ChannelManager> {
-        let (message, sv1_worker_name) = self
+        let (message, origin) = self
             .channel_manager_io
             .sv1_server_receiver
             .recv()
             .await
             .map_err(TproxyError::shutdown)?;
+        let sv1_worker_name = origin.as_ref().and_then(|origin| origin.worker.as_deref());
         match message {
             MiningOwned::OpenExtendedMiningChannel(m) => {
                 let mut open_channel_msg = m.clone();
@@ -786,15 +887,16 @@ impl ChannelManager {
                     match value {
                         Some(Ok(result)) => {
                             if let ShareValidationResult::BlockFound(share_hash) = result {
-                                info!(
-                                    channel_id = downstream_channel_id,
-                                    upstream_channel_id = upstream_extended_channel_id,
-                                    user_identity = ?self.extended_channels.with(&downstream_channel_id, |c| c.get_user_identity().to_string()).unwrap_or_default(),
-                                    share_user_identity = ?sv1_worker_name.as_deref().unwrap_or_default(),
-                                    "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
+                                self.report_block_found(
+                                    share_hash,
+                                    AGGREGATED_CHANNEL_ID,
+                                    m.job_id,
+                                    downstream_channel_id,
+                                    Some(upstream_extended_channel_id),
+                                    origin.as_ref(),
                                 );
                             }
-                            info!(
+                            debug!(
                                 "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
                                 upstream_extended_channel_id, m.sequence_number
                             );
@@ -804,7 +906,8 @@ impl ChannelManager {
                             m.sequence_number =
                                 self.next_share_sequence_number(upstream_extended_channel_id);
                         }
-                        Some(Err(ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                        Some(Err(error @ ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                            self.count_dropped_share(Some(&error));
                             // Per-miner vardiff can intentionally be easier than the aggregated
                             // upstream target, so these locally accepted shares are expected to be
                             // filtered here.
@@ -816,6 +919,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         Some(Err(validation_error)) => {
+                            self.count_dropped_share(Some(&validation_error));
                             warn!(
                                 channel_id = upstream_extended_channel_id,
                                 ?validation_error,
@@ -824,6 +928,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         None => {
+                            self.count_dropped_share(None);
                             warn!(
                                 channel_id = upstream_extended_channel_id,
                                 "SubmitSharesExtended references an unknown upstream channel"
@@ -840,14 +945,16 @@ impl ChannelManager {
                     match value {
                         Some(Ok(result)) => {
                             if let ShareValidationResult::BlockFound(share_hash) = result {
-                                info!(
-                                    channel_id = m.channel_id,
-                                    user_identity = ?self.extended_channels.with(&m.channel_id, |c| c.get_user_identity().to_string()).unwrap_or_default(),
-                                    share_user_identity = ?sv1_worker_name.as_deref().unwrap_or_default(),
-                                    "SubmitSharesExtended: 💰 Block Found!!! 💰{share_hash}"
+                                self.report_block_found(
+                                    share_hash,
+                                    m.channel_id,
+                                    m.job_id,
+                                    m.channel_id,
+                                    None,
+                                    origin.as_ref(),
                                 );
                             }
-                            info!(
+                            debug!(
                                 "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
                                 m.channel_id, m.sequence_number
                             );
@@ -873,7 +980,8 @@ impl ChannelManager {
                                     new_extranonce.try_into().map_err(TproxyError::shutdown)?;
                             }
                         }
-                        Some(Err(ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                        Some(Err(error @ ShareValidationError::DoesNotMeetTarget(error_code))) => {
+                            self.count_dropped_share(Some(&error));
                             // A downstream vardiff target can intentionally be easier than its
                             // upstream channel target, so these locally accepted shares are
                             // expected to be filtered here.
@@ -885,6 +993,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         Some(Err(validation_error)) => {
+                            self.count_dropped_share(Some(&validation_error));
                             warn!(
                                 channel_id = m.channel_id,
                                 ?validation_error,
@@ -893,6 +1002,7 @@ impl ChannelManager {
                             return Ok(());
                         }
                         None => {
+                            self.count_dropped_share(None);
                             warn!(
                                 channel_id = m.channel_id,
                                 "SubmitSharesExtended references an unknown upstream channel"
@@ -910,9 +1020,8 @@ impl ChannelManager {
 
                 let mut sent = false;
                 if contains_type_in_negotiated_extension {
-                    if let Some(sv1_worker_name) = sv1_worker_name
-                        .as_deref()
-                        .filter(|sv1_worker_name| !sv1_worker_name.is_empty())
+                    if let Some(sv1_worker_name) =
+                        sv1_worker_name.filter(|sv1_worker_name| !sv1_worker_name.is_empty())
                     {
                         let tlv_user_identity =
                             tlv_user_identity_from_sv1_worker_name(sv1_worker_name)
@@ -1485,6 +1594,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         )
     }
 
@@ -1653,6 +1766,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         ));
 
         let update_channel = UpdateChannelOwned {
@@ -1737,6 +1854,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         );
         manager.extended_channels.insert(
             42,
@@ -1771,7 +1892,7 @@ mod tests {
 
     /// Channel endpoints a test uses to feed a channel manager and observe what it sends.
     struct TestIo {
-        downstream_sender: Sender<(MiningOwned, Option<String>)>,
+        downstream_sender: Sender<(MiningOwned, Option<ShareOrigin>)>,
         upstream_receiver: Receiver<OutboundFrame>,
         sv1_server_receiver: Receiver<MiningOwned>,
     }
@@ -1792,6 +1913,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         );
         (
             manager,
@@ -2416,6 +2541,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         );
         let mut job = test_extended_job(42, 1);
         job.ntime_start = Sv2OptionOwned::new(Some(0));
@@ -2568,6 +2697,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         );
         manager.extended_channels.insert(
             42,
@@ -2754,6 +2887,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         );
         manager.set_expected_payout_distribution(None);
         let old_prefix = vec![0; 4];
@@ -2851,6 +2988,10 @@ mod tests {
             None,
             #[cfg(feature = "monitoring")]
             true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
         );
         let mut allocator =
             ExtranonceAllocator::from_upstream_prefix(vec![0; 4], vec![0; 23], 32, 1).unwrap();
@@ -3357,6 +3498,457 @@ mod tests {
                     .unwrap(),
                 0
             );
+        }
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn a_block_found_is_recorded_with_its_miner_and_height() {
+        use stratum_apps::stratum_core::channels_sv2::client::share_accounting::ShareValidationResult;
+
+        let (manager, receiver) = create_connected_aggregated_channel_manager();
+        manager.set_expected_payout_distribution(None);
+        let mut group = GroupChannel::new(100);
+        group.add_channel_id(42, 12).unwrap();
+        manager.group_channels.insert(100, group);
+        manager
+            .extended_channels
+            .with_mut(&AGGREGATED_CHANNEL_ID, |channel| {
+                channel
+                    .on_new_extended_mining_job(test_extended_job(42, 1))
+                    .unwrap();
+                channel
+                    .on_set_new_prev_hash(SetNewPrevHashOwned {
+                        channel_id: 42,
+                        job_id: 1,
+                        prev_hash: vec![0; 32].try_into().unwrap(),
+                        ntime_start: 0,
+                        // About half of all hashes meet it.
+                        nbits: 0x207fffff,
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+        manager
+            .handle_downstream_channel_request_in_aggregated_mode(7, "rig".to_string(), 1.0, 6)
+            .await
+            .unwrap();
+        let MiningOwned::OpenExtendedMiningChannelSuccess(success) = receiver.try_recv().unwrap()
+        else {
+            panic!("expected immediate open success");
+        };
+        let channel_id = success.channel_id;
+
+        // A share of the miner's own channel whose header meets the network target, found by
+        // validating on that channel; the channel manager validates on the aggregated one.
+        let mut share = manager
+            .extended_channels
+            .with(&channel_id, |channel| {
+                let job = &channel.get_active_job().unwrap().job_message;
+                SubmitSharesExtendedOwned {
+                    channel_id,
+                    sequence_number: 0,
+                    job_id: job.job_id,
+                    nonce: 0,
+                    ntime: *job.ntime_start.as_ref().unwrap(),
+                    version: job.version,
+                    extranonce: vec![0x11; channel.get_rollable_extranonce_size() as usize]
+                        .try_into()
+                        .unwrap(),
+                }
+            })
+            .unwrap();
+        let share_hash = (0..10_000)
+            .find_map(|nonce| {
+                share.nonce = nonce;
+                match manager
+                    .extended_channels
+                    .with_mut(&channel_id, |channel| channel.validate_share(share.clone()))
+                    .unwrap()
+                {
+                    Ok(ShareValidationResult::BlockFound(hash)) => Some(hash),
+                    _ => None,
+                }
+            })
+            .expect("half of all shares find a block at this target");
+
+        let (to_manager, from_sv1) = unbounded();
+        let (to_upstream, _from_manager) = unbounded();
+        let mut manager = manager;
+        manager.channel_manager_io.sv1_server_receiver = from_sv1;
+        manager.channel_manager_io.upstream_sender = to_upstream;
+        let blocks_found = manager.blocks_found.clone();
+        to_manager
+            .send((
+                MiningOwned::SubmitSharesExtended(share),
+                Some(ShareOrigin {
+                    downstream_id: 7,
+                    sv1_username: "acct.rig".to_string(),
+                    worker: Some("rig".to_string()),
+                }),
+            ))
+            .await
+            .unwrap();
+        Arc::new(manager).handle_downstream_message().await.unwrap();
+
+        let recorded = blocks_found.recent();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].sv1_username, "acct.rig");
+        assert_eq!(recorded[0].worker, "rig");
+        assert_eq!(recorded[0].share_hash, share_hash.to_string());
+        // The fixture coinbase commits to height 2 (OP_2).
+        assert_eq!(recorded[0].height, Some(2));
+        assert!(recorded[0].found_at_unix_secs > 0);
+        assert_eq!(blocks_found.total(), 1);
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn accepted_shares_not_sent_upstream_are_counted_by_reason() {
+        let (mut manager, _receiver) = create_connected_aggregated_channel_manager();
+        manager
+            .extended_channels
+            .with_mut(&AGGREGATED_CHANNEL_ID, |channel| {
+                // The smallest target, which no share meets, set before the job that takes it.
+                let mut target = [0; 32];
+                target[0] = 1;
+                channel.set_target(Target::from_le_bytes(target)).unwrap();
+                channel
+                    .on_new_extended_mining_job(test_extended_job(42, 1))
+                    .unwrap();
+                channel
+                    .on_set_new_prev_hash(SetNewPrevHashOwned {
+                        channel_id: 42,
+                        job_id: 1,
+                        prev_hash: vec![0; 32].try_into().unwrap(),
+                        ntime_start: 0,
+                        nbits: 0x207fffff,
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+        let rollable = manager
+            .extended_channels
+            .with(&AGGREGATED_CHANNEL_ID, |c| c.get_rollable_extranonce_size())
+            .unwrap() as usize;
+        let share = |job_id| SubmitSharesExtendedOwned {
+            channel_id: 99,
+            sequence_number: 0,
+            job_id,
+            nonce: 0,
+            ntime: 1,
+            version: 0x20000000,
+            extranonce: vec![0x11; rollable].try_into().unwrap(),
+        };
+        let (to_manager, from_sv1) = unbounded();
+        manager.channel_manager_io.sv1_server_receiver = from_sv1;
+        let drops = manager.share_drops.clone();
+        let manager = Arc::new(manager);
+        for job_id in [1, 7] {
+            to_manager
+                .send((MiningOwned::SubmitSharesExtended(share(job_id)), None))
+                .await
+                .unwrap();
+            manager.clone().handle_downstream_message().await.unwrap();
+        }
+
+        let drops = *drops.lock().unwrap();
+        assert_eq!(
+            drops,
+            stratum_apps::monitoring::Sv1ShareDrops {
+                below_upstream_target: 1,
+                invalid_job_id: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn non_aggregated_shares_not_sent_upstream_are_counted_by_reason() {
+        let (manager, io) = channel_manager_with_test_io(TproxyMode::NonAggregated);
+        let mut channel = ExtendedChannel::new(
+            42,
+            "pool.rig".to_string(),
+            ExtranoncePrefix::from_wire(vec![0; 4]).unwrap(),
+            Target::from_le_bytes([0xff; 32]),
+            1.0,
+            true,
+            8,
+            None,
+        )
+        .unwrap();
+        // The smallest target, which no share meets, set before the job that takes it.
+        let mut target = [0; 32];
+        target[0] = 1;
+        channel.set_target(Target::from_le_bytes(target)).unwrap();
+        channel
+            .on_new_extended_mining_job(test_extended_job(42, 1))
+            .unwrap();
+        channel
+            .on_set_new_prev_hash(SetNewPrevHashOwned {
+                channel_id: 42,
+                job_id: 1,
+                prev_hash: vec![0; 32].try_into().unwrap(),
+                ntime_start: 0,
+                nbits: 0x207fffff,
+            })
+            .unwrap();
+        let rollable = channel.get_rollable_extranonce_size() as usize;
+        manager.extended_channels.insert(42, channel);
+        let share = |channel_id, job_id| SubmitSharesExtendedOwned {
+            channel_id,
+            sequence_number: 0,
+            job_id,
+            nonce: 0,
+            ntime: 1,
+            version: 0x20000000,
+            extranonce: vec![0x11; rollable].try_into().unwrap(),
+        };
+        let drops = manager.share_drops.clone();
+        let manager = Arc::new(manager);
+        for (channel_id, job_id) in [(42, 1), (42, 7), (99, 1)] {
+            io.downstream_sender
+                .send((
+                    MiningOwned::SubmitSharesExtended(share(channel_id, job_id)),
+                    None,
+                ))
+                .await
+                .unwrap();
+            manager.clone().handle_downstream_message().await.unwrap();
+        }
+
+        let drops = *drops.lock().unwrap();
+        assert_eq!(
+            drops,
+            stratum_apps::monitoring::Sv1ShareDrops {
+                below_upstream_target: 1,
+                invalid_job_id: 1,
+                unknown_channel: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn a_block_found_in_non_aggregated_mode_is_recorded() {
+        use stratum_apps::stratum_core::channels_sv2::client::share_accounting::ShareValidationResult;
+
+        let (to_upstream, _from_manager) = unbounded();
+        let (_upstream_sender, upstream_receiver) = unbounded();
+        let (sv1_server_sender, _sv1_server_receiver_for_test) = unbounded();
+        let (to_manager, from_sv1) = unbounded();
+        let manager = ChannelManager::new(
+            to_upstream,
+            upstream_receiver,
+            sv1_server_sender,
+            from_sv1,
+            vec![],
+            vec![],
+            TproxyMode::NonAggregated,
+            None,
+            true,
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+            #[cfg(feature = "monitoring")]
+            Default::default(),
+        );
+        // Channel 43 is a twin of the miner's channel 42, used to find a block-finding share
+        // without marking it seen on 42.
+        for channel_id in [42, 43] {
+            let mut channel = ExtendedChannel::new(
+                channel_id,
+                "pool.rig".to_string(),
+                ExtranoncePrefix::from_wire(vec![0; 4]).unwrap(),
+                Target::from_le_bytes([0xff; 32]),
+                1.0,
+                true,
+                8,
+                None,
+            )
+            .unwrap();
+            channel
+                .on_new_extended_mining_job(test_extended_job(channel_id, 1))
+                .unwrap();
+            channel
+                .on_set_new_prev_hash(SetNewPrevHashOwned {
+                    channel_id,
+                    job_id: 1,
+                    prev_hash: vec![0; 32].try_into().unwrap(),
+                    ntime_start: 0,
+                    // About half of all hashes meet it.
+                    nbits: 0x207fffff,
+                })
+                .unwrap();
+            manager.extended_channels.insert(channel_id, channel);
+        }
+        let mut share = manager
+            .extended_channels
+            .with(&43, |channel| {
+                let job = &channel.get_active_job().unwrap().job_message;
+                SubmitSharesExtendedOwned {
+                    channel_id: 43,
+                    sequence_number: 0,
+                    job_id: job.job_id,
+                    nonce: 0,
+                    ntime: *job.ntime_start.as_ref().unwrap(),
+                    version: job.version,
+                    extranonce: vec![0x11; channel.get_rollable_extranonce_size() as usize]
+                        .try_into()
+                        .unwrap(),
+                }
+            })
+            .unwrap();
+        let share_hash = (0..10_000)
+            .find_map(|nonce| {
+                share.nonce = nonce;
+                match manager
+                    .extended_channels
+                    .with_mut(&43, |channel| channel.validate_share(share.clone()))
+                    .unwrap()
+                {
+                    Ok(ShareValidationResult::BlockFound(hash)) => Some(hash),
+                    _ => None,
+                }
+            })
+            .expect("half of all shares find a block at this target");
+        share.channel_id = 42;
+
+        let blocks_found = manager.blocks_found.clone();
+        to_manager
+            .send((
+                MiningOwned::SubmitSharesExtended(share),
+                Some(ShareOrigin {
+                    downstream_id: 7,
+                    sv1_username: "acct.rig".to_string(),
+                    worker: Some("rig".to_string()),
+                }),
+            ))
+            .await
+            .unwrap();
+        Arc::new(manager).handle_downstream_message().await.unwrap();
+
+        let recorded = blocks_found.recent();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].sv1_username, "acct.rig");
+        assert_eq!(recorded[0].share_hash, share_hash.to_string());
+        assert_eq!(recorded[0].height, Some(2));
+        assert_eq!(blocks_found.total(), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Runs `report_block_found` and returns the line it logged.
+    fn block_found_log_line(origin: Option<&ShareOrigin>) -> String {
+        use stratum_apps::stratum_core::bitcoin::{BlockHash, hashes::Hash};
+
+        let manager = create_test_channel_manager();
+        manager.extended_channels.insert(
+            42,
+            ExtendedChannel::new(
+                42,
+                "pool.rig".to_string(),
+                ExtranoncePrefix::from_wire(vec![0; 4]).unwrap(),
+                Target::from_le_bytes([0xff; 32]),
+                1.0,
+                true,
+                8,
+                None,
+            )
+            .unwrap(),
+        );
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            manager.report_block_found(
+                BlockHash::from_byte_array([0xab; 32]),
+                42,
+                1,
+                42,
+                None,
+                origin,
+            );
+        });
+        let line = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(line.lines().count(), 1, "{line}");
+        line
+    }
+
+    #[test]
+    fn block_found_log_line_has_the_hash_attached_and_both_identities() {
+        let hash = "ab".repeat(32);
+        let origin = ShareOrigin {
+            downstream_id: 7,
+            sv1_username: "acct.rig".to_string(),
+            worker: Some("rig".to_string()),
+        };
+        let line = block_found_log_line(Some(&origin));
+
+        let after_marker = line
+            .split_once("Block Found!!! 💰")
+            .unwrap_or_else(|| panic!("no Block Found marker: {line}"))
+            .1;
+        assert!(after_marker.starts_with(&hash), "{line}");
+        assert!(
+            after_marker[hash.len()..].starts_with(char::is_whitespace),
+            "{line}"
+        );
+        assert!(line.contains("sv1_username=\"acct.rig\""), "{line}");
+        assert!(line.contains(" user_identity=\"pool.rig\""), "{line}");
+        assert!(line.contains("share_user_identity=\"rig\""), "{line}");
+        let user_identity = line.find(" user_identity=").unwrap();
+        let share_user_identity = line.find(" share_user_identity=").unwrap();
+        assert!(user_identity < share_user_identity, "{line}");
+    }
+
+    #[test]
+    fn block_found_log_line_keeps_share_user_identity_without_a_worker() {
+        for (origin, sv1_username) in [
+            (None, ""),
+            (
+                Some(ShareOrigin {
+                    downstream_id: 7,
+                    sv1_username: "acct".to_string(),
+                    worker: None,
+                }),
+                "acct",
+            ),
+        ] {
+            let line = block_found_log_line(origin.as_ref());
+            assert!(
+                line.contains(&format!("sv1_username=\"{sv1_username}\"")),
+                "{line}"
+            );
+            assert!(line.contains(" user_identity=\"pool.rig\""), "{line}");
+            assert!(line.contains("share_user_identity=\"\""), "{line}");
+            let user_identity = line.find(" user_identity=").unwrap();
+            let share_user_identity = line.find(" share_user_identity=").unwrap();
+            assert!(user_identity < share_user_identity, "{line}");
         }
     }
 }

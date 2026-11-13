@@ -27,7 +27,7 @@ use crate::{
     sv1::{GenerationEvent, Sv1Server},
     sv2::{ChannelManager, ProtocolReconnect, Upstream, UpstreamConnectOptions},
     upstream_walk::UpstreamWalk,
-    utils::{ReconnectRequest, TproxyMode, UpstreamEntry},
+    utils::{ReconnectRequest, ShareOrigin, TproxyMode, UpstreamEntry},
 };
 
 /// Channels between the [`ChannelManager`] and the [`Upstream`] of one upstream generation.
@@ -44,7 +44,7 @@ struct Io {
 struct Sv1Side {
     server: Arc<Sv1Server>,
     channel_manager_to_sv1_server_sender: Sender<MiningOwned>,
-    sv1_server_to_channel_manager_receiver: Receiver<(MiningOwned, Option<String>)>,
+    sv1_server_to_channel_manager_receiver: Receiver<(MiningOwned, Option<ShareOrigin>)>,
     generation_events: Sender<GenerationEvent>,
     started: bool,
 }
@@ -395,6 +395,10 @@ impl TranslatorRuntime<IoReady> {
                 .config
                 .downstream_difficulty_config
                 .enable_vardiff,
+            #[cfg(feature = "monitoring")]
+            self.sv1.server.share_drops.clone(),
+            #[cfg(feature = "monitoring")]
+            self.sv1.server.blocks_found.clone(),
         ));
 
         TranslatorRuntime {

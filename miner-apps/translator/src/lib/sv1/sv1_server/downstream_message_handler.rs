@@ -144,7 +144,7 @@ impl IsServer for Sv1Server {
                         }
                     };
 
-                    info!(
+                    debug!(
                         "Received mining.submit from SV1 downstream for channel id: {}",
                         channel_id
                     );

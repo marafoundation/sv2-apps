@@ -247,6 +247,9 @@ pub struct DownstreamData {
     pub hashrate: Option<Hashrate>,
     #[cfg(feature = "monitoring")]
     pub connection_ip: IpAddr,
+    /// Outcomes of the shares this connection submitted.
+    #[cfg(feature = "monitoring")]
+    pub shares: stratum_apps::monitoring::Sv1ShareCounts,
     pub version_rolling_mask: Option<HexU32Be>,
     pub version_rolling_min_bit: Option<HexU32Be>,
     pub sv1_username: String,
@@ -319,6 +322,8 @@ impl DownstreamData {
             hashrate,
             #[cfg(feature = "monitoring")]
             connection_ip,
+            #[cfg(feature = "monitoring")]
+            shares: Default::default(),
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             sv1_username: String::new(),
