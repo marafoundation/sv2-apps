@@ -754,6 +754,10 @@ async fn tproxy_api_endpoints_with_miner() {
         &metrics,
         Metric::with_labels("sv1_shares_dropped_total", &[("reason", "stale")]),
     );
+    assert_metric_present(
+        &metrics,
+        Metric::with_labels("sv1_shares_dropped_total", &[("reason", "upstream-gone")]),
+    );
     let client: Sv1ClientInfo = tproxy_mon
         .fetch_typed(&routes::sv1_client_by_id(sv1_client_id))
         .await;

@@ -12,8 +12,8 @@ use stratum_apps::{
         DiscoveredMiner, MinerTelemetry, MinerTelemetryCollector, MinerTelemetryStatus,
         match_discovered_miners_to_downstreams_by_worker_and_port,
         sv1::{
-            Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDrops,
-            Sv1ShareRejection,
+            Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ShareCounts, Sv1ShareDropReason,
+            Sv1ShareDrops, Sv1ShareRejection,
         },
     },
     stratum_core::sv1_api::json_rpc,
@@ -124,6 +124,15 @@ fn share_rejection(response: &json_rpc::Response) -> Option<Sv1ShareRejection> {
 }
 
 impl Sv1Server {
+    /// Counts `count` accepted shares that were not sent upstream because the upstream generation
+    /// they were meant for ended, or whose fallback had started.
+    pub(super) fn count_shares_upstream_gone(&self, count: usize) {
+        let mut drops = self.share_drops.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..count {
+            drops.record(Some(Sv1ShareDropReason::UpstreamGone));
+        }
+    }
+
     /// Counts how a share from `downstream_id` was answered, for the miner and in total.
     pub(super) fn record_share_outcome(
         &self,

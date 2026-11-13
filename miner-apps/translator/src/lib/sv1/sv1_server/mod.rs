@@ -680,6 +680,10 @@ impl Sv1Server {
                 "Dropping {} for the channel manager of generation {epoch}",
                 message.0
             );
+            #[cfg(feature = "monitoring")]
+            if matches!(message.0, MiningOwned::SubmitSharesExtended(_)) {
+                self.count_shares_upstream_gone(1);
+            }
             return Ok(());
         }
         // Unbounded, so this never waits while the lock is held.
@@ -687,6 +691,23 @@ impl Sv1Server {
             .channel_manager_sender
             .try_send(message)
             .map_err(|_| ())
+    }
+
+    /// Discards what is queued for the channel manager of an ended generation and returns how
+    /// many messages that was. The accepted shares among them never reach an upstream, and are
+    /// counted as dropped.
+    fn discard_unsent(&self, queue: &Receiver<(MiningOwned, Option<ShareOrigin>)>) -> usize {
+        let mut discarded = 0;
+        let mut shares = 0;
+        while let Ok((message, _)) = queue.try_recv() {
+            discarded += 1;
+            shares += usize::from(matches!(message, MiningOwned::SubmitSharesExtended(_)));
+        }
+        #[cfg(feature = "monitoring")]
+        self.count_shares_upstream_gone(shares);
+        #[cfg(not(feature = "monitoring"))]
+        let _ = shares;
+        discarded
     }
 
     /// Applies a generation boundary.
@@ -707,10 +728,9 @@ impl Sv1Server {
                     slot.fallback_token = None;
                 }
                 let discarded_from = drain_queue(&self.sv1_server_io.channel_manager_receiver);
-                let discarded_to = self
-                    .generation_control
-                    .as_ref()
-                    .map_or(0, |control| drain_queue(&control.to_channel_manager));
+                let discarded_to = self.generation_control.as_ref().map_or(0, |control| {
+                    self.discard_unsent(&control.to_channel_manager)
+                });
                 if let Some(drained) = drained {
                     let _ = drained.send(());
                 }
@@ -6215,6 +6235,71 @@ mod tests {
             .unwrap();
         drained_receiver.await.unwrap();
         assert!(from_server.is_empty());
+    }
+
+    #[cfg(feature = "monitoring")]
+    #[tokio::test]
+    async fn shares_whose_upstream_went_away_are_counted_as_dropped() {
+        use stratum_apps::{
+            monitoring::{Sv1ClientsMonitoring, Sv1ShareDropReason},
+            stratum_core::mining_sv2::SubmitSharesExtendedOwned,
+        };
+
+        let share = || {
+            (
+                MiningOwned::SubmitSharesExtended(SubmitSharesExtendedOwned {
+                    channel_id: 9,
+                    sequence_number: 0,
+                    job_id: 1,
+                    nonce: 0,
+                    ntime: 1,
+                    version: 0x2000_0000,
+                    extranonce: vec![0; 4].try_into().unwrap(),
+                }),
+                None,
+            )
+        };
+        let gone = |server: &Sv1Server| {
+            server
+                .get_sv1_share_drops()
+                .dropped(Sv1ShareDropReason::UpstreamGone)
+        };
+
+        let (server, _to_server, from_server, _events) = server_with_generation_control(false);
+        let fallback_token = CancellationToken::new();
+        server
+            .handle_generation_event(GenerationEvent::Connected {
+                fallback_token: fallback_token.clone(),
+            })
+            .await
+            .unwrap();
+        let epoch = server.generation_epoch();
+
+        // Queued for a live generation: handed to its channel manager, not counted.
+        server.send_to_channel_manager_in(epoch, share()).unwrap();
+        assert_eq!(gone(&server), 0);
+
+        // The fallback has started: refused. Other messages are refused too, but are no shares.
+        fallback_token.cancel();
+        server.send_to_channel_manager_in(epoch, share()).unwrap();
+        server
+            .send_to_channel_manager_in(epoch, (close_channel(9), None))
+            .unwrap();
+        assert_eq!(gone(&server), 1);
+
+        // The first share was still queued when the generation ended.
+        assert_eq!(from_server.len(), 1);
+        end_generation(&server).await;
+        assert!(from_server.is_empty());
+        assert_eq!(gone(&server), 2);
+
+        // Between generations nothing is accepted by an upstream.
+        server.send_to_channel_manager(share()).unwrap();
+        server
+            .send_to_channel_manager((close_channel(9), None))
+            .unwrap();
+        assert_eq!(gone(&server), 3);
+        assert_eq!(server.get_sv1_share_drops().below_upstream_target, 0);
     }
 
     #[tokio::test]
