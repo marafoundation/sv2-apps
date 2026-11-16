@@ -287,8 +287,10 @@ struct HoldState {
     /// Miners whose channel has yet to be opened on the connected generation, opened at most
     /// [`MAX_CHANNEL_OPENS_IN_FLIGHT`] at a time.
     pending_opens: Arc<Mutex<VecDeque<DownstreamId>>>,
-    /// Requests of the channel opens sent for held miners. A request that is no longer
+    /// Requests of the channel opens sent from `pending_opens`. A request that is no longer
     /// outstanding is dropped the next time the set is counted.
+    queued_opens: Arc<Mutex<HashSet<RequestId>>>,
+    /// The part of `queued_opens` sent for held miners, which decides when a re-attach is done.
     held_opens: Arc<Mutex<HashSet<RequestId>>>,
     /// Set from the start of a generation until the channel opens of its held miners have been
     /// answered. Miners that connect meanwhile do not extend it.
@@ -306,8 +308,11 @@ enum GenerationFollowUp {
     Release,
 }
 
-/// Bounds the channel opens outstanding at once. In non-aggregated mode each one is an upstream
-/// `OpenExtendedMiningChannel`, sent to a pool that has often just restarted.
+/// Bounds the channel opens sent from the pending queue outstanding at once. In non-aggregated
+/// mode each one is an upstream `OpenExtendedMiningChannel`, sent to a pool that has often just
+/// restarted. The queue holds the held miners and the miners that reconnected while there was no
+/// upstream. Miners that connect once an upstream is up open their channel without waiting, paced
+/// by `accept`, and are neither counted nor held back.
 const MAX_CHANNEL_OPENS_IN_FLIGHT: usize = 256;
 
 /// How often pending channel opens are sent.
@@ -748,6 +753,11 @@ impl Sv1Server {
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
                 self.hold
+                    .queued_opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.hold
                     .held_opens
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -776,11 +786,16 @@ impl Sv1Server {
                 self.hold
                     .reattaching
                     .store(held && !waiting.is_empty(), Ordering::Release);
+                // Miners that connected while there was no upstream go first: they are the ones
+                // that have been waiting longest for a channel.
+                let (held_miners, new_miners): (Vec<_>, Vec<_>) = waiting
+                    .into_iter()
+                    .partition(|downstream_id| self.is_held(*downstream_id));
                 self.hold
                     .pending_opens
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .extend(waiting);
+                    .extend(new_miners.into_iter().chain(held_miners));
             }
             GenerationEvent::Released => {
                 self.hold.holding.store(false, Ordering::Release);
@@ -879,13 +894,15 @@ impl Sv1Server {
         }
     }
 
-    /// Opens queued channels while fewer than [`MAX_CHANNEL_OPENS_IN_FLIGHT`] are outstanding,
-    /// then reports a finished re-attach.
+    /// Opens queued channels while fewer than [`MAX_CHANNEL_OPENS_IN_FLIGHT`] of them are
+    /// outstanding, then reports a finished re-attach.
     async fn send_pending_channel_opens(&self) -> TproxyResult<(), error::Sv1Server> {
+        let mut in_flight = self.opens_in_flight(&self.hold.queued_opens);
         loop {
-            if self.current_generation().is_none()
-                || self.request_id_to_downstream_id.len() >= MAX_CHANNEL_OPENS_IN_FLIGHT
-            {
+            if self.current_generation().is_none() {
+                return Ok(());
+            }
+            if in_flight >= MAX_CHANNEL_OPENS_IN_FLIGHT {
                 return Ok(());
             }
             let next = self
@@ -902,20 +919,29 @@ impl Sv1Server {
             }
             let held = self.is_held(downstream_id);
             match self.handle_open_channel_request(downstream_id).await {
-                Ok(request_id) if held => {
+                Ok(request_id) => {
                     self.hold
-                        .held_opens
+                        .queued_opens
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(request_id);
+                    if held {
+                        self.hold
+                            .held_opens
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(request_id);
+                    }
+                    in_flight += 1;
                 }
-                Ok(_) => {}
                 // Only `DownstreamNotPresent`: the miner left after it was queued.
                 Err(e) if matches!(e.action, Action::Disconnect(_)) => {}
                 Err(e) => return Err(e),
             }
         }
-        if self.held_opens_in_flight() == 0 && self.hold.reattaching.swap(false, Ordering::AcqRel) {
+        if self.opens_in_flight(&self.hold.held_opens) == 0
+            && self.hold.reattaching.swap(false, Ordering::AcqRel)
+        {
             let counters = &self.hold.reattach_counters;
             info!(
                 unchanged = counters.unchanged.load(Ordering::Relaxed),
@@ -941,15 +967,11 @@ impl Sv1Server {
             .unwrap_or(false)
     }
 
-    /// Channel opens sent for held miners that are still waiting for an answer.
-    fn held_opens_in_flight(&self) -> usize {
-        let mut held_opens = self
-            .hold
-            .held_opens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        held_opens.retain(|request_id| self.request_id_to_downstream_id.contains_key(request_id));
-        held_opens.len()
+    /// How many of the channel opens in `opens` are still waiting for an answer.
+    fn opens_in_flight(&self, opens: &Mutex<HashSet<RequestId>>) -> usize {
+        let mut opens = opens.lock().unwrap_or_else(|e| e.into_inner());
+        opens.retain(|request_id| self.request_id_to_downstream_id.contains_key(request_id));
+        opens.len()
     }
 
     fn has_pending_channel_opens(&self) -> bool {
@@ -7092,6 +7114,116 @@ mod tests {
         server.hold.reattaching.store(false, Ordering::Release);
         server.handle_vardiff_updates().await.unwrap();
         assert!(from_server.is_empty());
+    }
+
+    /// Queues the setup of miner `downstream_id` while there is no upstream generation.
+    async fn queue_setup_while_disconnected(server: &Sv1Server, downstream_id: DownstreamId) {
+        register_test_downstream(server, downstream_id, None, 100.0, false);
+        server
+            .sv1_server_io
+            .downstream_to_sv1_server_sender
+            .send((
+                downstream_id,
+                json_rpc::Message::StandardRequest(json_rpc::StandardRequest {
+                    id: 1,
+                    method: "mining.subscribe".to_string(),
+                    params: serde_json::json!([]),
+                }),
+            ))
+            .await
+            .unwrap();
+        server.handle_downstream_message().await.unwrap();
+    }
+
+    /// The opens sent from the pending queue are capped, in held and walk-connected miners alike,
+    /// the miners behind the cap are sent as earlier opens are answered, and the open of a miner
+    /// that connects afterwards is neither counted nor delayed.
+    #[tokio::test]
+    async fn held_miners_reopen_at_most_the_cap_at_a_time() {
+        let held = MAX_CHANNEL_OPENS_IN_FLIGHT + 44;
+        let (server, from_server) = server_holding_miners(false, held as DownstreamId).await;
+        let walk_miner = 20_000;
+        queue_setup_while_disconnected(&server, walk_miner).await;
+        connect(&server).await;
+
+        server.send_pending_channel_opens().await.unwrap();
+        let mut outstanding = sent_opens(&from_server);
+        assert_eq!(outstanding.len(), MAX_CHANNEL_OPENS_IN_FLIGHT);
+        assert_eq!(
+            server
+                .request_id_to_downstream_id
+                .get_cloned(&outstanding[0]),
+            Some(walk_miner),
+            "the miner that connected during the walk goes first"
+        );
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(sent_opens(&from_server).is_empty(), "nothing is answered");
+
+        let new_miner = 10_000;
+        register_test_downstream(&server, new_miner, None, 100.0, false);
+        server.handle_open_channel_request(new_miner).await.unwrap();
+        assert_eq!(sent_opens(&from_server).len(), 1);
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(sent_opens(&from_server).is_empty());
+
+        let answered: Vec<_> = outstanding.drain(..10).collect();
+        for request_id in answered {
+            server.request_id_to_downstream_id.remove(&request_id);
+        }
+        server.send_pending_channel_opens().await.unwrap();
+        let sent = sent_opens(&from_server);
+        assert_eq!(sent.len(), 10);
+        outstanding.extend(sent);
+
+        for request_id in outstanding.drain(..) {
+            server.request_id_to_downstream_id.remove(&request_id);
+        }
+        server.send_pending_channel_opens().await.unwrap();
+        assert_eq!(
+            sent_opens(&from_server).len(),
+            held + 1 - MAX_CHANNEL_OPENS_IN_FLIGHT - 10
+        );
+    }
+
+    /// With the hold off, the miners that reconnected during the walk are the pending queue. The
+    /// cap bounds their opens too, and they re-open as earlier opens are answered.
+    #[tokio::test]
+    async fn miners_that_connected_during_the_walk_reopen_at_most_the_cap_at_a_time() {
+        let (server, _to_server, from_server) = vardiff_server(false);
+        let (_events, events_receiver) = unbounded();
+        let server = server.with_generation_control(events_receiver, from_server.clone());
+        assert!(server.config.upstream_loss_hold().is_none());
+        connect(&server).await;
+        end_generation(&server).await;
+        let walk_miners = MAX_CHANNEL_OPENS_IN_FLIGHT + 44;
+        for downstream_id in 1..=walk_miners as DownstreamId {
+            queue_setup_while_disconnected(&server, downstream_id).await;
+        }
+        connect(&server).await;
+
+        server.send_pending_channel_opens().await.unwrap();
+        let mut outstanding = sent_opens(&from_server);
+        assert_eq!(outstanding.len(), MAX_CHANNEL_OPENS_IN_FLIGHT);
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(sent_opens(&from_server).is_empty(), "nothing is answered");
+
+        let answered: Vec<_> = outstanding.drain(..10).collect();
+        for request_id in answered {
+            server.request_id_to_downstream_id.remove(&request_id);
+        }
+        server.send_pending_channel_opens().await.unwrap();
+        let sent = sent_opens(&from_server);
+        assert_eq!(sent.len(), 10);
+        outstanding.extend(sent);
+
+        for request_id in outstanding.drain(..) {
+            server.request_id_to_downstream_id.remove(&request_id);
+        }
+        server.send_pending_channel_opens().await.unwrap();
+        assert_eq!(
+            sent_opens(&from_server).len(),
+            walk_miners - MAX_CHANNEL_OPENS_IN_FLIGHT - 10
+        );
     }
 
     #[tokio::test(start_paused = true)]
