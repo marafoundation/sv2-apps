@@ -2,6 +2,7 @@ on:
   pull_request:
     branches:
       - mara-0.9
+      - 'm09/**'
   push:
     branches:
       - mara-0.9
