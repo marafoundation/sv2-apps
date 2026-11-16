@@ -1366,4 +1366,121 @@ mod tests {
         });
         assert_eq!(left, Some((0, 0)));
     }
+
+    const DOWNSTREAM_ID: DownstreamId = 7;
+    const TOKEN: JdToken = 10;
+
+    /// An engine whose downstream `DOWNSTREAM_ID` declared `job` under `TOKEN`.
+    fn engine_with_declared(job: DeclaredCustomJob) -> BitcoinCoreIPCEngine {
+        let (request_sender, _request_receiver) = async_channel::unbounded();
+        let engine = BitcoinCoreIPCEngine {
+            request_sender,
+            downstream_states: SharedMap::new(),
+            latest_prev_hash: SharedLock::new(None),
+            cancellation_token: CancellationToken::new(),
+            jdp_thread_handle: SharedLock::new(None),
+        };
+        engine
+            .downstream_states
+            .with_mut_or_default(DOWNSTREAM_ID, |state| {
+                state.insert_declared_custom_job(1, TOKEN, job);
+            });
+        engine
+    }
+
+    /// The `SetCustomMiningJob` a JDC sends for `job` as declared: every field the handler
+    /// compares equals the declaration's.
+    fn custom_job_as_declared(job: &DeclaredCustomJob) -> SetCustomMiningJobOwned {
+        let coinbase = job.get_coinbase_tx(None).unwrap();
+        SetCustomMiningJobOwned {
+            channel_id: 1,
+            request_id: 1,
+            token: TOKEN.to_le_bytes().to_vec().try_into().unwrap(),
+            version: job.get_version(),
+            prev_hash: job.get_prev_hash().to_byte_array().into(),
+            ntime_start: 1,
+            nbits: job.get_nbits(),
+            coinbase_tx_version: coinbase.version.0 as u32,
+            coinbase_prefix: coinbase.input[0].script_sig.as_bytes()[..4]
+                .to_vec()
+                .try_into()
+                .unwrap(),
+            coinbase_tx_input_n_sequence: coinbase.input[0].sequence.0,
+            coinbase_tx_outputs: bitcoin::consensus::serialize(&coinbase.output)
+                .try_into()
+                .unwrap(),
+            coinbase_tx_locktime: coinbase.lock_time.to_consensus_u32(),
+            merkle_path: job
+                .merkle_path
+                .iter()
+                .map(|node| node.to_byte_array().into())
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        }
+    }
+
+    // A `SetCustomMiningJob` pays out what its declaration did, so the coinbase `pool_only`
+    // checked at declaration time is the coinbase that is mined.
+    #[tokio::test]
+    async fn custom_job_paying_out_as_declared_is_accepted() {
+        let job = accepted_job(1).job;
+        let custom_job = custom_job_as_declared(&job);
+        let engine = engine_with_declared(job);
+
+        let result = engine
+            .handle_set_custom_mining_job(DOWNSTREAM_ID, custom_job, TOKEN)
+            .await;
+
+        assert!(matches!(result, SetCustomMiningJobResult::Success));
+    }
+
+    #[tokio::test]
+    async fn custom_job_paying_out_differently_from_its_declaration_is_refused() {
+        let declared = accepted_job(1).job;
+        let declared_coinbase = declared.get_coinbase_tx(None).unwrap();
+        let declared_output = declared_coinbase.output[0].clone();
+
+        let paying_the_miner = vec![TxOut {
+            value: declared_output.value,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 2]),
+        }];
+        let paying_less = vec![TxOut {
+            value: declared_output.value - Amount::from_sat(1),
+            script_pubkey: declared_output.script_pubkey.clone(),
+        }];
+        let paying_the_pool_and_the_miner = vec![
+            declared_output.clone(),
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 2]),
+            },
+        ];
+
+        for (name, outputs) in [
+            ("a different script", paying_the_miner),
+            ("a different amount", paying_less),
+            ("an extra output", paying_the_pool_and_the_miner),
+            ("no outputs", Vec::new()),
+        ] {
+            let mut custom_job = custom_job_as_declared(&declared);
+            custom_job.coinbase_tx_outputs =
+                bitcoin::consensus::serialize(&outputs).try_into().unwrap();
+            let engine = engine_with_declared(declared.clone());
+
+            let result = engine
+                .handle_set_custom_mining_job(DOWNSTREAM_ID, custom_job, TOKEN)
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    SetCustomMiningJobResult::Error(
+                        ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_OUTPUTS
+                    )
+                ),
+                "{name}"
+            );
+        }
+    }
 }
