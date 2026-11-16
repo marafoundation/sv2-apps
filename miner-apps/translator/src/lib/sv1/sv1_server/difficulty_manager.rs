@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use stratum_apps::stratum_core::{mining_sv2::UpdateChannelOwned, parsers_sv2::MiningOwned};
 
 use crate::{
@@ -64,7 +64,8 @@ impl Sv1Server {
     /// For each downstream whose hashrate estimate changed, records the new estimate and the
     /// target vardiff wants for it, sends UpdateChannel to keep the upstream informed (one per
     /// downstream, or a single one for the aggregated channel), and updates the difficulty
-    /// advertised to the miner, see [`Self::update_difficulty`].
+    /// advertised to the miner, see [`Self::update_difficulty`]. While held miners are being
+    /// re-attached, an aggregated channel is refreshed even when no estimate changed.
     pub(super) async fn handle_vardiff_updates(&self) -> TproxyResult<(), error::Sv1Server> {
         // The updates below are read under this generation and sent to its channel manager only.
         let epoch = self.generation_epoch();
@@ -162,6 +163,11 @@ impl Sv1Server {
         })?;
 
         if updates.is_empty() {
+            // Miners re-attached with their learned targets rarely change an estimate, so while
+            // a re-attach is unfinished the aggregate is refreshed here instead.
+            if self.mode.is_aggregated() && self.hold.reattaching.load(Ordering::Acquire) {
+                self.send_update_channel_on_downstream_state_change_in(epoch)?;
+            }
             return Ok(());
         }
         let updated_downstreams: Vec<DownstreamId> = updates

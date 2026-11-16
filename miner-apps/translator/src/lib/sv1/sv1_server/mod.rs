@@ -37,7 +37,7 @@ use async_channel::{Receiver, Sender, unbounded};
 #[cfg(feature = "monitoring")]
 use std::net::IpAddr;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         Arc, Mutex, RwLock,
@@ -287,7 +287,11 @@ struct HoldState {
     /// Miners whose channel has yet to be opened on the connected generation, opened at most
     /// [`MAX_CHANNEL_OPENS_IN_FLIGHT`] at a time.
     pending_opens: Arc<Mutex<VecDeque<DownstreamId>>>,
-    /// Set while held miners are being moved onto a new generation.
+    /// Requests of the channel opens sent for held miners. A request that is no longer
+    /// outstanding is dropped the next time the set is counted.
+    held_opens: Arc<Mutex<HashSet<RequestId>>>,
+    /// Set from the start of a generation until the channel opens of its held miners have been
+    /// answered. Miners that connect meanwhile do not extend it.
     reattaching: Arc<AtomicBool>,
     rejected_shares: Arc<AtomicU64>,
     reattach_counters: Arc<ReattachCounters>,
@@ -743,6 +747,11 @@ impl Sv1Server {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
+                self.hold
+                    .held_opens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 self.hold.reattaching.store(false, Ordering::Release);
                 if self.config.upstream_loss_hold().is_some() {
                     self.hold_miners().await?;
@@ -891,16 +900,22 @@ impl Sv1Server {
             if !self.downstreams.contains_key(&downstream_id) {
                 continue;
             }
-            if let Err(e) = self.handle_open_channel_request(downstream_id).await {
-                // Only `DownstreamNotPresent`: the miner left after it was queued.
-                if !matches!(e.action, Action::Disconnect(_)) {
-                    return Err(e);
+            let held = self.is_held(downstream_id);
+            match self.handle_open_channel_request(downstream_id).await {
+                Ok(request_id) if held => {
+                    self.hold
+                        .held_opens
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_id);
                 }
+                Ok(_) => {}
+                // Only `DownstreamNotPresent`: the miner left after it was queued.
+                Err(e) if matches!(e.action, Action::Disconnect(_)) => {}
+                Err(e) => return Err(e),
             }
         }
-        if self.request_id_to_downstream_id.is_empty()
-            && self.hold.reattaching.swap(false, Ordering::AcqRel)
-        {
+        if self.held_opens_in_flight() == 0 && self.hold.reattaching.swap(false, Ordering::AcqRel) {
             let counters = &self.hold.reattach_counters;
             info!(
                 unchanged = counters.unchanged.load(Ordering::Relaxed),
@@ -916,6 +931,25 @@ impl Sv1Server {
             }
         }
         Ok(())
+    }
+
+    /// Whether `downstream_id` is a miner held across a generation boundary.
+    fn is_held(&self, downstream_id: DownstreamId) -> bool {
+        self.downstreams
+            .get_cloned(&downstream_id)
+            .and_then(|downstream| downstream.downstream_data.with(|data| data.held).ok())
+            .unwrap_or(false)
+    }
+
+    /// Channel opens sent for held miners that are still waiting for an answer.
+    fn held_opens_in_flight(&self) -> usize {
+        let mut held_opens = self
+            .hold
+            .held_opens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        held_opens.retain(|request_id| self.request_id_to_downstream_id.contains_key(request_id));
+        held_opens.len()
     }
 
     fn has_pending_channel_opens(&self) -> bool {
@@ -1689,11 +1723,12 @@ impl Sv1Server {
         Ok(())
     }
 
-    /// Handles channel opening requests from downstream when they send their first message.
+    /// Handles channel opening requests from downstream when they send their first message, and
+    /// returns the id of the request sent.
     async fn handle_open_channel_request(
         &self,
         downstream_id: DownstreamId,
-    ) -> TproxyResult<(), error::Sv1Server> {
+    ) -> TproxyResult<RequestId, error::Sv1Server> {
         info!(
             "SV1 server: opening extended mining channel for downstream {} after first message",
             downstream_id
@@ -1716,7 +1751,8 @@ impl Sv1Server {
         self.open_requested_at.insert(request_id, Instant::now());
 
         self.forward_pending_open_channel_request(request_id, downstream_id)
-            .await
+            .await?;
+        Ok(request_id)
     }
 
     /// Forwards an open request that has already been registered, removing its mapping if the
@@ -1909,7 +1945,9 @@ impl Sv1Server {
 
                         // Opening a downstream changes the aggregate just like disconnecting one.
                         // Refresh it now so the newly active hashrate is not left out until the
-                        // next vardiff update. A re-attach refreshes it once, when it finishes.
+                        // next vardiff update. A re-attach refreshes it once, when its held miners
+                        // have been answered, or at the next vardiff tick
+                        // if that takes longer.
                         if self.mode.is_aggregated()
                             && vardiff_enabled
                             && !self.hold.reattaching.load(Ordering::Acquire)
@@ -6938,6 +6976,122 @@ mod tests {
         ));
         assert!(from_server.is_empty());
         assert!(!server.has_pending_channel_opens());
+    }
+
+    /// A holding server with vardiff on whose generation has just ended, leaving `held` miners
+    /// held, ids from 1.
+    async fn server_holding_miners(
+        aggregated: bool,
+        held: DownstreamId,
+    ) -> (Sv1Server, Receiver<(MiningOwned, Option<ShareOrigin>)>) {
+        let (server, _to_server, from_server) = vardiff_server(aggregated);
+        let (_events, events_receiver) = unbounded();
+        let mut server = server.with_generation_control(events_receiver, from_server.clone());
+        server.config.upstream_loss_hold_secs = 60;
+        connect(&server).await;
+        for downstream_id in 1..=held {
+            register_test_downstream(
+                &server,
+                downstream_id,
+                Some(downstream_id as ChannelId),
+                100.0,
+                false,
+            );
+        }
+        end_generation(&server).await;
+        (server, from_server)
+    }
+
+    /// [`server_holding_miners`] once the next generation has connected, with the held miners
+    /// queued to re-attach.
+    async fn reattaching_server(
+        aggregated: bool,
+        held: DownstreamId,
+    ) -> (Sv1Server, Receiver<(MiningOwned, Option<ShareOrigin>)>) {
+        let (server, from_server) = server_holding_miners(aggregated, held).await;
+        connect(&server).await;
+        (server, from_server)
+    }
+
+    /// Takes the channel opens the server has sent, returning their request ids.
+    fn sent_opens(from_server: &Receiver<(MiningOwned, Option<ShareOrigin>)>) -> Vec<RequestId> {
+        let mut requests = Vec::new();
+        while let Ok((message, _)) = from_server.try_recv() {
+            if let MiningOwned::OpenExtendedMiningChannel(open) = message {
+                requests.push(open.request_id);
+            }
+        }
+        requests
+    }
+
+    /// Miners that connect while held miners re-attach do not postpone the aggregate refresh
+    /// that ends the re-attach.
+    #[tokio::test]
+    async fn new_connects_do_not_delay_the_end_of_a_reattach() {
+        let (server, from_server) = reattaching_server(true, 2).await;
+        register_test_downstream(&server, 100, None, 100.0, false);
+        server.handle_open_channel_request(100).await.unwrap();
+        server.send_pending_channel_opens().await.unwrap();
+        let held_requests: Vec<_> = sent_opens(&from_server)
+            .into_iter()
+            .filter(|request_id| {
+                server
+                    .request_id_to_downstream_id
+                    .get_cloned(request_id)
+                    .is_some_and(|downstream_id| downstream_id != 100)
+            })
+            .collect();
+        assert_eq!(held_requests.len(), 2);
+        assert!(server.hold.reattaching.load(Ordering::Acquire));
+
+        for request_id in held_requests {
+            server.request_id_to_downstream_id.remove(&request_id);
+        }
+        for downstream_id in 101..104 {
+            register_test_downstream(&server, downstream_id, None, 100.0, false);
+            server
+                .handle_open_channel_request(downstream_id)
+                .await
+                .unwrap();
+        }
+        assert!(
+            server.request_id_to_downstream_id.len() >= 4,
+            "new connects are waiting for their channel"
+        );
+        let _ = sent_opens(&from_server);
+
+        server.send_pending_channel_opens().await.unwrap();
+        assert!(!server.hold.reattaching.load(Ordering::Acquire));
+        assert!(matches!(
+            from_server.try_recv(),
+            Ok((MiningOwned::UpdateChannel(_), _))
+        ));
+    }
+
+    /// While a re-attach is unfinished the vardiff tick refreshes the aggregate even though no
+    /// miner's estimate changed; otherwise it sends nothing.
+    #[tokio::test]
+    async fn the_vardiff_tick_refreshes_the_aggregate_while_reattaching() {
+        let (server, from_server) = reattaching_server(true, 2).await;
+        server.send_pending_channel_opens().await.unwrap();
+        let _ = sent_opens(&from_server);
+        register_test_downstream(&server, 50, Some(50), 100.0, false);
+        assert!(server.vardiff.is_empty());
+        assert!(server.hold.reattaching.load(Ordering::Acquire));
+
+        server.handle_vardiff_updates().await.unwrap();
+        let Ok((MiningOwned::UpdateChannel(update), _)) = from_server.try_recv() else {
+            panic!("expected the aggregate refresh");
+        };
+        assert_eq!(
+            update.nominal_hash_rate, 100.0,
+            "miner 50 is the only open one"
+        );
+        assert!(from_server.is_empty());
+
+        server.hold.reattaching.store(false, Ordering::Release);
+        server.handle_vardiff_updates().await.unwrap();
+        assert!(from_server.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
