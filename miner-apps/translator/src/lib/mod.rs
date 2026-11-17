@@ -171,12 +171,27 @@ impl TranslatorSv2 {
     }
 
     /// What [`TranslatorSv2::start`] returns after `kind` stopped it. A failure that comes while
-    /// a shutdown or drain is already under way is part of that shutdown, not an error.
+    /// a shutdown or drain is already under way is part of that shutdown, not an error: the
+    /// miners not yet drained are cut by it like at the end of the drain window.
+    ///
+    /// An upstream lost during a drain is still handled as a fallback, so the miners that have
+    /// not been drained keep mining on the next upstream. Only when no upstream can serve them,
+    /// or the fallback budget is spent, does the drain turn into the shutdown it was heading for.
     ///
     /// Must be called before the failed runtime is shut down, which cancels the shutdown token.
     fn failure_outcome(&self, kind: TproxyErrorKind, message: &str) -> Result<(), TproxyErrorKind> {
-        if self.cancellation_token.is_cancelled() {
-            info!(?kind, "{message}: shutdown in progress");
+        if self.cancellation_token.is_cancelled() || self.is_draining() {
+            let drain_cut_short = !self.cancellation_token.is_cancelled()
+                && matches!(
+                    kind,
+                    TproxyErrorKind::GenerationEndUnacknowledged
+                        | TproxyErrorKind::FallbackLoop { .. }
+                );
+            if drain_cut_short {
+                warn!(?kind, "{message}: shutdown in progress");
+            } else {
+                info!(?kind, "{message}: shutdown in progress");
+            }
             Ok(())
         } else {
             error!(?kind, "{message}");
@@ -356,6 +371,36 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(translator.cancellation_token.is_cancelled());
         shutdown.abort();
+    }
+
+    /// Failures that come during a drain or shutdown are a clean exit, whatever caused them;
+    /// otherwise they are reported.
+    #[test]
+    fn failures_during_a_drain_or_shutdown_are_a_clean_exit() {
+        let failures = || {
+            [
+                TproxyErrorKind::CouldNotInitiateSystem,
+                TproxyErrorKind::FallbackLoop {
+                    fallbacks: 6,
+                    window_secs: 600,
+                },
+            ]
+        };
+
+        let translator = translator(30);
+        for kind in failures() {
+            assert!(translator.failure_outcome(kind, "test").is_err());
+        }
+        translator.drain_token.cancel();
+        for kind in failures() {
+            assert!(translator.failure_outcome(kind, "test").is_ok());
+        }
+
+        let translator = self::translator(30);
+        translator.cancellation_token.cancel();
+        for kind in failures() {
+            assert!(translator.failure_outcome(kind, "test").is_ok());
+        }
     }
 
     /// A bootstrap that fails because the translator is already shutting down is a clean exit.

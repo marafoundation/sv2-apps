@@ -164,10 +164,12 @@ impl<State> TranslatorRuntime<State> {
 
     /// Asks every held miner to reconnect, spread over the drain window, and waits for them to
     /// leave. Called before shutting down because no upstream connected within the hold window.
+    /// During a drain the miners are already being disconnected one by one and the shutdown that
+    /// follows cuts the rest, so nothing is released.
     pub(super) async fn release_held_miners(&self) {
         let was_holding = self.upstreams.holding_until().is_some();
         self.upstreams.stop_holding();
-        if !was_holding || !self.sv1.started {
+        if !was_holding || !self.sv1.started || self.translator.is_draining() {
             return;
         }
         let _ = self
@@ -798,8 +800,10 @@ impl TranslatorRuntime<Running> {
     pub(super) async fn cleanup_for_fallback(
         mut self,
     ) -> Result<TranslatorRuntime<ChannelManagerReady>, BootstrapError> {
-        // A shutdown or drain that has already cancelled the translator is not an upstream
-        // failure: it must not hold miners or count toward the fallback metric and budget.
+        // A shutdown that has already cancelled the translator is not an upstream failure: it
+        // must not hold miners or count toward the fallback metric and budget. An upstream lost
+        // during a drain is one, and is recorded; `TranslatorSv2::failure_outcome` ends the
+        // process cleanly if the fallback then fails.
         if self.translator.cancellation_token.is_cancelled() {
             return Err(BootstrapError::from((
                 TproxyErrorKind::CouldNotInitiateSystem,

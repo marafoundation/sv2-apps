@@ -3115,6 +3115,102 @@ async fn translator_exits_when_fallbacks_exceed_the_budget() {
     );
 }
 
+/// An upstream lost while the translator drains is handled as a fallback. If that fallback cannot
+/// be completed, because the budget is spent or no upstream answers, the drain turns into the
+/// shutdown it was heading for and `start()` returns `Ok`, instead of failing the process.
+async fn upstream_lost_during_a_drain_ends_in_a_clean_exit(max_fallbacks: usize, hold_secs: u64) {
+    use translator_sv2::config::{DownstreamDifficultyConfig, TranslatorConfig, Upstream};
+
+    start_tracing();
+    let upstream_addr = get_available_address();
+    let _session = MockUpstream::new(
+        upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .disconnect_after_setup_connection_success(Duration::from_secs(4))
+    .start()
+    .await;
+
+    let authority_pubkey = stratum_apps::key_utils::Secp256k1PublicKey::try_from(
+        "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72".to_string(),
+    )
+    .unwrap();
+    let listen_addr = get_available_address();
+    let mut config = TranslatorConfig::new(
+        vec![Upstream::new(
+            upstream_addr.ip().to_string(),
+            upstream_addr.port(),
+            authority_pubkey,
+            "user_identity".to_string(),
+        )],
+        listen_addr.ip().to_string(),
+        listen_addr.port(),
+        DownstreamDifficultyConfig::new(1_000_000.0, 6.0, true, 60),
+        2,
+        2,
+        4,
+        false,
+        true,
+        vec![],
+        vec![],
+        None,
+        None,
+    );
+    config.max_fallbacks = max_fallbacks;
+    config.upstream_loss_hold_secs = hold_secs;
+    // A window the miner is not drained within before the upstream drops.
+    config.drain_seconds = 86_400;
+    let translator = translator_sv2::TranslatorSv2::new(config);
+    let started = tokio::spawn({
+        let translator = translator.clone();
+        async move { translator.start().await }
+    });
+
+    let _miner = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(stream) = TcpStream::connect(listen_addr).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("translator should accept SV1 connections");
+    // Let the accept loop register the connection before draining.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let drain = tokio::spawn({
+        let translator = translator.clone();
+        async move { translator.drain_and_shutdown().await }
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(60), started)
+        .await
+        .expect("translator should stop once its upstream is lost and cannot be replaced")
+        .unwrap();
+    assert!(
+        translator.is_draining() && result.is_ok(),
+        "unexpected result: {result:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(10), drain)
+        .await
+        .expect("the drain should end with the translator")
+        .unwrap();
+}
+
+/// The fallback the lost upstream causes exceeds the budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_lost_during_a_drain_exits_cleanly_when_the_budget_is_spent() {
+    upstream_lost_during_a_drain_ends_in_a_clean_exit(0, 0).await;
+}
+
+/// The walk for a new upstream finds none before the hold window ends: the mock no longer listens
+/// once it dropped the translator. The miner is held meanwhile, still waiting for its turn to be
+/// drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_lost_during_a_drain_exits_cleanly_when_the_walk_fails() {
+    upstream_lost_during_a_drain_ends_in_a_clean_exit(5, 8).await;
+}
+
 /// HTTP status of the translator's `/api/v1/health`, or `None` while nothing listens.
 async fn health_status(monitoring_addr: std::net::SocketAddr) -> Option<u16> {
     let url = format!("http://{monitoring_addr}/api/v1/health");
