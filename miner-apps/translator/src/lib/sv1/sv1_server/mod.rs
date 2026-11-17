@@ -6297,6 +6297,43 @@ mod tests {
         assert!(from_server.is_empty());
     }
 
+    /// The acknowledgement tells the runtime it may start the next channel manager, so nothing
+    /// of the ended generation may still be queued when it is sent. The queues are filled so that
+    /// draining them takes much longer than waking the thread waiting for the acknowledgement.
+    #[test]
+    fn generation_end_is_acknowledged_only_after_both_queues_are_drained() {
+        const QUEUED: usize = 100_000;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (server, to_server, from_server, _events) = server_with_generation_control(false);
+        runtime.block_on(connect(&server));
+        for _ in 0..QUEUED {
+            server
+                .send_to_channel_manager((close_channel(9), None))
+                .unwrap();
+            to_server.try_send(close_channel(9)).unwrap();
+        }
+        let (drained, drained_receiver) = tokio::sync::oneshot::channel();
+        let acknowledged = std::thread::spawn({
+            let from_server = from_server.clone();
+            let from_manager = server.sv1_server_io.channel_manager_receiver.clone();
+            move || {
+                drained_receiver.blocking_recv().unwrap();
+                (from_server.len(), from_manager.len())
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        runtime
+            .block_on(server.handle_generation_event(GenerationEvent::Ended {
+                drained: Some(drained),
+            }))
+            .unwrap();
+
+        assert_eq!(acknowledged.join().unwrap(), (0, 0));
+    }
+
     #[cfg(feature = "monitoring")]
     #[tokio::test]
     async fn shares_whose_upstream_went_away_are_counted_as_dropped() {

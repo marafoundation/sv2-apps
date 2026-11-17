@@ -978,6 +978,66 @@ mod tests {
         assert!(started.elapsed() >= GENERATION_END_ACK_TIMEOUT);
     }
 
+    /// A runtime holding miners for a minute whose SV1 server never answers a generation end.
+    fn running_runtime_with_a_silent_sv1_server() -> TranslatorRuntime<Running> {
+        use crate::config::Upstream;
+        use std::str::FromStr;
+        use stratum_apps::key_utils::Secp256k1PublicKey;
+
+        let pubkey =
+            Secp256k1PublicKey::from_str("9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan")
+                .unwrap();
+        let mut config = TranslatorConfig::new(
+            vec![Upstream::new(
+                "127.0.0.1".into(),
+                4444,
+                pubkey,
+                "test".into(),
+            )],
+            "127.0.0.1".into(),
+            3333,
+            DownstreamDifficultyConfig::new(100.0, 5.0, true, 60),
+            2,
+            1,
+            4,
+            false,
+            true,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        config.upstream_loss_hold_secs = 60;
+        let mut runtime = TranslatorRuntime::<Init>::new(TranslatorSv2::new(config)).unwrap();
+        runtime.sv1.started = true;
+        TranslatorRuntime {
+            tproxy_mode: runtime.tproxy_mode,
+            fallback_coordinator: runtime.fallback_coordinator,
+            task_manager: runtime.task_manager,
+            translator: runtime.translator,
+            upstreams: runtime.upstreams,
+            protocol_reconnect: runtime.protocol_reconnect,
+            listen_addr: runtime.listen_addr,
+            sv1: runtime.sv1,
+            state: Running,
+        }
+    }
+
+    /// When the SV1 server does not acknowledge a generation end, it cannot be told to release
+    /// the held miners either, so the hold is dropped and shutting down disconnects them.
+    #[tokio::test(start_paused = true)]
+    async fn an_unacknowledged_generation_end_stops_the_hold() {
+        let runtime = running_runtime_with_a_silent_sv1_server();
+
+        let Err(error) = runtime.cleanup_for_fallback().await else {
+            panic!("the fallback should fail");
+        };
+        let (kind, runtime) = error.into_parts();
+
+        assert!(matches!(kind, TproxyErrorKind::GenerationEndUnacknowledged));
+        assert!(runtime.upstreams.holding_until().is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn shutdown_during_the_generation_end_wait_stops_the_translator() {
         let sv1 = sv1_side(true, false);
