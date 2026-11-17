@@ -51,7 +51,7 @@ impl Sv1Server {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
-            info!("Starting vardiff loop for downstreams");
+            info!("Starting vardiff loop for downstreams (responsive vardiff)");
 
             self.handle_vardiff_updates().await?;
         }

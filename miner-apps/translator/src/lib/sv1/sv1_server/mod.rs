@@ -546,7 +546,8 @@ impl Sv1Server {
                                     // which is twelve orders of magnitude below anything this config
                                     // admits.
                                     let min_hashrate = self.config.downstream_difficulty_config.min_individual_miner_hashrate;
-                                    let vardiff = VardiffState::new_with_min(min_hashrate).expect("Failed to create vardiffstate");
+                                    // The responsive vardiff: closes a far opening and a large rise in a few evaluations.
+                                    let vardiff = VardiffState::new_with_min(min_hashrate).expect("Failed to create vardiffstate").responsive();
                                     self.vardiff.insert(downstream_id, vardiff);
                                 }
                                 info!("Downstream {} registered successfully (channel will be opened after first message)", downstream_id);
