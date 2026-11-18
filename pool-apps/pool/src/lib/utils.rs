@@ -79,3 +79,48 @@ pub(crate) fn create_close_channel_msg(channel_id: ChannelId, msg: &str) -> Clos
         reason_code: Str0255Owned::try_from(msg).expect("Could not convert message."),
     }
 }
+
+/// Applies the pool's nominal hashrate floor to a hashrate declared by a downstream.
+///
+/// A `floor` of `0.0` disables it. A declared rate that the target derivation refuses (NaN,
+/// infinite or negative, including `-0.0`) is returned untouched, so it is still rejected with
+/// the usual error rather than being papered over by the floor.
+pub fn clamp_nominal_hash_rate(declared: f32, floor: f32) -> f32 {
+    if floor > 0.0 && declared.is_finite() && !declared.is_sign_negative() {
+        declared.max(floor)
+    } else {
+        declared
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_floor_leaves_the_declared_rate_unchanged() {
+        for declared in [0.0, 1.0, 1e9, 2e14, f32::MAX] {
+            assert_eq!(clamp_nominal_hash_rate(declared, 0.0), declared);
+        }
+    }
+
+    #[test]
+    fn declared_below_the_floor_gets_the_floor() {
+        assert_eq!(clamp_nominal_hash_rate(1e9, 1e13), 1e13);
+        assert_eq!(clamp_nominal_hash_rate(0.0, 1e13), 1e13);
+    }
+
+    #[test]
+    fn declared_at_or_above_the_floor_is_kept() {
+        assert_eq!(clamp_nominal_hash_rate(1e13, 1e13), 1e13);
+        assert_eq!(clamp_nominal_hash_rate(2e14, 1e13), 2e14);
+    }
+
+    #[test]
+    fn invalid_declared_rates_are_left_for_the_channel_to_reject() {
+        for declared in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, -0.0] {
+            let clamped = clamp_nominal_hash_rate(declared, 1e13);
+            assert_eq!(clamped.to_bits(), declared.to_bits());
+        }
+    }
+}

@@ -65,6 +65,27 @@ pub struct PoolConfig {
     /// Which payout modes a `user_identity` may select; `pool_only` also binds the embedded JDS.
     #[serde(default)]
     payout_modes: AllowedPayoutModes,
+    /// Floor, in hashes per second, applied to the nominal hashrate a downstream declares for a
+    /// channel (on open and on `UpdateChannel`). `0.0` (the default) disables it.
+    ///
+    /// The channel's initial target is derived from the declared rate, so a device that declares
+    /// far less than it hashes starts at a target that is far too easy and floods the pool with
+    /// shares until the first vardiff tick.
+    #[serde(default, deserialize_with = "deserialize_hash_rate_floor")]
+    min_channel_nominal_hash_rate: f32,
+}
+
+fn deserialize_hash_rate_floor<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <f32 as serde::Deserialize>::deserialize(deserializer)?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(serde::de::Error::custom(format!(
+            "min_channel_nominal_hash_rate must be finite and >= 0, got {value}"
+        )));
+    }
+    Ok(value)
 }
 
 impl PoolConfig {
@@ -100,6 +121,7 @@ impl PoolConfig {
             share_batch_size,
             max_past_jobs: None,
             payout_modes: AllowedPayoutModes::default(),
+            min_channel_nominal_hash_rate: 0.0,
             log_file: None,
             server_id,
             supported_extensions,
@@ -123,6 +145,25 @@ impl PoolConfig {
     /// Sets which payout modes a `user_identity` may select.
     pub fn set_payout_modes(&mut self, payout_modes: AllowedPayoutModes) {
         self.payout_modes = payout_modes;
+    }
+
+    /// Returns the floor applied to a channel's declared nominal hashrate, in hashes per second.
+    /// `0.0` means no floor.
+    pub fn min_channel_nominal_hash_rate(&self) -> f32 {
+        self.min_channel_nominal_hash_rate
+    }
+
+    /// Sets the floor applied to a channel's declared nominal hashrate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hash_rate` is not finite or is negative, which the config loader rejects.
+    pub fn set_min_channel_nominal_hash_rate(&mut self, hash_rate: f32) {
+        assert!(
+            hash_rate.is_finite() && hash_rate >= 0.0,
+            "min_channel_nominal_hash_rate must be finite and >= 0, got {hash_rate}"
+        );
+        self.min_channel_nominal_hash_rate = hash_rate;
     }
 
     /// Returns Pool listenining address.
@@ -378,6 +419,54 @@ address = "127.0.0.1:8442"
     }
 
     #[test]
+    fn min_channel_nominal_hash_rate_defaults_to_off_and_is_read_from_config() {
+        assert_eq!(
+            load_with("", "floor-absent").min_channel_nominal_hash_rate(),
+            0.0
+        );
+        assert_eq!(
+            load_with("min_channel_nominal_hash_rate = 1e13", "floor-float")
+                .min_channel_nominal_hash_rate(),
+            1e13
+        );
+        assert_eq!(
+            load_with("min_channel_nominal_hash_rate = 5000", "floor-int")
+                .min_channel_nominal_hash_rate(),
+            5000.0
+        );
+        assert_eq!(
+            load_with("min_channel_nominal_hash_rate = 0", "floor-zero")
+                .min_channel_nominal_hash_rate(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn min_channel_nominal_hash_rate_rejects_invalid_values() {
+        for (name, value) in [
+            ("floor-neg", "-1.0"),
+            ("floor-nan", "nan"),
+            ("floor-inf", "inf"),
+            ("floor-neg-inf", "-inf"),
+            ("floor-str", "\"fast\""),
+        ] {
+            let err = try_load_with(&format!("min_channel_nominal_hash_rate = {value}"), name);
+            assert!(err.is_err(), "{value} must not load, got {err:?}");
+        }
+        let err = try_load_with("min_channel_nominal_hash_rate = -1.0", "floor-neg-msg")
+            .expect_err("negative floor must not load")
+            .to_string();
+        assert!(err.contains("min_channel_nominal_hash_rate"), "{err}");
+    }
+
+    #[test]
+    fn min_channel_nominal_hash_rate_setter_overrides() {
+        let mut cfg = load_with("", "floor-setter");
+        cfg.set_min_channel_nominal_hash_rate(2e13);
+        assert_eq!(cfg.min_channel_nominal_hash_rate(), 2e13);
+    }
+
+    #[test]
     fn unknown_keys_are_rejected() {
         // A misspelled key must not be dropped, leaving its field at the default (for
         // `payout_mode`, the permissive `any`).
@@ -415,6 +504,27 @@ address = "127.0.0.1:8442"
             .expect_err("unknown env override must not load")
             .to_string();
         assert!(err.contains("unknown field `bogus`"), "{err}");
+    }
+
+    #[test]
+    fn min_channel_nominal_hash_rate_env_override_is_validated() {
+        // The prefix is unique to this test, so the variable reaches no other test's loader.
+        let key = "POOL_TEST_ENV_FLOOR__MIN_CHANNEL_NOMINAL_HASH_RATE";
+        let load = |value: &str, name: &str| {
+            // `set_var` is unsafe as of Rust 2024; see the loader's tests.
+            unsafe { std::env::set_var(key, value) };
+            let result = try_load_with_tp_extra("", "", name, "POOL_TEST_ENV_FLOOR");
+            unsafe { std::env::remove_var(key) };
+            result
+        };
+
+        let cfg = load("1e13", "env-floor-valid").expect("valid env floor loads");
+        assert_eq!(cfg.min_channel_nominal_hash_rate(), 1e13);
+
+        for (name, value) in [("env-floor-nan", "nan"), ("env-floor-neg", "-1")] {
+            let result = load(value, name);
+            assert!(result.is_err(), "{value} must not load, got {result:?}");
+        }
     }
 
     /// Every shipped example must deserialize, so a key renamed in the config structs cannot

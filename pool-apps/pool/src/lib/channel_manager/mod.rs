@@ -26,6 +26,7 @@ use stratum_apps::{
             Vardiff, VardiffState,
             extranonce_manager::{ExtranonceAllocator, bytes_needed},
             server::{extended::ExtendedChannel, group::GroupChannel, standard::StandardChannel},
+            vardiff::error::VardiffError,
         },
         handlers_sv2::{
             HandleMiningMessagesFromClientOwnedAsync,
@@ -47,10 +48,12 @@ use crate::{
     config::PoolConfig,
     downstream::Downstream,
     error::{self, Action, LoopControl, PoolError, PoolErrorKind, PoolResult},
-    utils::DownstreamMessage,
+    utils::{DownstreamMessage, clamp_nominal_hash_rate},
 };
 
 mod mining_message_handler;
+#[cfg(test)]
+mod nominal_hash_rate_floor_tests;
 mod template_distribution_message_handler;
 
 // Size of the static identifier for this pool server, placed at the start of the pool's
@@ -112,6 +115,8 @@ pub struct ChannelManager {
     pool_tag_string: String,
     share_batch_size: usize,
     shares_per_minute: SharesPerMinute,
+    /// Floor for a channel's declared nominal hashrate; `0.0` disables it.
+    min_channel_nominal_hash_rate: f32,
     /// Past jobs retained per channel; `None` uses the `channels_sv2` default.
     max_past_jobs: Option<usize>,
     pub(crate) coinbase_reward_script: CoinbaseRewardScript,
@@ -200,6 +205,12 @@ impl ChannelManager {
             _ => info!("past-jobs retention cap: using channels_sv2 default"),
         }
         info!(payout_modes = ?config.payout_modes(), "user_identity payout modes accepted");
+        if config.min_channel_nominal_hash_rate() > 0.0 {
+            info!(
+                min_channel_nominal_hash_rate = config.min_channel_nominal_hash_rate(),
+                "channel nominal hashrate floor configured"
+            );
+        }
 
         let channel_manager = ChannelManager {
             downstreams: SharedMap::new(),
@@ -212,6 +223,7 @@ impl ChannelManager {
             channel_manager_io,
             share_batch_size: config.share_batch_size(),
             shares_per_minute: config.shares_per_minute(),
+            min_channel_nominal_hash_rate: config.min_channel_nominal_hash_rate(),
             max_past_jobs: config.max_past_jobs(),
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
@@ -223,6 +235,37 @@ impl ChannelManager {
         };
 
         Ok(channel_manager)
+    }
+
+    // The nominal hashrate a channel is opened or updated with: the declared rate, raised to
+    // the configured floor. Logs once per call when the floor applies.
+    fn effective_nominal_hash_rate(
+        &self,
+        downstream_id: DownstreamId,
+        channel_id: ChannelId,
+        declared: f32,
+    ) -> f32 {
+        let effective = clamp_nominal_hash_rate(declared, self.min_channel_nominal_hash_rate);
+        if effective.to_bits() != declared.to_bits() {
+            debug!(
+                downstream_id,
+                channel_id,
+                declared_hash_rate = declared,
+                min_channel_nominal_hash_rate = self.min_channel_nominal_hash_rate,
+                "declared nominal hashrate is below the pool floor; using the floor"
+            );
+        }
+        effective
+    }
+
+    // Vardiff state for a new channel. The floor is also vardiff's minimum hashrate, so the
+    // periodic adjustment can never take a channel's nominal hashrate below it.
+    fn new_channel_vardiff(&self) -> Result<VardiffState, VardiffError> {
+        if self.min_channel_nominal_hash_rate > 0.0 {
+            VardiffState::new_with_min(self.min_channel_nominal_hash_rate)
+        } else {
+            VardiffState::new()
+        }
     }
 
     // Bootstraps a group channel with the given parameters.
@@ -548,12 +591,24 @@ impl ChannelManager {
         Ok(())
     }
 
+    // Whether vardiff only pushed the channel back onto the configured floor it already sits
+    // on. A channel whose real rate is below the floor hits this on every tick, and there is
+    // nothing to tell the downstream: the target would not change. Never true without a floor.
+    fn is_clamped_to_current_floor(
+        new_hashrate: f32,
+        current_hashrate: f32,
+        min_channel_nominal_hash_rate: f32,
+    ) -> bool {
+        min_channel_nominal_hash_rate > 0.0 && new_hashrate == current_hashrate
+    }
+
     // Runs the vardiff on extended channel.
     fn run_vardiff_on_extended_channel(
         downstream_id: DownstreamId,
         channel_id: ChannelId,
         channel_state: &mut ExtendedChannel,
         vardiff_state: &mut VardiffState,
+        min_channel_nominal_hash_rate: f32,
         updates: &mut Vec<RouteMessageTo>,
     ) {
         let (hashrate, target, shares_per_minute) = (
@@ -572,6 +627,11 @@ impl ChannelManager {
             channel_state.set_stable_hashrate(true);
             return;
         };
+
+        if Self::is_clamped_to_current_floor(new_hashrate, hashrate, min_channel_nominal_hash_rate)
+        {
+            return;
+        }
 
         channel_state.set_stable_hashrate(false);
 
@@ -602,6 +662,7 @@ impl ChannelManager {
         channel_id: ChannelId,
         channel: &mut StandardChannel,
         vardiff_state: &mut VardiffState,
+        min_channel_nominal_hash_rate: f32,
         updates: &mut Vec<RouteMessageTo>,
     ) {
         let hashrate = channel.get_nominal_hashrate();
@@ -618,6 +679,11 @@ impl ChannelManager {
             channel.set_stable_hashrate(true);
             return;
         };
+
+        if Self::is_clamped_to_current_floor(new_hashrate, hashrate, min_channel_nominal_hash_rate)
+        {
+            return;
+        }
 
         channel.set_stable_hashrate(false);
         match channel.update_channel(new_hashrate, None) {
@@ -684,6 +750,7 @@ impl ChannelManager {
                                     channel_id,
                                     standard_channel,
                                     vardiff_state,
+                                    self.min_channel_nominal_hash_rate,
                                     &mut messages,
                                 );
                             });
@@ -695,6 +762,7 @@ impl ChannelManager {
                                     channel_id,
                                     extended_channel,
                                     vardiff_state,
+                                    self.min_channel_nominal_hash_rate,
                                     &mut messages,
                                 );
                             });

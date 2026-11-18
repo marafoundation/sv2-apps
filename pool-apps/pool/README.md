@@ -64,6 +64,7 @@ The configuration file contains the following information:
      - `data_dir` - (Optional) Custom Bitcoin data directory. Uses OS default if not set. The directory holding `node.sock` must be owned by the Bitcoin Core user and not writable by others; run this app as that user (see [Socket Trust](../../bitcoin-core-sv2/README.md#socket-trust))
      - `fee_threshold` - Minimum fee threshold to trigger new templates
      - `min_interval` - Minimum interval between template updates in seconds
+6. `min_channel_nominal_hash_rate` - (Optional) Floor, in hashes per second, for the nominal hashrate a downstream declares when it opens a channel or sends `UpdateChannel`. The channel's initial target is derived from the declared rate, so a device that declares far less than it hashes starts at a target that is far too easy and floods the pool with shares until vardiff catches up; the pool then drops the connection once the per-chain-tip accepted-share budget is exhausted. With a floor set, the pool uses the larger of the declared rate and the floor, and vardiff never takes the channel below the floor. The channel's reported hashrate (`sv2_client_channel_hashrate`, `/api/v1`) is the floored value, not the declared one. It must be finite and not negative; `0.0` (the default) disables it.
 
 For connections with a Sv2 Template Provider, you may want to verify that your TP connection is authentic. You can get the `public_key` from the logs of your TP, for example:
 

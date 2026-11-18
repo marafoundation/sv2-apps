@@ -35,6 +35,10 @@ share_batch_size = 10
 # legacy solo and donate identities; "pool_only" refuses channels whose identity pays the
 # miner and, with [jds], declared coinbases that pay anything but coinbase_reward_script.
 # payout_modes = "pool_only"
+# Floor, in hashes per second, for the nominal hashrate a downstream declares on a channel (optional).
+# A channel's initial target comes from the declared rate, so a device declaring far less than it
+# hashes floods the pool with shares until vardiff catches up. 0.0 (the default) disables it.
+# min_channel_nominal_hash_rate = 0.0
 
 
 # Protocol Extensions Configuration

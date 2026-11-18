@@ -14,7 +14,7 @@ use stratum_apps::stratum_core::{
     binary_sv2::Str0255,
     bitcoin::Target,
     channels_sv2::{
-        Vardiff, VardiffState,
+        Vardiff,
         extranonce_manager::ExtranonceAllocatorError,
         server::{
             error::{ExtendedChannelError, StandardChannelError},
@@ -224,7 +224,6 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     &self.coinbase_reward_script,
                 );
 
-                let nominal_hash_rate = msg.nominal_hash_rate;
                 let requested_max_target = Target::from_le_bytes(msg.max_target.to_array());
                 let extranonce_prefix = match self
                     .extranonce_allocator
@@ -254,6 +253,11 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 };
 
                 let channel_id = downstream.channel_id_factory.fetch_add(1, Ordering::SeqCst);
+                let nominal_hash_rate = self.effective_nominal_hash_rate(
+                    downstream_id,
+                    channel_id,
+                    msg.nominal_hash_rate,
+                );
 
                 let mut standard_channel = match StandardChannel::new_for_pool(
                     channel_id,
@@ -386,7 +390,7 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                             PoolError::shutdown(e)
                         })?;
                 }
-                let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
+                let vardiff = self.new_channel_vardiff().map_err(PoolError::shutdown)?;
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 
@@ -417,7 +421,6 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
             client_id.expect("client_id must be present for downstream_id extraction");
         info!("Received OpenExtendedMiningChannel: {}", msg);
 
-        let nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target = Target::from_le_bytes(msg.max_target.to_array());
         let requested_min_rollable_extranonce_size = msg.min_extranonce_size;
 
@@ -514,6 +517,11 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 };
 
                 let channel_id = downstream.channel_id_factory.fetch_add(1, Ordering::SeqCst);
+                let nominal_hash_rate = self.effective_nominal_hash_rate(
+                    downstream_id,
+                    channel_id,
+                    msg.nominal_hash_rate,
+                );
 
                 let mut extended_channel = match ExtendedChannel::new_for_pool(
                     channel_id,
@@ -701,7 +709,7 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                     .payout_mode
                     .set(Some(payout_mode))
                     .map_err(PoolError::shutdown)?;
-                let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
+                let vardiff = self.new_channel_vardiff().map_err(PoolError::shutdown)?;
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 
@@ -1270,7 +1278,7 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
         let channel_id = msg.channel_id;
-        let new_nominal_hash_rate = msg.nominal_hash_rate;
+        let declared_nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target = Target::from_le_bytes(msg.max_target.to_array());
         let messages = self.with_registered_downstream(downstream_id, |downstream| {
             let mut messages: Vec<RouteMessageTo> = Vec::new();
@@ -1278,6 +1286,11 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
             if downstream
                 .standard_channels
                 .with_mut(&channel_id, |standard_channel| {
+                    let new_nominal_hash_rate = self.effective_nominal_hash_rate(
+                        downstream_id,
+                        channel_id,
+                        declared_nominal_hash_rate,
+                    );
                     let res = standard_channel
                         .update_channel(new_nominal_hash_rate, Some(requested_max_target));
                     match res {
@@ -1318,6 +1331,11 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 && downstream
                     .extended_channels
                     .with_mut(&channel_id, |extended_channel| {
+                        let new_nominal_hash_rate = self.effective_nominal_hash_rate(
+                            downstream_id,
+                            channel_id,
+                            declared_nominal_hash_rate,
+                        );
                         let res = extended_channel
                             .update_channel(new_nominal_hash_rate, Some(requested_max_target));
                         match res {
