@@ -875,7 +875,7 @@ fn format_mhs(val_mhs: f64) -> String {
 }
 
 // returns hashrate by running all worker threads in parallel for the given duration
-fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
+pub fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
     use std::sync::Barrier;
 
     // Prepare a random header template to hash

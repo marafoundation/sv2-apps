@@ -145,6 +145,29 @@ pub async fn start_pool_with_server_id(
     enable_monitoring: bool,
     server_id: u8,
 ) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
+    start_pool_with_floor(
+        template_provider_config,
+        supported_extensions,
+        required_extensions,
+        enable_monitoring,
+        server_id,
+        SHARES_PER_MINUTE,
+        0.0,
+    )
+    .await
+}
+
+/// [`start_pool_with_server_id`] with an explicit `shares_per_minute` and
+/// `min_channel_nominal_hash_rate` (hashes per second, `0.0` for no floor).
+pub async fn start_pool_with_floor(
+    template_provider_config: TemplateProviderType,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+    enable_monitoring: bool,
+    server_id: u8,
+    shares_per_minute: f32,
+    min_channel_nominal_hash_rate: f32,
+) -> (PoolSv2, SocketAddr, Option<SocketAddr>) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -173,12 +196,12 @@ pub async fn start_pool_with_server_id(
         None
     };
     let monitoring_cache_refresh_secs = if enable_monitoring { Some(1) } else { None };
-    let config = PoolConfig::new(
+    let mut config = PoolConfig::new(
         connection_config,
         template_provider_config,
         authority_config,
         coinbase_reward_script,
-        SHARES_PER_MINUTE,
+        shares_per_minute,
         share_batch_size,
         server_id,
         supported_extensions,
@@ -187,6 +210,7 @@ pub async fn start_pool_with_server_id(
         monitoring_cache_refresh_secs,
         None, // no JDS
     );
+    config.set_min_channel_nominal_hash_rate(min_channel_nominal_hash_rate);
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
     tokio::spawn(async move {
