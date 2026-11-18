@@ -638,7 +638,13 @@ async fn tproxy_api_endpoints_with_miner() {
     let (sniffer, sniffer_addr) = start_sniffer("0", pool_addr, false, vec![], None);
     let (tproxy, tproxy_addr, tproxy_monitoring) =
         start_sv2_translator(&[sniffer_addr], false, vec![], vec![], None, true).await;
-    let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+    let (_minerd_process, _minerd_addr) = start_minerd(
+        tproxy_addr,
+        Some("site-a.rig1".to_string()),
+        Some("x".to_string()),
+        false,
+    )
+    .await;
 
     sniffer
         .wait_for_message_type(
@@ -762,6 +768,21 @@ async fn tproxy_api_endpoints_with_miner() {
         .fetch_typed(&routes::sv1_client_by_id(sv1_client_id))
         .await;
     assert!(client.shares.accepted >= 1, "{:?}", client.shares);
+
+    // The miner authorized as `site-a.rig1`, so its account `site-a` has a client and some
+    // hashrate series.
+    assert_eq!(client.sv1_username, "site-a.rig1");
+    let metrics = tproxy_mon
+        .poll_metric_gte(
+            Metric::with_labels("sv1_account_clients", &[("account", "site-a")]),
+            1.0,
+            METRIC_POLL_TIMEOUT,
+        )
+        .await;
+    assert_metric_present(
+        &metrics,
+        Metric::with_labels("sv1_account_hashrate", &[("account", "site-a")]),
+    );
 
     shutdown_all!(tproxy, pool);
 }

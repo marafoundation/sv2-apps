@@ -344,9 +344,33 @@ impl Sv1ClientsSummary {
     }
 }
 
+/// The account an SV1 username belongs to: everything before the first `.`, so
+/// `account.worker` belongs to `account`. A username without a `.` is its own account, and an
+/// empty one belongs to the account `""`.
+pub fn sv1_account(sv1_username: &str) -> &str {
+    sv1_username
+        .split_once('.')
+        .map_or(sv1_username, |(account, _worker)| account)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sv1_account_is_everything_before_the_first_dot() {
+        assert_eq!(sv1_account("acct.rig"), "acct");
+        assert_eq!(
+            sv1_account("mara-us-tx-dfw-wh-001.10x28x142x36"),
+            "mara-us-tx-dfw-wh-001"
+        );
+        assert_eq!(sv1_account("acct.rig.1.x"), "acct");
+        assert_eq!(sv1_account("acct."), "acct");
+        assert_eq!(sv1_account("acct"), "acct");
+        assert_eq!(sv1_account(""), "");
+        assert_eq!(sv1_account(".rig"), "");
+        assert_eq!(sv1_account("."), "");
+    }
 
     fn create_sv1_client_info(id: usize, hashrate: Option<f32>) -> Sv1ClientInfo {
         Sv1ClientInfo {

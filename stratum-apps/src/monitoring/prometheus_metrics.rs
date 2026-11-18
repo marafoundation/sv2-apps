@@ -35,6 +35,10 @@ pub struct PrometheusMetrics {
     // SV1 metrics
     pub sv1_clients_total: Option<Gauge>,
     pub sv1_hashrate_total: Option<Gauge>,
+    /// Hashrate per account, for at most `MAX_ACCOUNT_SERIES` accounts plus `_other`.
+    pub sv1_account_hashrate: Option<GaugeVec>,
+    /// SV1 clients per account, for at most `MAX_ACCOUNT_SERIES` accounts plus `_other`.
+    pub sv1_account_clients: Option<GaugeVec>,
     // Upstream metrics
     pub sv2_upstream_connected: Option<GaugeVec>,
     pub sv2_upstream_fallbacks_total: Option<Gauge>,
@@ -240,6 +244,8 @@ impl PrometheusMetrics {
         let (
             sv1_clients_total,
             sv1_hashrate_total,
+            sv1_account_hashrate,
+            sv1_account_clients,
             sv1_shares_accepted_total,
             sv1_shares_rejected_total,
             sv1_shares_below_upstream_target_total,
@@ -252,6 +258,24 @@ impl PrometheusMetrics {
 
             let hashrate = Gauge::new("sv1_hashrate_total", "Total hashrate from SV1 clients")?;
             registry.register(Box::new(hashrate.clone()))?;
+
+            let account_hashrate = GaugeVec::new(
+                Opts::new(
+                    "sv1_account_hashrate",
+                    "Hashrate of the account's SV1 clients, summed from each client's estimate",
+                ),
+                &["account"],
+            )?;
+            registry.register(Box::new(account_hashrate.clone()))?;
+
+            let account_clients = GaugeVec::new(
+                Opts::new(
+                    "sv1_account_clients",
+                    "Number of SV1 clients connected for the account",
+                ),
+                &["account"],
+            )?;
+            registry.register(Box::new(account_clients.clone()))?;
 
             let accepted = Gauge::new(
                 "sv1_shares_accepted_total",
@@ -318,6 +342,8 @@ impl PrometheusMetrics {
             (
                 Some(clients),
                 Some(hashrate),
+                Some(account_hashrate),
+                Some(account_clients),
                 Some(accepted),
                 Some(rejected),
                 Some(below_target),
@@ -326,7 +352,7 @@ impl PrometheusMetrics {
                 Some(blocks_found),
             )
         } else {
-            (None, None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, None, None)
         };
 
         // Upstream metrics
@@ -374,6 +400,8 @@ impl PrometheusMetrics {
             sv2_client_blocks_found_total,
             sv1_clients_total,
             sv1_hashrate_total,
+            sv1_account_hashrate,
+            sv1_account_clients,
             sv2_upstream_connected,
             sv2_upstream_fallbacks_total,
             sv1_shares_accepted_total,
@@ -434,6 +462,8 @@ mod tests {
         let m = PrometheusMetrics::new(false, false, true, false).unwrap();
         assert!(m.sv1_clients_total.is_some());
         assert!(m.sv1_hashrate_total.is_some());
+        assert!(m.sv1_account_hashrate.is_some());
+        assert!(m.sv1_account_clients.is_some());
         // server and clients should be None
         assert!(m.sv2_server_channels.is_none());
         assert!(m.sv2_clients_total.is_none());

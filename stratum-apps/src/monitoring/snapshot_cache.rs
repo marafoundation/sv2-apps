@@ -37,7 +37,7 @@
 //! ```
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -57,7 +57,7 @@ use super::{
     server::{ServerInfo, ServerMonitoring, ServerSummary},
     sv1::{
         Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareDropReason,
-        Sv1ShareRejection,
+        Sv1ShareRejection, sv1_account,
     },
     upstream::{UpstreamInfo, UpstreamMonitoring},
 };
@@ -78,6 +78,78 @@ const SHARE_REJECTION_CODES: &[&str] = &[
     ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE,
     ERROR_CODE_SUBMIT_SHARES_INVALID_NON_ROLLABLE_VERSION_BIT,
 ];
+
+/// The most accounts `sv1_account_hashrate` and `sv1_account_clients` export by name on one
+/// refresh. SV1 usernames are chosen by the miners, so without a bound a client could create an
+/// unbounded number of series. The accounts with the highest hashrate are kept (ties by name),
+/// and the rest are summed into the `ACCOUNT_OTHER` series, so the series still add up to
+/// `sv1_hashrate_total` and `sv1_clients_total`.
+pub const MAX_ACCOUNT_SERIES: usize = 256;
+
+/// The longest `account` label, in bytes, that is exported by name. SV1 usernames are chosen by
+/// the miners and only bounded by the line length, so a longer account is summed into the
+/// `ACCOUNT_OTHER` series instead.
+pub const MAX_ACCOUNT_LABEL_BYTES: usize = 64;
+
+/// The `account` label of the series that sums the accounts beyond `MAX_ACCOUNT_SERIES`. An
+/// account that is literally named this, or is longer than `MAX_ACCOUNT_LABEL_BYTES`, is summed
+/// into it as well, so it cannot be told apart from the overflow.
+const ACCOUNT_OTHER: &str = "_other";
+
+/// The hashrate and client count of one account.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct AccountTotals {
+    hashrate: f64,
+    clients: usize,
+}
+
+impl AccountTotals {
+    fn add(&mut self, other: AccountTotals) {
+        self.hashrate += other.hashrate;
+        self.clients += other.clients;
+    }
+}
+
+/// Groups `clients` by account with one pass over them, and returns at most
+/// `MAX_ACCOUNT_SERIES` accounts ordered by hashrate (highest first, ties by name), followed by
+/// `ACCOUNT_OTHER` if any client did not fit. A client without a hashrate estimate counts as a
+/// client and adds no hashrate, as in `Sv1ClientsSummary`.
+fn account_totals(clients: &[Sv1ClientInfo]) -> Vec<(String, AccountTotals)> {
+    let mut by_account: HashMap<&str, AccountTotals> = HashMap::new();
+    for client in clients {
+        let account = sv1_account(&client.sv1_username);
+        let account = if account.len() > MAX_ACCOUNT_LABEL_BYTES {
+            ACCOUNT_OTHER
+        } else {
+            account
+        };
+        by_account.entry(account).or_default().add(AccountTotals {
+            hashrate: client.hashrate.unwrap_or(0.0) as f64,
+            clients: 1,
+        });
+    }
+
+    let mut other = by_account.remove(ACCOUNT_OTHER);
+    let mut ranked: Vec<(&str, AccountTotals)> = by_account.into_iter().collect();
+    ranked.sort_unstable_by(|(a_name, a), (b_name, b)| {
+        b.hashrate
+            .total_cmp(&a.hashrate)
+            .then_with(|| a_name.cmp(b_name))
+    });
+    if ranked.len() > MAX_ACCOUNT_SERIES {
+        for (_, totals) in &ranked[MAX_ACCOUNT_SERIES..] {
+            other.get_or_insert_with(Default::default).add(*totals);
+        }
+        ranked.truncate(MAX_ACCOUNT_SERIES);
+    }
+
+    let mut series: Vec<(String, AccountTotals)> = ranked
+        .into_iter()
+        .map(|(name, totals)| (name.to_string(), totals))
+        .collect();
+    series.extend(other.map(|totals| (ACCOUNT_OTHER.to_string(), totals)));
+    series
+}
 
 /// Tracks which label combinations were set on the previous refresh so we can
 /// remove only stale series instead of calling `.reset()` (which would create a
@@ -100,6 +172,8 @@ struct PreviousPrometheusLabelSets {
     /// Labels for the SV1 block-found GaugeVec: [sv1_username, worker, user_identity,
     /// share_hash, height]
     sv1_block_found_labels: HashSet<[String; 5]>,
+    /// Labels for the SV1 per-account GaugeVecs: [account]
+    sv1_account_labels: HashSet<[String; 1]>,
 }
 
 /// Cached snapshot of monitoring data.
@@ -173,6 +247,7 @@ impl Clone for SnapshotCache {
                     .client_rejected_share_labels
                     .clone(),
                 sv1_block_found_labels: previous_metrics_labels.sv1_block_found_labels.clone(),
+                sv1_account_labels: previous_metrics_labels.sv1_account_labels.clone(),
             }),
         }
     }
@@ -313,6 +388,7 @@ impl SnapshotCache {
         let mut current_client_labels: HashSet<[String; 3]> = HashSet::new();
         let mut current_client_rejected_labels: HashSet<[String; 4]> = HashSet::new();
         let mut current_sv1_block_found_labels: HashSet<[String; 5]> = HashSet::new();
+        let mut current_sv1_account_labels: HashSet<[String; 1]> = HashSet::new();
 
         // Server metrics
         if let Some(ref summary) = snapshot.server_summary {
@@ -580,6 +656,19 @@ impl SnapshotCache {
                 }
             }
         }
+        if let Some(ref clients) = snapshot.sv1_clients {
+            if metrics.sv1_account_hashrate.is_some() || metrics.sv1_account_clients.is_some() {
+                for (account, totals) in account_totals(clients) {
+                    if let Some(ref m) = metrics.sv1_account_hashrate {
+                        m.with_label_values(&[&account]).set(totals.hashrate);
+                    }
+                    if let Some(ref m) = metrics.sv1_account_clients {
+                        m.with_label_values(&[&account]).set(totals.clients as f64);
+                    }
+                    current_sv1_account_labels.insert([account]);
+                }
+            }
+        }
         if let (Some(total), Some(m)) = (
             snapshot.sv1_blocks_found_total,
             &metrics.sv1_blocks_found_total,
@@ -724,6 +813,23 @@ impl SnapshotCache {
             }
         }
         previous_metrics_labels.sv1_block_found_labels = current_sv1_block_found_labels;
+
+        // Accounts that no longer have a client, or that fell out of the top accounts.
+        for stale in previous_metrics_labels
+            .sv1_account_labels
+            .difference(&current_sv1_account_labels)
+        {
+            let label_refs = stale.each_ref().map(String::as_str);
+            for m in [&metrics.sv1_account_hashrate, &metrics.sv1_account_clients]
+                .into_iter()
+                .flatten()
+            {
+                if let Err(e) = m.remove_label_values(&label_refs) {
+                    debug!(labels = ?label_refs, error = %e, "failed to remove stale SV1 account label");
+                }
+            }
+        }
+        previous_metrics_labels.sv1_account_labels = current_sv1_account_labels;
     }
 
     /// Get the refresh interval
@@ -734,6 +840,8 @@ impl SnapshotCache {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     struct MockServerMonitoring;
@@ -1112,5 +1220,284 @@ mod tests {
 
         update(vec![]);
         assert_eq!(block_found_series(&metrics), Vec::<String>::new());
+    }
+
+    fn sv1_client(id: usize, username: &str, hashrate: Option<f32>) -> Sv1ClientInfo {
+        Sv1ClientInfo {
+            client_id: id,
+            channel_id: Some(id as u32),
+            connection_ip: "192.0.2.1".parse().unwrap(),
+            #[cfg(feature = "asic-rs-telemetry")]
+            management_ip: None,
+            sv1_username: username.to_string(),
+            sv1_worker_name: username.split('.').nth(1).unwrap_or_default().to_string(),
+            target_hex: "00ff".into(),
+            hashrate,
+            stable_hashrate: false,
+            extranonce1_hex: "aabb".into(),
+            extranonce2_len: 8,
+            version_rolling_mask: None,
+            version_rolling_min_bit: None,
+            shares: Default::default(),
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry: None,
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry_status: None,
+        }
+    }
+
+    fn sv1_snapshot(clients: Vec<Sv1ClientInfo>) -> MonitoringSnapshot {
+        MonitoringSnapshot {
+            sv1_clients_summary: Some(Sv1ClientsSummary::new(
+                &clients,
+                Default::default(),
+                Default::default(),
+            )),
+            sv1_clients: Some(clients),
+            ..Default::default()
+        }
+    }
+
+    /// The `account` label and value of every series of `name`.
+    fn account_series(metrics: &PrometheusMetrics, name: &str) -> BTreeMap<String, f64> {
+        metrics
+            .registry
+            .gather()
+            .iter()
+            .filter(|family| family.get_name() == name)
+            .flat_map(|family| family.get_metric())
+            .map(|metric| {
+                let label = &metric.get_label()[0];
+                assert_eq!(label.get_name(), "account");
+                (
+                    label.get_value().to_string(),
+                    metric.get_gauge().get_value(),
+                )
+            })
+            .collect()
+    }
+
+    fn gauge_value(metrics: &PrometheusMetrics, name: &str) -> f64 {
+        metrics
+            .registry
+            .gather()
+            .iter()
+            .find(|family| family.get_name() == name)
+            .map(|family| family.get_metric()[0].get_gauge().get_value())
+            .unwrap()
+    }
+
+    fn sv1_cache() -> (SnapshotCache, PrometheusMetrics) {
+        let metrics = PrometheusMetrics::new(false, false, true, false).unwrap();
+        let cache =
+            SnapshotCache::new(Duration::from_secs(5), None, None).with_metrics(metrics.clone());
+        (cache, metrics)
+    }
+
+    #[test]
+    fn account_gauges_sum_the_clients_of_each_account() {
+        let (cache, metrics) = sv1_cache();
+        let clients = vec![
+            sv1_client(1, "site-a.rig1", Some(100.0)),
+            sv1_client(2, "site-a.rig2", Some(200.0)),
+            sv1_client(3, "site-a.rig3.x", Some(50.0)),
+            sv1_client(4, "site-b.rig1", Some(1000.0)),
+            sv1_client(5, "site-b.rig2", None),
+            sv1_client(6, "site-c", Some(25.0)),
+            sv1_client(7, "site-c.a", Some(25.0)),
+            sv1_client(8, "site-c.b", Some(25.0)),
+            sv1_client(9, "site-c.c", Some(25.0)),
+        ];
+        cache.update_metrics(&metrics, &sv1_snapshot(clients));
+
+        let hashrate = account_series(&metrics, "sv1_account_hashrate");
+        let count = account_series(&metrics, "sv1_account_clients");
+        assert_eq!(
+            hashrate,
+            BTreeMap::from([
+                ("site-a".to_string(), 350.0),
+                ("site-b".to_string(), 1000.0),
+                ("site-c".to_string(), 100.0),
+            ])
+        );
+        assert_eq!(
+            count,
+            BTreeMap::from([
+                ("site-a".to_string(), 3.0),
+                ("site-b".to_string(), 2.0),
+                ("site-c".to_string(), 4.0),
+            ])
+        );
+        assert_eq!(
+            hashrate.values().sum::<f64>(),
+            gauge_value(&metrics, "sv1_hashrate_total")
+        );
+        assert_eq!(
+            count.values().sum::<f64>(),
+            gauge_value(&metrics, "sv1_clients_total")
+        );
+    }
+
+    #[test]
+    fn account_gauges_label_an_empty_username_with_an_empty_account() {
+        let (cache, metrics) = sv1_cache();
+        cache.update_metrics(
+            &metrics,
+            &sv1_snapshot(vec![
+                sv1_client(1, "", Some(10.0)),
+                sv1_client(2, ".rig", Some(5.0)),
+            ]),
+        );
+        assert_eq!(
+            account_series(&metrics, "sv1_account_clients"),
+            BTreeMap::from([("".to_string(), 2.0)])
+        );
+        assert_eq!(
+            account_series(&metrics, "sv1_account_hashrate"),
+            BTreeMap::from([("".to_string(), 15.0)])
+        );
+    }
+
+    #[test]
+    fn stale_account_series_are_removed() {
+        let (cache, metrics) = sv1_cache();
+        let both = vec![
+            sv1_client(1, "gone.rig1", Some(100.0)),
+            sv1_client(2, "kept.rig1", Some(200.0)),
+        ];
+        cache.update_metrics(&metrics, &sv1_snapshot(both));
+        assert_eq!(account_series(&metrics, "sv1_account_hashrate").len(), 2);
+
+        cache.update_metrics(
+            &metrics,
+            &sv1_snapshot(vec![sv1_client(2, "kept.rig1", Some(300.0))]),
+        );
+        assert_eq!(
+            account_series(&metrics, "sv1_account_hashrate"),
+            BTreeMap::from([("kept".to_string(), 300.0)])
+        );
+        assert_eq!(
+            account_series(&metrics, "sv1_account_clients"),
+            BTreeMap::from([("kept".to_string(), 1.0)])
+        );
+
+        cache.update_metrics(&metrics, &sv1_snapshot(vec![]));
+        assert!(account_series(&metrics, "sv1_account_hashrate").is_empty());
+        assert!(account_series(&metrics, "sv1_account_clients").is_empty());
+    }
+
+    #[test]
+    fn account_series_are_capped_and_the_rest_is_summed_into_other() {
+        assert_eq!(MAX_ACCOUNT_SERIES, 256);
+        let (cache, metrics) = sv1_cache();
+        // 300 accounts of 2 clients each; account `n` has hashrate 2 * (n + 1) * 8, so the 44
+        // lowest ones (0..44) overflow.
+        let clients: Vec<_> = (0..300usize)
+            .flat_map(|n| {
+                let hashrate = ((n + 1) * 8) as f32;
+                [
+                    sv1_client(2 * n, &format!("acct{n:03}.a"), Some(hashrate)),
+                    sv1_client(2 * n + 1, &format!("acct{n:03}.b"), Some(hashrate)),
+                ]
+            })
+            .collect();
+        cache.update_metrics(&metrics, &sv1_snapshot(clients));
+
+        let hashrate = account_series(&metrics, "sv1_account_hashrate");
+        let count = account_series(&metrics, "sv1_account_clients");
+        assert_eq!(hashrate.len(), MAX_ACCOUNT_SERIES + 1);
+        assert_eq!(count.len(), MAX_ACCOUNT_SERIES + 1);
+        assert_eq!(
+            hashrate.keys().filter(|k| *k != "_other").count(),
+            MAX_ACCOUNT_SERIES
+        );
+        assert!(hashrate.contains_key("acct299"));
+        assert!(hashrate.contains_key("acct044"));
+        assert!(!hashrate.contains_key("acct043"));
+
+        let overflow_hashrate: f64 = (0..44usize).map(|n| ((n + 1) * 16) as f64).sum();
+        assert_eq!(hashrate["_other"], overflow_hashrate);
+        assert_eq!(count["_other"], 88.0);
+        assert_eq!(
+            hashrate.values().sum::<f64>(),
+            gauge_value(&metrics, "sv1_hashrate_total")
+        );
+        assert_eq!(count.values().sum::<f64>(), 600.0);
+        assert_eq!(gauge_value(&metrics, "sv1_clients_total"), 600.0);
+
+        // Back under the cap, `_other` goes away.
+        cache.update_metrics(
+            &metrics,
+            &sv1_snapshot(vec![sv1_client(1, "acct001.a", Some(8.0))]),
+        );
+        assert_eq!(
+            account_series(&metrics, "sv1_account_clients").len(),
+            1,
+            "{:?}",
+            account_series(&metrics, "sv1_account_clients")
+        );
+    }
+
+    #[test]
+    fn account_ranking_breaks_ties_by_name() {
+        let clients: Vec<_> = (0..MAX_ACCOUNT_SERIES + 2)
+            .map(|n| sv1_client(n, &format!("acct{n:03}.rig"), Some(10.0)))
+            .collect();
+        let series = account_totals(&clients);
+        assert_eq!(series.len(), MAX_ACCOUNT_SERIES + 1);
+        assert_eq!(series[0].0, "acct000");
+        assert_eq!(series[MAX_ACCOUNT_SERIES - 1].0, "acct255");
+        assert_eq!(series[MAX_ACCOUNT_SERIES].0, "_other");
+        assert_eq!(series[MAX_ACCOUNT_SERIES].1.clients, 2);
+    }
+
+    #[test]
+    fn an_account_longer_than_the_label_limit_is_summed_into_the_other_series() {
+        let long = "a".repeat(MAX_ACCOUNT_LABEL_BYTES + 1);
+        let exact = "b".repeat(MAX_ACCOUNT_LABEL_BYTES);
+        // 'é' is 2 bytes: 32 of them fit the limit exactly, 33 are 66 bytes.
+        let multibyte_exact = "é".repeat(MAX_ACCOUNT_LABEL_BYTES / 2);
+        let multibyte_long = "é".repeat(MAX_ACCOUNT_LABEL_BYTES / 2 + 1);
+        assert_eq!(multibyte_exact.chars().count(), MAX_ACCOUNT_LABEL_BYTES / 2);
+        assert!(multibyte_long.chars().count() <= MAX_ACCOUNT_LABEL_BYTES);
+
+        let series = account_totals(&[
+            sv1_client(1, &format!("{long}.rig"), Some(1.0)),
+            sv1_client(2, &format!("{exact}.rig"), Some(2.0)),
+            sv1_client(3, &format!("{multibyte_exact}.rig"), Some(3.0)),
+            sv1_client(4, &format!("{multibyte_long}.rig"), Some(4.0)),
+        ]);
+        let names: Vec<&str> = series.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, [multibyte_exact.as_str(), exact.as_str(), "_other"]);
+        let other = series.last().unwrap().1;
+        assert_eq!(other.clients, 2);
+        assert_eq!(other.hashrate, 5.0);
+    }
+
+    #[test]
+    fn an_account_named_other_is_summed_into_the_other_series() {
+        let series = account_totals(&[
+            sv1_client(1, "_other.rig", Some(3.0)),
+            sv1_client(2, "acct.rig", Some(4.0)),
+        ]);
+        assert_eq!(
+            series,
+            vec![
+                (
+                    "acct".to_string(),
+                    AccountTotals {
+                        hashrate: 4.0,
+                        clients: 1
+                    }
+                ),
+                (
+                    "_other".to_string(),
+                    AccountTotals {
+                        hashrate: 3.0,
+                        clients: 1
+                    }
+                ),
+            ]
+        );
     }
 }

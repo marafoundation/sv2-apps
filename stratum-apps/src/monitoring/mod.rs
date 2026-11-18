@@ -40,10 +40,10 @@ pub use server::{
     CoinbaseOutputInfo, ServerExtendedChannelInfo, ServerInfo, ServerMonitoring,
     ServerStandardChannelInfo, ServerSummary,
 };
-pub use snapshot_cache::{MonitoringSnapshot, SnapshotCache};
+pub use snapshot_cache::{MAX_ACCOUNT_SERIES, MonitoringSnapshot, SnapshotCache};
 pub use sv1::{
     Sv1BlockFound, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary, Sv1ShareCounts,
-    Sv1ShareDropReason, Sv1ShareDrops, Sv1ShareRejection,
+    Sv1ShareDropReason, Sv1ShareDrops, Sv1ShareRejection, sv1_account,
 };
 pub use upstream::{UpstreamEndpointInfo, UpstreamInfo, UpstreamMonitoring};
 
