@@ -359,10 +359,12 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                             PoolError::shutdown(e)
                         })?;
                 }
-                // The responsive vardiff: closes a far opening and a large rise in a few evaluations.
+                // The responsive vardiff, with the doubt ease: closes a far opening and a large rise in a
+                // few evaluations, and eases on a drop the shares make doubtful before it is certain.
                 let vardiff = VardiffState::new()
                     .map_err(PoolError::shutdown)?
-                    .responsive();
+                    .responsive()
+                    .with_doubt();
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 
@@ -656,10 +658,12 @@ impl HandleMiningMessagesFromClientOwnedAsync for ChannelManager {
                 downstream
                     .extended_channels
                     .insert(channel_id, extended_channel);
-                // The responsive vardiff: closes a far opening and a large rise in a few evaluations.
+                // The responsive vardiff, with the doubt ease: closes a far opening and a large rise in a
+                // few evaluations, and eases on a drop the shares make doubtful before it is certain.
                 let vardiff = VardiffState::new()
                     .map_err(PoolError::shutdown)?
-                    .responsive();
+                    .responsive()
+                    .with_doubt();
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 

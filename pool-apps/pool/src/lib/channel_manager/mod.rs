@@ -625,7 +625,7 @@ impl ChannelManager {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             ticker.tick().await;
-            info!("Starting vardiff loop for downstreams (responsive vardiff)");
+            info!("Starting vardiff loop for downstreams (responsive vardiff with doubt)");
 
             if let Err(e) = self.run_vardiff().await {
                 error!(error = ?e, "Vardiff iteration failed");
