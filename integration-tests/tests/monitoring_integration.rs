@@ -922,3 +922,42 @@ async fn jdc_api_endpoints_with_miner() {
 
     shutdown_all!(tproxy, jdc, pool);
 }
+
+/// Traffic counters end to end. Pool, translator and sniffer share one process here, so this
+/// checks that each kind of traffic reaches `/metrics`, not per-app values.
+#[tokio::test]
+async fn traffic_metrics_count_real_sv1_and_sv2_traffic() {
+    start_tracing();
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (_pool, pool_addr, _pool_monitoring) =
+        start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+    let (sniffer, sniffer_addr) = start_sniffer("0", pool_addr, false, vec![], None);
+    let (_tproxy, tproxy_addr, tproxy_monitoring) =
+        start_sv2_translator(&[sniffer_addr], false, vec![], vec![], None, true).await;
+    let (_minerd_process, _minerd_addr) =
+        start_minerd(tproxy_addr, Some("site-a.rig1".to_string()), Some("x".to_string()), false)
+            .await;
+    sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED)
+        .await;
+
+    let tproxy_mon =
+        MonitoringApi::builder(tproxy_monitoring.expect("tproxy monitoring should be enabled"))
+            .build();
+    let text = tproxy_mon.fetch_metrics().await;
+    let traffic: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("sv1_traffic_") || l.starts_with("sv2_traffic_"))
+        .collect();
+    println!("{}", traffic.join("\n"));
+
+    for expected in [
+        r#"sv1_traffic_messages_total{direction="out",kind="mining.notify"}"#,
+        r#"sv1_traffic_messages_total{direction="in",kind="mining.submit"}"#,
+        r#"sv1_traffic_bytes_total{direction="out",kind="mining.notify"}"#,
+        r#"sv2_traffic_frames_total{direction="out",msg_type="0x1b"}"#,
+        r#"sv2_traffic_bytes_total{direction="in",msg_type="0x1f"}"#,
+    ] {
+        assert!(traffic.iter().any(|l| l.starts_with(expected)), "missing {expected} in:\n{}", traffic.join("\n"));
+    }
+}

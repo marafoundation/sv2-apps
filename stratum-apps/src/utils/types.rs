@@ -65,10 +65,15 @@ impl EncodableFrame for OutboundFrame {
     }
 
     fn encode_into(self, dst: &mut [u8]) -> Result<(), stratum_core::framing_sv2::Error> {
-        match self {
-            Self::Message(frame) => frame.encode_into(dst),
-            Self::Raw(frame) => frame.encode_into(dst),
+        let bytes = dst.len();
+        let (msg_type, result) = match self {
+            Self::Message(frame) => (frame.header().msg_type(), frame.encode_into(dst)),
+            Self::Raw(frame) => (frame.header().msg_type(), frame.encode_into(dst)),
+        };
+        if result.is_ok() {
+            crate::traffic::record_sv2(crate::traffic::Direction::Out, msg_type, bytes);
         }
+        result
     }
 }
 
