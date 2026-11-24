@@ -934,11 +934,18 @@ async fn traffic_metrics_count_real_sv1_and_sv2_traffic() {
     let (sniffer, sniffer_addr) = start_sniffer("0", pool_addr, false, vec![], None);
     let (_tproxy, tproxy_addr, tproxy_monitoring) =
         start_sv2_translator(&[sniffer_addr], false, vec![], vec![], None, true).await;
-    let (_minerd_process, _minerd_addr) =
-        start_minerd(tproxy_addr, Some("site-a.rig1".to_string()), Some("x".to_string()), false)
-            .await;
+    let (_minerd_process, _minerd_addr) = start_minerd(
+        tproxy_addr,
+        Some("site-a.rig1".to_string()),
+        Some("x".to_string()),
+        false,
+    )
+    .await;
     sniffer
-        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED)
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+        )
         .await;
 
     let tproxy_mon =
@@ -958,6 +965,10 @@ async fn traffic_metrics_count_real_sv1_and_sv2_traffic() {
         r#"sv2_traffic_frames_total{direction="out",msg_type="0x1b"}"#,
         r#"sv2_traffic_bytes_total{direction="in",msg_type="0x1f"}"#,
     ] {
-        assert!(traffic.iter().any(|l| l.starts_with(expected)), "missing {expected} in:\n{}", traffic.join("\n"));
+        assert!(
+            traffic.iter().any(|l| l.starts_with(expected)),
+            "missing {expected} in:\n{}",
+            traffic.join("\n")
+        );
     }
 }

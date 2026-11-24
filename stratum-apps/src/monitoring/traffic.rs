@@ -17,10 +17,26 @@ impl TrafficCollector {
             IntCounterVec::new(Opts::new(name, help), &["direction", label]).expect("static metric")
         };
         Self([
-            v("sv2_traffic_frames_total", "SV2 frames decoded (in) or encoded (out)", "msg_type"),
-            v("sv2_traffic_bytes_total", "Plaintext bytes of those SV2 frames, header included", "msg_type"),
-            v("sv1_traffic_messages_total", "SV1 lines read (in) or written (out)", "kind"),
-            v("sv1_traffic_bytes_total", "Bytes of those SV1 lines, newline included", "kind"),
+            v(
+                "sv2_traffic_frames_total",
+                "SV2 frames decoded (in) or encoded (out)",
+                "msg_type",
+            ),
+            v(
+                "sv2_traffic_bytes_total",
+                "Plaintext bytes of those SV2 frames, header included",
+                "msg_type",
+            ),
+            v(
+                "sv1_traffic_messages_total",
+                "SV1 lines read (in) or written (out)",
+                "kind",
+            ),
+            v(
+                "sv1_traffic_bytes_total",
+                "Bytes of those SV1 lines, newline included",
+                "kind",
+            ),
         ])
     }
 }
@@ -36,7 +52,8 @@ impl Collector for TrafficCollector {
         self.0.iter().flat_map(|v| v.desc()).collect()
     }
 
-    // Fresh vectors set to the current totals: monotonic counters, and nothing kept between scrapes.
+    // Fresh vectors set to the current totals: monotonic counters, and nothing kept between
+    // scrapes.
     fn collect(&self) -> Vec<MetricFamily> {
         let [frames, frame_bytes, lines, line_bytes] = Self::new().0;
         for (d, msg_type, count, bytes) in sv2_totals() {
@@ -46,7 +63,9 @@ impl Collector for TrafficCollector {
         }
         for (d, kind, count, bytes) in sv1_totals() {
             lines.with_label_values(&[d.label(), kind]).inc_by(count);
-            line_bytes.with_label_values(&[d.label(), kind]).inc_by(bytes);
+            line_bytes
+                .with_label_values(&[d.label(), kind])
+                .inc_by(bytes);
         }
         [frames, frame_bytes, lines, line_bytes]
             .iter()
@@ -66,9 +85,21 @@ mod tests {
         record_sv2(Direction::Out, 0xF2, 123);
         record_sv1(Direction::Out, sv1_kind(Some("mining.set_extranonce")), 77);
         let registry = prometheus::Registry::new();
-        registry.register(Box::new(TrafficCollector::new())).unwrap();
-        let text = prometheus::TextEncoder::new().encode_to_string(&registry.gather()).unwrap();
-        assert!(text.contains(r#"sv2_traffic_frames_total{direction="out",msg_type="0xf2"}"#), "{text}");
-        assert!(text.contains(r#"sv1_traffic_bytes_total{direction="out",kind="mining.set_extranonce"}"#), "{text}");
+        registry
+            .register(Box::new(TrafficCollector::new()))
+            .unwrap();
+        let text = prometheus::TextEncoder::new()
+            .encode_to_string(&registry.gather())
+            .unwrap();
+        assert!(
+            text.contains(r#"sv2_traffic_frames_total{direction="out",msg_type="0xf2"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                r#"sv1_traffic_bytes_total{direction="out",kind="mining.set_extranonce"}"#
+            ),
+            "{text}"
+        );
     }
 }

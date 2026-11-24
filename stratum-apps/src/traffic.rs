@@ -52,12 +52,16 @@ struct Tally {
 
 impl Tally {
     const fn new() -> Self {
-        Self { count: AtomicU64::new(0), bytes: AtomicU64::new(0) }
+        Self {
+            count: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
     }
 }
 
 static SV2: [[Tally; 256]; 2] = [const { [const { Tally::new() }; 256] }; 2];
-static SV1: [[Tally; SV1_KINDS.len()]; 2] = [const { [const { Tally::new() }; SV1_KINDS.len()] }; 2];
+static SV1: [[Tally; SV1_KINDS.len()]; 2] =
+    [const { [const { Tally::new() }; SV1_KINDS.len()] }; 2];
 
 fn add(t: &Tally, bytes: usize) {
     t.count.fetch_add(1, Relaxed);
@@ -77,14 +81,16 @@ pub fn record_sv1(direction: Direction, kind: usize, bytes: usize) {
 /// Non-zero SV2 totals: `(direction, msg_type, frames, bytes)`.
 pub fn sv2_totals() -> impl Iterator<Item = (Direction, u8, u64, u64)> {
     Direction::ALL.into_iter().flat_map(|d| {
-        (0..=255u8).filter_map(move |t| read(&SV2[d as usize][t as usize]).map(|(c, b)| (d, t, c, b)))
+        (0..=255u8)
+            .filter_map(move |t| read(&SV2[d as usize][t as usize]).map(|(c, b)| (d, t, c, b)))
     })
 }
 
 /// Non-zero SV1 totals: `(direction, kind label, lines, bytes)`.
 pub fn sv1_totals() -> impl Iterator<Item = (Direction, &'static str, u64, u64)> {
     Direction::ALL.into_iter().flat_map(|d| {
-        (0..SV1_KINDS.len()).filter_map(move |k| read(&SV1[d as usize][k]).map(|(c, b)| (d, SV1_KINDS[k], c, b)))
+        (0..SV1_KINDS.len())
+            .filter_map(move |k| read(&SV1[d as usize][k]).map(|(c, b)| (d, SV1_KINDS[k], c, b)))
     })
 }
 
@@ -99,7 +105,9 @@ mod tests {
 
     // One process-wide static: use a message type nothing else records, and compare deltas.
     fn sv2(direction: Direction, msg_type: u8) -> (u64, u64) {
-        sv2_totals().find(|(d, t, ..)| *d == direction && *t == msg_type).map_or((0, 0), |(.., c, b)| (c, b))
+        sv2_totals()
+            .find(|(d, t, ..)| *d == direction && *t == msg_type)
+            .map_or((0, 0), |(.., c, b)| (c, b))
     }
 
     #[test]
@@ -113,8 +121,14 @@ mod tests {
 
     #[test]
     fn sv1_kinds_are_a_fixed_set() {
-        assert_eq!(SV1_KINDS[sv1_kind(Some("mining.set_difficulty"))], "mining.set_difficulty");
-        assert_eq!(SV1_KINDS[sv1_kind(Some("anything a peer invents"))], "other");
+        assert_eq!(
+            SV1_KINDS[sv1_kind(Some("mining.set_difficulty"))],
+            "mining.set_difficulty"
+        );
+        assert_eq!(
+            SV1_KINDS[sv1_kind(Some("anything a peer invents"))],
+            "other"
+        );
         assert_eq!(SV1_KINDS[sv1_kind(None)], "response");
     }
 
@@ -126,9 +140,14 @@ mod tests {
         let t = std::time::Instant::now();
         std::thread::scope(|s| {
             for _ in 0..8 {
-                s.spawn(|| (0..N / 8).for_each(|i| record_sv1(Direction::Out, 0, i as usize & 0x7ff)));
+                s.spawn(|| {
+                    (0..N / 8).for_each(|i| record_sv1(Direction::Out, 0, i as usize & 0x7ff))
+                });
             }
         });
-        println!("record_sv1: {:.1} ns/op, 8 threads on one counter", t.elapsed().as_nanos() as f64 / N as f64);
+        println!(
+            "record_sv1: {:.1} ns/op, 8 threads on one counter",
+            t.elapsed().as_nanos() as f64 / N as f64
+        );
     }
 }
