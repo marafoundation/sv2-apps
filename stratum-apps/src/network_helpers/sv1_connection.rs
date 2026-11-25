@@ -107,6 +107,12 @@ impl ConnectionSV1 {
             match result {
                 Ok(line) => match serde_json::from_str::<json_rpc::Message>(&line) {
                     Ok(msg) => {
+                        // + 1: the newline LinesCodec strips.
+                        crate::traffic::record_sv1(
+                            crate::traffic::Direction::In,
+                            sv1_kind(&msg),
+                            line.len() + 1,
+                        );
                         if sender.send(msg).await.is_err() {
                             warn!("Receiver dropped, stopping reader");
                             break;
@@ -136,6 +142,11 @@ impl ConnectionSV1 {
                         error!("Failed to write to stream");
                         break;
                     }
+                    crate::traffic::record_sv1(
+                        crate::traffic::Direction::Out,
+                        sv1_kind(&msg),
+                        data.len(),
+                    );
                     if writer.flush().await.is_err() {
                         error!("Failed to flush writer.");
                         break;
@@ -168,6 +179,14 @@ impl ConnectionSV1 {
     pub fn sender(&self) -> Sender<json_rpc::Message> {
         self.sender.clone()
     }
+}
+
+fn sv1_kind(msg: &json_rpc::Message) -> usize {
+    crate::traffic::sv1_kind(match msg {
+        json_rpc::Message::StandardRequest(r) => Some(&r.method),
+        json_rpc::Message::Notification(n) => Some(&n.method),
+        json_rpc::Message::OkResponse(_) | json_rpc::Message::ErrorResponse(_) => None,
+    })
 }
 
 #[cfg(test)]

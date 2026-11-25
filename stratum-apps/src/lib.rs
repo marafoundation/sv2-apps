@@ -67,6 +67,8 @@ pub mod key_utils;
 /// Utility methods used in apps.
 pub mod utils;
 
+pub mod traffic;
+
 /// Channel monitoring - expose channel data via HTTP JSON APIs
 #[cfg(feature = "monitoring")]
 pub mod monitoring;

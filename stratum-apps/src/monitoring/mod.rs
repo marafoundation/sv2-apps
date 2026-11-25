@@ -20,6 +20,7 @@ pub mod routes;
 pub mod server;
 pub mod snapshot_cache;
 pub mod sv1;
+pub mod traffic;
 pub mod upstream;
 
 pub use client::{

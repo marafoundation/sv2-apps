@@ -272,6 +272,8 @@ impl NoiseTcpReadHalf {
         match self.decoder.next_transport_frame(state)? {
             Decrypted::Frame(frame, state) => {
                 self.state = Some(state);
+                let (msg_type, bytes) = (frame.header().msg_type(), frame.encoded_length());
+                crate::traffic::record_sv2(crate::traffic::Direction::In, msg_type, bytes);
                 Ok(Some(frame))
             }
             Decrypted::Incomplete(state) => {

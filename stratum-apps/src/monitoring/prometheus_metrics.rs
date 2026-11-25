@@ -63,6 +63,7 @@ impl PrometheusMetrics {
         // System metrics (always enabled)
         let sv2_uptime_seconds = Gauge::new("sv2_uptime_seconds", "Server uptime in seconds")?;
         registry.register(Box::new(sv2_uptime_seconds.clone()))?;
+        registry.register(Box::new(super::traffic::TrafficCollector::new()))?;
         // Set at scrape time: every other metric keeps its last value if refreshes stop.
         let sv2_monitoring_snapshot_age_seconds = Gauge::new(
             "sv2_monitoring_snapshot_age_seconds",
